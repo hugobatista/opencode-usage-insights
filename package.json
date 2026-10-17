@@ -1,7 +1,7 @@
 {
   "name": "opencode-usage-insights",
   "version": "0.1.0",
-  "description": "OpenCode plugin: live turn telemetry line plus persistent usage statistics (provider/model, tokens, prompt cache, affinity) with an in-TUI stats panel.",
+  "description": "OpenCode V2 plugin: a live turn telemetry line plus a persistent SQLite usage record, read back by an interactive /usage panel — models, endpoints, prompt cache, affinity, periods and latency.",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -19,11 +19,18 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "usage",
-    "statistics",
-    "tokens",
+    "opencode-tui",
+    "tui",
+    "telemetry",
+    "usage-statistics",
+    "sqlite",
     "prompt-cache",
-    "tui"
+    "observability",
+    "token-usage",
+    "cost-tracking",
+    "cache-affinity",
+    "bun",
+    "typescript"
   ],
   "engines": {
     "opencode": ">=2.0.0"
