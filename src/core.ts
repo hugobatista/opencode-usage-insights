@@ -407,7 +407,8 @@ export const DEFAULT_LABELS: LineLabels = {
   upstream: "via",
 }
 
-export const DEFAULT_FIELDS: LineFields = {  clock: true,
+export const DEFAULT_FIELDS: LineFields = {
+  clock: true,
   delta: true,
   model: true,
   variant: true,
@@ -416,7 +417,10 @@ export const DEFAULT_FIELDS: LineFields = {  clock: true,
   reasoning: false,
   cost: false,
   cacheExpiry: true,
-  upstream: true,
+  // The reported upstream operator is best-effort evidence — often absent, and
+  // it can name the wrong party. The line leads with the endpoint that actually
+  // served the turn, so the operator stays out unless it is asked for.
+  upstream: false,
 }
 
 export function formatClock(ms: number): string {

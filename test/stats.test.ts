@@ -187,7 +187,8 @@ describe("stats queries", () => {
     expect(usage.cost).toBeCloseTo(0.0445, 10)
     expect(usage.firstAt).toBe(1_000_000)
     expect(usage.lastAt).toBe(2_610_000)
-    expect(usage.cacheHitRatio).toBeCloseTo(313_500 / 316_050, 10)
+    // The ratio counts the whole prompt: reads + fresh input + writes.
+    expect(usage.cacheHitRatio).toBeCloseTo(313_500 / (313_500 + 2_550 + 1_200), 10)
   })
 
   test("overview respects the range", () => {
@@ -195,9 +196,11 @@ describe("stats queries", () => {
     expect(usage).toMatchObject({ steps: 5, sessions: 2, prompts: 3, input: 1_150, cached: 263_500, output: 470 })
   })
 
-  test("cacheHitRatio is undefined without traffic", () => {
-    expect(cacheHitRatio({ input: 0, cached: 0 })).toBeUndefined()
-    expect(cacheHitRatio({ input: 50, cached: 50 })).toBe(0.5)
+  test("cacheHitRatio counts the whole prompt, cache writes included", () => {
+    expect(cacheHitRatio({ input: 0, cached: 0, cacheWrite: 0 })).toBeUndefined()
+    expect(cacheHitRatio({ input: 50, cached: 50, cacheWrite: 0 })).toBe(0.5)
+    // A write is prompt the provider saw but did not reuse.
+    expect(cacheHitRatio({ input: 50, cached: 50, cacheWrite: 100 })).toBe(0.25)
   })
 
   test("models names the providers behind each model", () => {

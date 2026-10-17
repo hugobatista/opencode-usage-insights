@@ -9,9 +9,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { computeTurn, formatLine, type LineIdentity, type Totals, type TurnTotalsView } from "../src/core"
 import { sessionTotals, toTranscript, type RuntimeMessage, type RuntimeModelRef, type RuntimeTokenUsage } from "../src/line"
-import { cacheLines, latencyLines, modelsLines, overviewLines, sessionsLines, sidebarLines, turnsLines, type PanelLine } from "../src/panel-data"
+import { buildPanel, type PanelRequest } from "../src/panel-build"
+import { PANEL_VIEWS, sidebarLines, type PanelLine } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
-import { cacheDrops, cacheTtlEvidence, latency, models, overview, sessions, turns } from "../src/stats/queries"
+import { turns } from "../src/stats/queries"
 
 const width = Number(process.argv[2] ?? 100)
 const base = Date.UTC(2026, 9, 12, 8, 0, 0)
@@ -139,13 +140,26 @@ section(
   "turn · response still streaming (no line until the response ends)",
   turnLine([...recorderTurn2, ...recorderTurn3, ...liveTurn], recorderTotals, { router: "orcarouter-dsv4.1flash" }) || "(no line yet)",
 )
-section("/usage overview", body(overviewLines({ usage: overview(db), session: overview(db, { from: at(70) }), range: "all" }, width)))
-section("/usage models", body(modelsLines(models(db), width)))
-section("/usage cache", body(cacheLines({ drops: cacheDrops(db), evidence: cacheTtlEvidence(db) }, width)))
-section("/usage latency", body(latencyLines(latency(db), width)))
-section("/usage sessions", body(sessionsLines(sessions(db, { limit: 10 }), width)))
-section("/usage turns", body(turnsLines(turns(db, { sessionID: "ses_recorder", limit: 6 }), width)))
 section("sidebar history (compact, last 3 turns)", body(sidebarLines(turns(db, { sessionID: "ses_recorder", limit: 3 }), { budget: 34 })))
+
+// Every view of the panel, rendered from the same request the TUI builds.
+for (const view of PANEL_VIEWS) {
+  const request: PanelRequest = {
+    db,
+    view,
+    range: "all",
+    filters: {},
+    granularity: "day",
+    turnsScope: "all",
+    sort: "",
+    sortDesc: true,
+    sessionID: "ses_recorder",
+    sessionStart: at(0),
+    now: at(90),
+    width,
+  }
+  section(`/usage ${view}`, body(buildPanel(request)))
+}
 
 db.close()
 rmSync(root, { recursive: true, force: true })

@@ -4,11 +4,25 @@
  *
  *   bun run report [view] [range] [--db <path>] [--width <n>] [--json] [--ndjson]
  *
- * Views: overview models cache latency sessions all   (default: overview)
- * Ranges: session today 7d 30d all                    (default: all)
+ * Views: the panel's own catalogue   (default: overview)
+ * Ranges: session today 7d 30d all   (default: all)
+ *
+ * The views come from the same `buildPanel` the panel renders, so the terminal
+ * and the TUI never drift apart.
  */
 import { existsSync, readFileSync } from "node:fs"
-import { PANEL_VIEWS, RANGE_KEYS, cacheLines, count, latencyLines, modelsLines, overviewLines, rangeFor, sessionsLines, type PanelLine, type PanelView, type RangeKey } from "../src/panel-data"
+import { buildPanel, type PanelRequest } from "../src/panel-build"
+import { DEFAULT_SETTINGS, GRANULARITIES, PANEL_VIEWS, RANGE_KEYS, count, type Granularity, type PanelLine, type PanelView, type RangeKey } from "../src/panel-data"
+import {
+  affinityReport,
+  coverageReport,
+  gapReport,
+  latencyGroups,
+  periodReport,
+  endpointBreakdown,
+  endpointSummary,
+  stepFacts,
+} from "../src/stats/insights"
 import { exportNdjson, importNdjson, openStatsDb } from "../src/stats/db"
 import { defaultDbPath, resolveDbPath } from "../src/stats/paths"
 import { cacheDrops, cacheTtlEvidence, latency, models, overview, sessions } from "../src/stats/queries"
@@ -18,30 +32,45 @@ type Args = {
   range: RangeKey
   db?: string | undefined
   width: number
+  granularity: Granularity
+  model?: string | undefined
+  endpoint?: string | undefined
+  sort?: string | undefined
+  sortDesc: boolean
   json: boolean
   ndjson: boolean
   import?: string | undefined
 }
 
-const USAGE = `usage: bun run report [view] [range] [--db <path>] [--width <n>] [--json] [--ndjson] [--import <file>]
+const USAGE = `usage: bun run report [view] [range] [options]
 
 views  ${PANEL_VIEWS.join(", ")}, all (default: overview)
 ranges ${RANGE_KEYS.join(", ")} (default: all)
-flags  --db <path>     database override (default: ${defaultDbPath()})
-       --width <n>     column budget (default: 100)
-       --json          print the raw query rows as JSON
-       --ndjson        export the whole database as NDJSON
-       --import <file> merge an NDJSON export into the database and exit`
+flags  --db <path>          database override (default: ${defaultDbPath()})
+       --width <n>          column budget (default: 100)
+       --granularity <g>    periods bucket: ${GRANULARITIES.join(", ")} (default: day)
+       --model <id>         only steps of this model
+       --endpoint <name>    only steps served by this routing endpoint
+       --sort <key>         sort key of the view (models: steps cached out cost, …)
+       --asc                sort ascending (default: descending)
+       --json               print the raw query rows as JSON
+       --ndjson             export the whole database as NDJSON
+       --import <file>      merge an NDJSON export into the database and exit`
 
 function parse(argv: readonly string[]): Args {
-  const parsed: Args = { view: "overview", range: "all", width: 100, json: false, ndjson: false }
+  const parsed: Args = { view: "overview", range: "all", width: 100, granularity: "day", sortDesc: true, json: false, ndjson: false }
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index] ?? ""
     if (token === "--json") parsed.json = true
     else if (token === "--ndjson") parsed.ndjson = true
+    else if (token === "--asc") parsed.sortDesc = false
     else if (token === "--db") parsed.db = argv[++index]
     else if (token === "--import") parsed.import = argv[++index]
     else if (token === "--width") parsed.width = Number(argv[++index] ?? 100)
+    else if (token === "--granularity") parsed.granularity = (argv[++index] ?? "day") as Granularity
+    else if (token === "--model") parsed.model = argv[++index]
+    else if (token === "--endpoint") parsed.endpoint = argv[++index]
+    else if (token === "--sort") parsed.sort = argv[++index]
     else if (token === "-h" || token === "--help") {
       console.log(USAGE)
       process.exit(0)
@@ -54,6 +83,7 @@ function parse(argv: readonly string[]): Args {
     }
   }
   if (!Number.isFinite(parsed.width) || parsed.width < 40) parsed.width = 100
+  if (!(GRANULARITIES as readonly string[]).includes(parsed.granularity)) parsed.granularity = "day"
   return parsed
 }
 
@@ -102,17 +132,27 @@ if (args.ndjson) {
 }
 
 const now = Date.now()
-const range = rangeFor(args.range, now)
+const range = args.range === "session" ? undefined : rangeForCli(args.range, now)
 if (args.range === "session") console.error("note: no session context here, so \"session\" covers the whole database")
 
+const filters = {
+  ...(args.model !== undefined ? { modelID: args.model } : {}),
+  ...(args.endpoint !== undefined ? { router: args.endpoint } : {}),
+}
+
 if (args.json) {
+  const facts = stepFacts(db, { range, filters, withPredecessor: true })
   const data = {
-    overview: overview(db, range),
-    models: models(db, range),
-    cacheDrops: cacheDrops(db, { range }),
-    cacheTtlEvidence: cacheTtlEvidence(db, range),
-    latency: latency(db, range),
-    sessions: sessions(db, { range, limit: 50 }),
+    overview: overview(db, range, filters),
+    models: models(db, range, filters),
+    endpoints: endpointSummary(facts),
+    endpointModels: endpointBreakdown(facts),
+    affinity: affinityReport(facts),
+    cache: { drops: cacheDrops(db, { range, filters }), ttl: cacheTtlEvidence(db, { range, filters }), gap: gapReport(facts) },
+    periods: periodReport(facts, args.granularity),
+    latency: { overall: latency(db, range, filters), byModel: latencyGroups(facts, "model"), byOperator: latencyGroups(facts, "operator") },
+    sessions: sessions(db, { range, filters, limit: 50 }),
+    coverage: coverageReport(facts),
   }
   console.log(JSON.stringify(data, null, 2))
   db.close()
@@ -122,26 +162,39 @@ if (args.json) {
 const views: PanelView[] = args.view === "all" ? [...PANEL_VIEWS] : [args.view]
 
 for (const view of views) {
-  if (views.length > 1) console.log(`
-${view}
-${"─".repeat(args.width)}`)
-  const lines: PanelLine[] = (() => {
-    switch (view) {
-      case "overview":
-        return overviewLines({ usage: overview(db, range), session: undefined, range: args.range }, args.width)
-      case "models":
-        return modelsLines(models(db, range), args.width)
-      case "cache":
-        return cacheLines({ drops: cacheDrops(db, { range }), evidence: cacheTtlEvidence(db, range) }, args.width)
-      case "latency":
-        return latencyLines(latency(db, range), args.width)
-      case "sessions":
-        return sessionsLines(sessions(db, { range, limit: 20 }), args.width)
-      default:
-        return []
-    }
-  })()
+  if (views.length > 1) console.log(`\n${view}\n${"─".repeat(args.width)}`)
+  const request: PanelRequest = {
+    db,
+    view,
+    range: args.range,
+    filters,
+    granularity: args.granularity,
+    turnsScope: "all",
+    sort: args.sort ?? "",
+    sortDesc: args.sortDesc,
+    sessionID: "",
+    sessionStart: undefined,
+    now,
+    width: args.width,
+  }
+  const lines: PanelLine[] = buildPanel(request)
   for (const line of lines) console.log(line.text.replace(/\s+$/, ""))
 }
 
 db.close()
+
+function rangeForCli(key: RangeKey, at: number): { from?: number | undefined; to?: number | undefined } | undefined {
+  switch (key) {
+    case "today": {
+      const start = new Date(at)
+      start.setHours(0, 0, 0, 0)
+      return { from: start.getTime() }
+    }
+    case "7d":
+      return { from: at - 7 * 24 * 60 * 60 * 1000 }
+    case "30d":
+      return { from: at - 30 * 24 * 60 * 60 * 1000 }
+    default:
+      return undefined
+  }
+}

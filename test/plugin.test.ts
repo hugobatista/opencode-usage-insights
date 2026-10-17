@@ -10,7 +10,7 @@ import { createSignal } from "solid-js"
 
 registerBunPlugin(solid)
 import { formatClock } from "../src/core"
-import { PANEL_NAME } from "../src/panel-data"
+import { DEFAULT_SETTINGS, PANEL_NAME, type PanelSettings } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
 import { resolveDbPath } from "../src/stats/paths"
 
@@ -59,6 +59,23 @@ function createHarness(config: { options?: Record<string, unknown>; sessions?: S
   const toasts: Array<{ message: string; variant?: string }> = []
   const events: Array<{ type: string; handler: (payload: unknown) => void; live: boolean }> = []
   const sessions = new Map<string, SessionSeed>()
+  // The panel keeps its view, range, sort and filters in the host's durable
+  // store. The mock mirrors it with a signal-backed proxy: property reads track
+  // and a mutation replaces the draft, exactly like the host's store does for
+  // the plugin.
+  const [panelSettings, setPanelSettings] = createSignal<PanelSettings>({ ...DEFAULT_SETTINGS }, { equals: false })
+  const settingsProxy = new Proxy({} as PanelSettings, {
+    get: (_target, key) => (panelSettings() as Record<string | symbol, unknown>)[key],
+    set: () => true,
+    // A spread reads own keys, not properties: without these two traps the
+    // panel would only ever see the defaults.
+    ownKeys: () => Reflect.ownKeys(panelSettings()),
+    getOwnPropertyDescriptor: (_target, key) => ({
+      enumerable: true,
+      configurable: true,
+      value: (panelSettings() as Record<string | symbol, unknown>)[key],
+    }),
+  })
   // The reactive message store: the real host publishes session messages
   // through a store, so render tests must be able to trigger updates.
   const messageSignals = new Map<string, [() => RuntimeMessage[], (next: RuntimeMessage[]) => void]>()
@@ -104,6 +121,14 @@ function createHarness(config: { options?: Record<string, unknown>; sessions?: S
           info: { base: RGBA.fromInts(80, 160, 255, 255), muted: RGBA.fromInts(60, 120, 200, 255) },
         },
       },
+      background: {
+        base: RGBA.fromInts(20, 20, 20, 255),
+        raised: {
+          base: RGBA.fromInts(40, 40, 40, 255),
+          high: RGBA.fromInts(50, 50, 50, 255),
+          max: RGBA.fromInts(60, 60, 60, 255),
+        },
+      },
     },
     ui: {
       slot: (claim: SlotClaim) => {
@@ -137,6 +162,17 @@ function createHarness(config: { options?: Record<string, unknown>; sessions?: S
         layers.push(layer)
         commands.push(...(layer.commands ?? []))
       },
+    },
+    storage: {
+      store: () => [
+        settingsProxy,
+        (mutation: (draft: PanelSettings) => void) => {
+          const draft = { ...panelSettings() }
+          mutation(draft)
+          setPanelSettings(draft)
+          return Promise.resolve()
+        },
+      ],
     },
   }
 
@@ -376,11 +412,12 @@ describe("telemetry line", () => {
     })
     db.close()
 
+    // The reported operator is evidence, so it stays off the line by default.
     const withUpstream = init({ sessions: [session({ id: "ses_upstream" })] })
-    expect(withUpstream.lineText("ses_upstream")).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
+    expect(withUpstream.lineText("ses_upstream")).not.toContain("via")
 
-    const disabled = init({ options: { upstream: false }, sessions: [session({ id: "ses_upstream" })] })
-    expect(disabled.lineText("ses_upstream")).not.toContain("via")
+    const asked = init({ options: { fields: { upstream: true } }, sessions: [session({ id: "ses_upstream" })] })
+    expect(asked.lineText("ses_upstream")).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
   })
 
   test("drops its cached upstream lookup when a step ends", () => {
@@ -629,7 +666,8 @@ describe("rendering", () => {
       expect(frame).toContain("usage insights")
       expect(frame).toContain("all time")
       expect(frame).toContain("cached")
-      expect(frame).toContain("/usage <view> <range> to switch")
+      expect(frame).toContain("[1 overview]")
+      expect(frame).toContain("? help")
     } finally {
       await setup.dispose()
     }
@@ -682,7 +720,8 @@ describe("rendering", () => {
       await setup.renderOnce()
       const text = treeText(setup)
       expect(countOccurrences(text, "usage insights")).toBe(1)
-      expect(text).toContain("models · 30 days · views:")
+      expect(text).toContain("[2 models]")
+      expect(text).toContain("30 days")
     } finally {
       await setup.dispose()
     }
@@ -721,6 +760,10 @@ describe("history", () => {
     try {
       await setup.renderOnce()
       const text = treeText(setup)
+      // The accumulated session usage comes first, then the per-turn history.
+      expect(text).toContain("session")
+      expect(text).toContain("1 step")
+      expect(text).toContain("hit")
       expect(text).toContain("turns")
       expect(text).toContain("orcarouter-dsv4.1flash")
       expect(text).toContain("in 1.62k (427.3k)")
@@ -745,7 +788,7 @@ describe("history", () => {
       harness.command("usage-insights.stats")!.run("turns")
       await setup.renderOnce()
       const text = treeText(setup)
-      expect(text).toContain("turns ·")
+      expect(text).toContain("[9 turns]")
       expect(text).toContain("orcarouter-dsv4.1flash · in 1.62k (427.3k), cached 425.7k, out 1.06k")
     } finally {
       await setup.dispose()

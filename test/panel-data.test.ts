@@ -2,29 +2,40 @@ import { describe, expect, test } from "bun:test"
 import { formatClock } from "../src/core"
 import type { TurnUsage } from "../src/stats/queries"
 import {
-  count,
+  DEFAULT_SETTINGS,
   PANEL_NAME,
   PANEL_VIEWS,
   RANGE_KEYS,
   cacheLines,
+  count,
+  filterSummary,
   formatCount,
   formatGap,
   formatMs,
   formatPercent,
   formatTableRow,
   formatTps,
+  helpLines,
+  keysFor,
   kvGrid,
   latencyLines,
   modelsLines,
+  nextIn,
   overviewLines,
   padCell,
   parseArgs,
   rangeFor,
   rangeLabel,
+  reduceSeries,
+  sanitizeSettings,
+  sessionSummaryLines,
   sessionsLines,
   sidebarLines,
+  sparkline,
   truncate,
+  truncateMiddle,
   turnsLines,
+  viewBar,
   type PanelLine,
 } from "../src/panel-data"
 import type { CacheDropRow, LatencyReport, ModelUsage, Overview, SessionUsage, TtlEvidenceRow } from "../src/stats/queries"
@@ -229,8 +240,14 @@ describe("overviewLines", () => {
     const lines = overviewLines({ usage: overview(), session: undefined, range: "7d" }, 100)
     expect(lines[0]!.text).toBe("7 days · 3 steps · 2 sessions · 4 prompts")
     expect(lines[0]!.tone).toBe("muted")
-    expect(text(lines)).toContain(`${padCell("cached", 11)}340k (96.6% hit)`)
-    expect(text(lines)).toContain(`${padCell("cost", 11)}$0.42`)
+    // The buckets match the live line: in = fresh + writes, prompt = what the
+    // provider saw, out = visible + reasoning.
+    expect(text(lines)).toContain(`${padCell("in", 11)}17k`)
+    expect(text(lines)).toContain(`${padCell("prompt", 11)}357k`)
+    expect(text(lines)).toContain(`${padCell("cached", 11)}340k`)
+    expect(text(lines)).toContain(`${padCell("hit", 11)}95.2%`)
+    expect(text(lines)).toContain(`${padCell("out", 11)}900`)
+    expect(text(lines)).toContain(`${padCell("cost", 11)}$0.4200`)
     expect(text(lines)).not.toContain("reasoning")
     expect(text(lines)).not.toContain("this session")
   })
@@ -249,108 +266,92 @@ describe("overviewLines", () => {
     expect(body).toContain("first")
     expect(body).toContain("last")
     expect(find(lines, "this session")?.tone).toBe("accent")
-    expect(body).toContain(`${padCell("cost", 11)}$0.01`)
+    expect(body).toContain(`${padCell("cost", 11)}$0.0100`)
+  })
+
+  test("names the subagents of the open session apart from it", () => {
+    const lines = overviewLines(
+      {
+        usage: overview(),
+        session: overview(),
+        subagents: [{ ...overview(), sessionID: "child", parentID: "s1", steps: 4, cost: 0.5 } as never],
+        range: "all",
+      },
+      100,
+    )
+    expect(text(lines)).toContain("subagents")
+    expect(text(lines)).toContain("their own sessions")
+    expect(text(lines)).toContain("$0.5000")
   })
 })
 
 describe("modelsLines", () => {
-  test("lists each provider behind a model, including upstream operators", () => {
+  const providerRow = (overrides: Partial<ModelUsage["providers"][number]> = {}): ModelUsage["providers"][number] => ({
+    providerID: "opencode",
+    upstreams: [],
+    upstreamModels: [],
+    routers: [],
+    steps: 4,
+    input: 12_000,
+    cached: 340_000,
+    cacheWrite: 5_000,
+    output: 900,
+    reasoning: 0,
+    cost: 0.42,
+    firstAt: undefined,
+    lastAt: undefined,
+    ...overrides,
+  })
+
+  test("lists each model once, with its cache and where it was served", () => {
     const rows = [
       model({
         modelID: "deepseek-v4.1-flash-free",
         providers: [
-          {
-            providerID: "opencode",
-            upstreams: ["fireworks", "deepseek"], upstreamModels: [], routers: [],
-            steps: 4,
-            input: 12_000,
-            cached: 340_000,
-            cacheWrite: 0,
-            output: 900,
-            reasoning: 0,
-            cost: 0.42,
-            firstAt: undefined,
-            lastAt: undefined,
-          },
-          {
-            providerID: "deepseek",
-            upstreams: [], upstreamModels: [], routers: [],
-            steps: 1,
-            input: 500,
-            cached: 0,
-            cacheWrite: 0,
-            output: 20,
-            reasoning: 0,
-            cost: 0.01,
-            firstAt: undefined,
-            lastAt: undefined,
-          },
+          providerRow({ upstreams: ["fireworks", "deepseek"], routers: ["orcarouter-dsv4.1flash"] }),
+          providerRow({ providerID: "deepseek", steps: 1, input: 10, cached: 0, cacheWrite: 0, output: 20, cost: 0.01 }),
         ],
       }),
     ]
-    const lines = modelsLines(rows, 100)
+    const lines = modelsLines(rows, 120)
     expect(lines[0]!.text).toContain("model")
-    expect(lines[0]!.text).toContain("provider")
+    expect(lines[0]!.text).toContain("prompt")
+    expect(lines[0]!.text).toContain("cached")
     expect(lines[0]!.text).toContain("cost")
-    // A long operator list continues on its own line instead of being cut.
-    const row = find(lines, "opencode")!
-    expect(row.text).toContain("deepseek-v4.1-flash-free")
-    expect(row.text).not.toContain("via")
-    const continuation = find(lines, "via fireworks, deepseek")!
-    expect(continuation.tone).toBe("muted")
-    expect(continuation.text).toBe(`${" ".repeat(31)}via fireworks, deepseek`)
-    expect(text(lines)).toContain(`${padCell("deepseek", 22)}`)
-    expect(text(lines)).toContain("12k")
-    expect(text(lines)).toContain("$0.4200")
+    expect(lines[0]!.text).toContain("served by")
+    // The endpoint is the identity that served the request; the reported
+    // operator is not what this view leads with any more.
+    expect(text(lines)).toContain("orcarouter-dsv4.1flash")
+    expect(text(lines)).not.toContain("via fireworks")
+    expect(text(lines)).toContain("$0.42")
   })
 
-  test("keeps a short operator list inside the provider cell", () => {
-    const rows = [model({ modelID: "glm-5.3-flash", providers: [{ providerID: "opencode", upstreams: ["fireworks"], upstreamModels: [], routers: [], steps: 2, input: 1, cached: 0, cacheWrite: 0, output: 1, reasoning: 0, cost: 0, firstAt: undefined, lastAt: undefined }] })]
-    const lines = modelsLines(rows, 100)
-    expect(text(lines)).toContain("opencode via fireworks")
-    expect(text(lines)).not.toContain("  via fireworks")
-  })
-
-  test("shows the upstream model and the routing endpoint the gateway reported", () => {
-    const rows = [
-      model({
-        modelID: "deepseek-v4.1-flash",
-        providers: [
-          {
-            providerID: "opencode",
-            upstreams: ["DeepSeek"],
-            upstreamModels: ["deepseek/deepseek-v4.1-flash"],
-            routers: ["orcarouter-dsv4.1flash"],
-            steps: 3,
-            input: 1_000,
-            cached: 291_584,
-            cacheWrite: 0,
-            output: 463,
-            reasoning: 1_030,
-            cost: 0.01,
-            firstAt: undefined,
-            lastAt: undefined,
-          },
-        ],
-      }),
-    ]
-    const lines = modelsLines(rows, 130)
-    expect(text(lines)).toContain("opencode via DeepSeek")
-    expect(text(lines)).toContain("upstream deepseek/deepseek-v4.1-flash · endpoint orcarouter-dsv4.1flash")
+  test("adds the p50 hit and the identity changes the facts provide", () => {
+    const rows = [model({ modelID: "glm-5.3-flash" })]
+    const lines = modelsLines(
+      rows,
+      120,
+      {
+        cache: new Map([["glm-5.3-flash#", { steps: 4, input: 12_000, cached: 340_000, cacheWrite: 5_000, prompt: 357_000, hit: 340_000 / 357_000, hitP50: 0.9 }]]),
+        changes: new Map([["glm-5.3-flash#", 2]]),
+      },
+    )
+    expect(text(lines)).toContain("95.2%")
+    expect(text(lines)).toContain("p50 hit 90.0%")
+    expect(text(lines)).toContain("no routing endpoint observed")
+    expect(text(lines)).toContain("2 identity changes")
   })
 
   test("drops the cost column on narrow panels and notes hidden models", () => {
     const rows = Array.from({ length: 4 }, (_, index) => model({ modelID: `model-${index}` }))
-    const narrow = modelsLines(rows, 60, 2)
+    // At 48 columns only the essential columns fit: the cost column goes.
+    const narrow = modelsLines(rows, 48, undefined, 2)
     expect(narrow[0]!.text).not.toContain("cost")
     expect(text(narrow)).toContain("… 2 more models")
   })
 
   test("explains an empty range", () => {
-    const lines = modelsLines([], 100)
-    expect(lines).toHaveLength(2)
-    expect(lines[1]!.text).toBe("no usage recorded for this range")
-    expect(lines[1]!.tone).toBe("muted")
+    expect(modelsLines([], 100).at(-1)!.text).toBe("no usage recorded for this range")
   })
 })
 
@@ -414,10 +415,11 @@ describe("latencyLines", () => {
 })
 
 describe("sessionsLines", () => {
-  test("lists sessions with their providers", () => {
+  test("lists sessions with their totals", () => {
     const rows: SessionUsage[] = [
       {
         sessionID: "ses_1",
+        parentID: undefined,
         title: "Fix the recorder",
         directory: "/project",
         providers: ["opencode", "deepseek"],
@@ -432,13 +434,42 @@ describe("sessionsLines", () => {
         output: 1_200,
         reasoning: 0,
         cost: 1.25,
+        cacheHitRatio: 500_000 / 520_000,
       },
     ]
     const lines = sessionsLines(rows, 100)
     expect(lines[0]!.tone).toBe("accent")
     expect(lines[0]!.text).toContain("title")
-    expect(text(lines)).toContain("Fix the recorder [opencode,deepseek]")
+    expect(text(lines)).toContain("Fix the recorder")
+    expect(text(lines)).toContain("/project")
     expect(text(lines)).toContain("$1.25")
+    expect(text(lines)).toContain("96%")
+  })
+
+  test("indents subagent sessions and rolls their usage up", () => {
+    const parent: SessionUsage = {
+      sessionID: "ses_parent",
+      parentID: undefined,
+      title: "Parent",
+      directory: undefined,
+      providers: ["opencode"],
+      models: ["m"],
+      prompts: 1,
+      firstAt: undefined,
+      lastAt: undefined,
+      steps: 10,
+      input: 1_000,
+      cached: 9_000,
+      cacheWrite: 0,
+      output: 100,
+      reasoning: 0,
+      cost: 1,
+      cacheHitRatio: 0.9,
+    }
+    const child: SessionUsage = { ...parent, sessionID: "ses_child", parentID: "ses_parent", title: "Child", steps: 4, cost: 0.25 }
+    const lines = sessionsLines([parent, child], 100, { rollup: { subagentSteps: 4, subagentCost: 0.25 } })
+    expect(text(lines)).toContain("↳ Child")
+    expect(text(lines)).toContain("subagents 4 steps (28.6%) · $0.2500")
   })
 
   test("falls back to the session id and explains an empty range", () => {
@@ -446,6 +477,7 @@ describe("sessionsLines", () => {
       [
         {
           sessionID: "ses_untitled",
+          parentID: undefined,
           title: undefined,
           directory: undefined,
           providers: [],
@@ -460,12 +492,95 @@ describe("sessionsLines", () => {
           output: 1,
           reasoning: 0,
           cost: 0,
+          cacheHitRatio: 0,
         },
       ],
       100,
     )
     expect(text(lines)).toContain("ses_untitled")
     expect(sessionsLines([], 100).at(-1)!.text).toBe("no sessions recorded for this range")
+  })
+})
+
+describe("sessionSummaryLines", () => {
+  test("summarises the session with the line's own buckets, inside the budget", () => {
+    const lines = sessionSummaryLines(overview({ steps: 12, cost: 1.25 }))
+    expect(lines[0]!.text).toBe("session")
+    expect(lines[0]!.tone).toBe("accent")
+    expect(lines[1]!.text).toBe("  12 steps · $1.25")
+    expect(text(lines)).toContain("in 17k · cached 340k")
+    expect(text(lines)).toContain("out 900 · hit 95.2%")
+    for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(34)
+  })
+
+  test("truncates to a narrower sidebar instead of overflowing", () => {
+    const lines = sessionSummaryLines(overview({ steps: 1_234 }), 20)
+    for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(20)
+  })
+})
+
+describe("panel chrome", () => {
+  test("the view bar brackets the active view and numbers every view", () => {
+    const bar = viewBar("endpoints")
+    expect(bar.text).toContain("[3 endpoints]")
+    expect(bar.text).toContain("1 overview")
+    expect(bar.text).toContain("9 turns")
+    expect(bar.tone).toBe("muted")
+  })
+
+  test("the key hints match the view that is open", () => {
+    expect(keysFor("periods")).toContain("b bucket")
+    expect(keysFor("turns")).toContain("a scope")
+    expect(keysFor("models")).toContain("enter drill")
+    expect(keysFor("models")).toContain("? help")
+  })
+
+  test("summarises the active filters, and nothing when they are empty", () => {
+    expect(filterSummary({ modelID: "m", routerID: "orcarouter-dsv4.1flash" })).toBe("model=m · endpoint=orcarouter-dsv4.1flash")
+    expect(filterSummary({ modelID: "", routerID: "" })).toBeUndefined()
+    expect(filterSummary({})).toBeUndefined()
+  })
+
+  test("the help overlay names the keys and the metric definitions", () => {
+    const lines = helpLines(100)
+    const body = text(lines)
+    expect(body).toContain("keys")
+    expect(body).toContain("numbers")
+    expect(body).toContain("hit       cached / prompt")
+    expect(body).toContain("hit p50   median")
+    expect(body).toContain("prompt    everything the provider saw")
+    expect(body).toContain("out       everything generated")
+    expect(body).toContain("endpoint  where the request was actually sent")
+    expect(body).toContain("The endpoint is the inference provider")
+    expect(body).toContain("kept in the database as evidence, not surfaced")
+    expect(body).toContain("escape close")
+  })
+
+  test("sparklines scale to the series and fold a long one", () => {
+    expect(sparkline([0, 0, 0])).toBe("▁▁▁")
+    expect(sparkline([1, 2, 4, 8])).toBe("▂▃▅█")
+    expect(sparkline([])).toBe("")
+    const long = Array.from({ length: 200 }, () => 2)
+    expect(reduceSeries(long)).toHaveLength(40)
+    expect(sparkline(long).length).toBe(40)
+  })
+
+  test("nextIn wraps around the catalogue", () => {
+    expect(nextIn(RANGE_KEYS, "all", 1)).toBe("session")
+    expect(nextIn(RANGE_KEYS, "session", -1)).toBe("all")
+    expect(nextIn(PANEL_VIEWS, "not-a-view" as never, 1)).toBe("overview")
+  })
+
+  test("sanitizeSettings keeps what it understands and defaults the rest", () => {
+    expect(sanitizeSettings(undefined)).toEqual(DEFAULT_SETTINGS)
+    expect(sanitizeSettings({ view: "cache", range: "7d", sortDesc: false }).view).toBe("cache")
+    expect(sanitizeSettings({ view: "cache", range: "7d", sortDesc: false }).sortDesc).toBe(false)
+    expect(sanitizeSettings({ granularity: "week" }).granularity).toBe("week")
+  })
+
+  test("middle-truncation keeps both ends of a long model id", () => {
+    expect(truncateMiddle("deepseek-v4.1-flash-free", 24)).toBe("deepseek-v4.1-flash-free")
+    expect(truncateMiddle("deepseek-v4.1-flash-free", 12)).toBe("deepse…-free")
   })
 })
 

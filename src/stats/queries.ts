@@ -24,6 +24,28 @@ export type Range = {
   to?: number | undefined
 }
 
+/**
+ * Panel filters. They narrow every aggregation to one model, one OpenCode
+ * provider or one inference operator, and are applied with the same `WHERE`
+ * builder the range uses so a filtered view and a drill-down agree.
+ */
+export type Filters = {
+  /** Model id, variant excluded. */
+  modelID?: string | undefined
+  /**
+   * The routing endpoint that served the request (`router`). It is the one
+   * identity that answers "who ran this inference": the provider you configured
+   * and the operator a header reported are evidence, not answers.
+   */
+  router?: string | undefined
+  /**
+   * One session, exactly. Used by the `session` range and by the overview's
+   * "this session" block, which must not pick up the steps of every other
+   * session that happened to run after it started.
+   */
+  sessionID?: string | undefined
+}
+
 export type Usage = {
   steps: number
   input: number
@@ -79,9 +101,39 @@ function rangeWhere(range: Range | undefined, column = STEP_TIME): { where: stri
   return { where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "", params }
 }
 
-/** Tokens that would have been billed as fresh input without cache reuse. */
-export function cacheHitRatio(usage: Pick<Usage, "input" | "cached">): number | undefined {
-  const total = usage.cached + usage.input
+/**
+ * `WHERE` for a range plus the panel filters. Shared with the analysis layer so
+ * a filtered view and a drill-down agree on what is in scope.
+ */
+export function buildWhere(
+  range: Range | undefined,
+  filters?: Filters | undefined,
+  column = STEP_TIME,
+): { where: string; params: (string | number)[] } {
+  const rangeClause = rangeWhere(range, column)
+  const clauses = rangeClause.where === "" ? [] : [rangeClause.where.slice("WHERE ".length)]
+  const params: (string | number)[] = [...rangeClause.params]
+  if (filters?.modelID !== undefined && filters.modelID !== "") {
+    clauses.push("model_id = ?")
+    params.push(filters.modelID)
+  }
+  if (filters?.router !== undefined && filters.router !== "") {
+    clauses.push("router = ?")
+    params.push(filters.router)
+  }
+  if (filters?.sessionID !== undefined && filters.sessionID !== "") {
+    clauses.push("session_id = ?")
+    params.push(filters.sessionID)
+  }
+  return { where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "", params }
+}
+
+/**
+ * Share of the whole prompt that came from the cache. The denominator is what
+ * the provider saw: cache reads, fresh input and cache writes.
+ */
+export function cacheHitRatio(usage: Pick<Usage, "input" | "cached" | "cacheWrite">): number | undefined {
+  const total = usage.cached + usage.input + usage.cacheWrite
   return total > 0 ? usage.cached / total : undefined
 }
 
@@ -93,8 +145,8 @@ export type Overview = Usage & {
   cacheHitRatio: number | undefined
 }
 
-export function overview(db: Database, range?: Range): Overview {
-  const steps = rangeWhere(range)
+export function overview(db: Database, range?: Range, filters?: Filters): Overview {
+  const steps = buildWhere(range, filters)
   const row = db
     .query(
       `SELECT ${USAGE_SELECT},
@@ -154,8 +206,8 @@ type ModelRow = UsageRow & {
  * that answers "which inference providers is this model actually coming from
  * over the selected period".
  */
-export function models(db: Database, range?: Range): ModelUsage[] {
-  const filter = rangeWhere(range)
+export function models(db: Database, range?: Range, filters?: Filters): ModelUsage[] {
+  const filter = buildWhere(range, filters)
   const rows = db
     .query(
       `SELECT provider_id, model_id, variant,
@@ -295,8 +347,8 @@ type StepSequences = {
  * needed to judge reuse, so the fetch deliberately ignores the range bounds
  * once a session is selected.
  */
-function loadSequences(db: Database, range?: Range): StepSequences {
-  const filter = rangeWhere(range)
+function loadSequences(db: Database, range?: Range, filters?: Filters): StepSequences {
+  const filter = buildWhere(range, filters)
   const sessionRows = db.query(`SELECT DISTINCT session_id FROM steps ${filter.where}`).all(...filter.params) as { session_id: string }[]
   const sessionIDs = sessionRows.map((row) => row.session_id)
   const bySession = new Map<string, StepRow[]>()
@@ -334,9 +386,9 @@ function loadSequences(db: Database, range?: Range): StepSequences {
  * Cache reuse losses with a best-effort reason: a compaction in between,
  * an idle gap long enough to be provider-side expiry, or unknown.
  */
-export function cacheDrops(db: Database, options?: { range?: Range; ttlHintMs?: number }): CacheDropRow[] {
+export function cacheDrops(db: Database, options?: { range?: Range; filters?: Filters; ttlHintMs?: number }): CacheDropRow[] {
   const ttlHint = options?.ttlHintMs ?? DEFAULT_TTL_HINT_MS
-  const { bySession, compactions } = loadSequences(db, options?.range)
+  const { bySession, compactions } = loadSequences(db, options?.range, options?.filters)
   const from = options?.range?.from
   const to = options?.range?.to
   const drops: CacheDropRow[] = []
@@ -378,8 +430,8 @@ export function cacheDrops(db: Database, options?: { range?: Range; ttlHintMs?: 
  * still reused the cache, and the shortest gap that lost it. Comparing the
  * two per provider turns TTL guesses into observations.
  */
-export function cacheTtlEvidence(db: Database, range?: Range): TtlEvidenceRow[] {
-  const { bySession } = loadSequences(db, range)
+export function cacheTtlEvidence(db: Database, options?: { range?: Range; filters?: Filters }): TtlEvidenceRow[] {
+  const { bySession } = loadSequences(db, options?.range, options?.filters)
   const evidence = new Map<string, TtlEvidenceRow>()
 
   for (const steps of bySession.values()) {
@@ -440,7 +492,7 @@ export function percentile(values: readonly number[], p: number): number | undef
   return sorted[index]
 }
 
-function statsFor(values: number[]): LatencyStats {
+export function latencyStats(values: number[]): LatencyStats {
   return {
     count: values.length,
     p50: percentile(values, 50),
@@ -449,8 +501,10 @@ function statsFor(values: number[]): LatencyStats {
   }
 }
 
-export function latency(db: Database, range?: Range): LatencyReport {
-  const filter = rangeWhere(range)
+const statsFor = latencyStats
+
+export function latency(db: Database, range?: Range, filters?: Filters): LatencyReport {
+  const filter = buildWhere(range, filters)
   const rows = db
     .query(`SELECT created_at, streamed_at, completed_at, output_tokens, reasoning_tokens FROM steps ${filter.where}`)
     .all(...filter.params) as { created_at: number | null; streamed_at: number | null; completed_at: number | null; output_tokens: number | null; reasoning_tokens: number | null }[]
@@ -470,6 +524,7 @@ export function latency(db: Database, range?: Range): LatencyReport {
 
 export type SessionUsage = Usage & {
   sessionID: string
+  parentID: string | undefined
   title: string | undefined
   directory: string | undefined
   providers: string[]
@@ -477,14 +532,15 @@ export type SessionUsage = Usage & {
   prompts: number
   firstAt: number | undefined
   lastAt: number | undefined
+  cacheHitRatio: number | undefined
 }
 
-export function sessions(db: Database, options?: { range?: Range; limit?: number }): SessionUsage[] {
-  const filter = rangeWhere(options?.range, "COALESCE(st.created_at, st.recorded_at)")
+export function sessions(db: Database, options?: { range?: Range; filters?: Filters; limit?: number }): SessionUsage[] {
+  const filter = buildWhere(options?.range, options?.filters, "COALESCE(st.created_at, st.recorded_at)")
   const limit = options?.limit ?? 20
   const rows = db
     .query(
-      `SELECT st.session_id, s.title, s.directory,
+      `SELECT st.session_id, s.title, s.directory, s.parent_id,
               GROUP_CONCAT(DISTINCT st.provider_id) AS providers,
               GROUP_CONCAT(DISTINCT st.model_id) AS models,
               (SELECT COUNT(*) FROM prompts p WHERE p.session_id = st.session_id) AS prompts,
@@ -511,6 +567,7 @@ export function sessions(db: Database, options?: { range?: Range; limit?: number
     session_id: string
     title: string | null
     directory: string | null
+    parent_id: string | null
     providers: string | null
     models: string | null
     prompts: number | null
@@ -518,17 +575,22 @@ export function sessions(db: Database, options?: { range?: Range; limit?: number
     last_at: number | null
   })[]
 
-  return rows.map((row) => ({
-    ...usageFrom(row),
-    sessionID: row.session_id,
-    title: row.title ?? undefined,
-    directory: row.directory ?? undefined,
-    providers: row.providers ? row.providers.split(",").filter(Boolean) : [],
-    models: row.models ? row.models.split(",").filter(Boolean) : [],
-    prompts: row.prompts ?? 0,
-    firstAt: row.first_at ?? undefined,
-    lastAt: row.last_at ?? undefined,
-  }))
+  return rows.map((row) => {
+    const usage = usageFrom(row)
+    return {
+      ...usage,
+      sessionID: row.session_id,
+      parentID: row.parent_id ?? undefined,
+      title: row.title ?? undefined,
+      directory: row.directory ?? undefined,
+      providers: row.providers ? row.providers.split(",").filter(Boolean) : [],
+      models: row.models ? row.models.split(",").filter(Boolean) : [],
+      prompts: row.prompts ?? 0,
+      firstAt: row.first_at ?? undefined,
+      lastAt: row.last_at ?? undefined,
+      cacheHitRatio: cacheHitRatio(usage),
+    }
+  })
 }
 
 export type TurnDrop = {
@@ -634,9 +696,9 @@ function stepMessage(row: TurnStepRow): AssistantMessage {
  */
 export function turns(
   db: Database,
-  options?: { sessionID?: string | undefined; range?: Range | undefined; limit?: number | undefined },
+  options?: { sessionID?: string | undefined; range?: Range | undefined; filters?: Filters | undefined; limit?: number | undefined },
 ): TurnUsage[] {
-  const filter = rangeWhere(options?.range)
+  const filter = buildWhere(options?.range, options?.filters)
   const clauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
   const params: (number | string)[] = [...filter.params]
   if (options?.sessionID !== undefined) {

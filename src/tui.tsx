@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite"
 import { Show, createMemo, createRenderEffect, createSignal } from "solid-js"
 import { computeTurn, type LineFields, type LineIdentity, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
 import { lineParts, lineText, sessionTotals, toTranscript, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
-import { PANEL_NAME, parseArgs, type PanelView, type RangeKey } from "./panel-data"
+import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
 import { TurnsSidebar } from "./sidebar"
 import { openStatsDb } from "./stats/db"
@@ -84,8 +84,13 @@ export default Plugin.define({
     if (options.enabled === false) return
     const panelEnabled = options.panel !== false
 
-    const [view, setView] = createSignal<PanelView>("overview")
-    const [range, setRange] = createSignal<RangeKey>("all")
+    // Panel state lives in the host's durable store, so the view, range, sort,
+    // bucket and filters survive a restart and the command palette and the
+    // panel keys mutate the same object.
+    const [settings, updateSettings] = ctx.storage.store<PanelSettings>("panel", { initial: DEFAULT_SETTINGS })
+    const patchSettings = (mutation: (draft: PanelSettings) => void): void => {
+      void updateSettings(mutation)
+    }
     // Bumped when a step or an execution ends: the panel and the sidebar read
     // the database, which is not reactive by itself.
     const [refresh, setRefresh] = createSignal(0)
@@ -221,7 +226,14 @@ export default Plugin.define({
           append: "session.panel",
           render: (input) =>
             input.name === PANEL_NAME ? (
-              <Panel input={input} ctx={ctx} deps={{ db, now: () => Date.now(), sessionStart, refresh }} view={view} range={range} />
+              <Panel
+                input={input}
+                ctx={ctx}
+                deps={{ db, now: () => Date.now(), sessionStart, refresh }}
+                settings={settings}
+                update={patchSettings}
+                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, identity: options.identity }}
+              />
             ) : null,
         })
       : () => {}
@@ -251,8 +263,12 @@ export default Plugin.define({
      */
     function open(input?: string): boolean {
       const parsed = parseArgs(input)
-      if (parsed.view !== undefined) setView(parsed.view)
-      if (parsed.range !== undefined) setRange(parsed.range)
+      if (parsed.view !== undefined || parsed.range !== undefined) {
+        patchSettings((draft) => {
+          if (parsed.view !== undefined) draft.view = parsed.view
+          if (parsed.range !== undefined) draft.range = parsed.range
+        })
+      }
       const tokens = (input ?? "")
         .split(/\s+/)
         .map((token) => token.trim())
@@ -313,7 +329,10 @@ export default Plugin.define({
     __test.lineText = (sessionID: string) =>
       lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields }))
     __test.open = open
-    __test.state = () => ({ view: view(), range: range() })
+    __test.state = () => {
+      const current = sanitizeSettings(settings)
+      return { view: current.view, range: current.range }
+    }
 
     return () => {
       for (const dispose of disposeEvents) dispose()

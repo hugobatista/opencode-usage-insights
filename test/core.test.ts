@@ -350,9 +350,11 @@ describe("line identity", () => {
     expect(formatLine(stats, plain)).toBe("orcarouter-dsv4.1flash · changed · in 100, cached 0, out 10")
   })
 
-  test("identity: model keeps the provider view, with the operator", () => {
+  test("identity: model keeps the provider view, without the reported operator", () => {
     const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash", upstream: "DeepSeek" }
-    expect(formatLine(stats, { ...plain, identity: "model" })).toBe(
+    expect(formatLine(stats, { ...plain, identity: "model" })).toBe("opencode/deepseek-v4.1-flash-free · in 100, cached 0, out 10")
+    // Still available on request, for anyone who wants the evidence.
+    expect(formatLine(stats, { ...plain, identity: "model", fields: { ...plain.fields, upstream: true } })).toBe(
       "opencode/deepseek-v4.1-flash-free (via DeepSeek) · in 100, cached 0, out 10",
     )
   })
@@ -464,10 +466,13 @@ describe("formatLineSegments", () => {
     expect(segments.find((s) => s.text === "model changed")!.tone).toBe("muted")
   })
 
-  test("mentions the upstream operator when known", () => {
+  test("keeps the reported operator out of the default segments", () => {
     const stats = computeTurn(lineTranscript(), session)!
     stats.upstream = "DeepInfra"
-    expect(formatLineSegments(stats).find((s) => s.text.includes("via"))!.text).toBe("opencode/deepseek-v4.1-flash-free (via DeepInfra)")
+    expect(formatLineSegments(stats).find((s) => s.text.includes("via"))).toBeUndefined()
+    expect(formatLineSegments(stats, { fields: { upstream: true } }).find((s) => s.text.includes("via"))!.text).toBe(
+      "opencode/deepseek-v4.1-flash-free (via DeepInfra)",
+    )
   })
 
   test("respects field toggles and label overrides", () => {

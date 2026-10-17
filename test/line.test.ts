@@ -168,10 +168,10 @@ describe("lineParts", () => {
     expect(lineText(lineParts(sameProvider))).not.toContain("changed · model changed")
   })
 
-  test("shows the upstream operator next to the provider", () => {
+  test("leaves the reported operator out unless it is asked for", () => {
     const withUpstream = { ...stats, upstream: "fireworks" }
-    expect(lineText(lineParts(withUpstream))).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
-    expect(lineText(lineParts(withUpstream, { fields: { upstream: false } }))).not.toContain("fireworks")
+    expect(lineText(lineParts(withUpstream))).not.toContain("fireworks")
+    expect(lineText(lineParts(withUpstream, { fields: { upstream: true } }))).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
   })
 
   test("shows the cache warning only when a drop was detected", () => {
