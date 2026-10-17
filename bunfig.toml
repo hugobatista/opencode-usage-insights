@@ -1,0 +1,7 @@
+# Bun configuration.
+#
+# Tests preload `test/preload.ts`, which points the bare `solid-js` specifier at
+# the client build: Bun defaults it to the server build, where signals do not
+# track, while the TUI stack uses the client build.
+[test]
+preload = ["./test/preload.ts"]

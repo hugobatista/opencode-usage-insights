@@ -1,0 +1,76 @@
+{
+  "name": "opencode-usage-insights",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: live turn telemetry line plus persistent usage statistics (provider/model, tokens, prompt cache, affinity) with an in-TUI stats panel.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Hugo Batista",
+    "url": "https://github.com/hugobatista"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hugobatista/opencode-usage-insights.git"
+  },
+  "homepage": "https://github.com/hugobatista/opencode-usage-insights#readme",
+  "bugs": {
+    "url": "https://github.com/hugobatista/opencode-usage-insights/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "usage",
+    "statistics",
+    "tokens",
+    "prompt-cache",
+    "tui"
+  ],
+  "engines": {
+    "opencode": ">=2.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js",
+      "default": "./dist/tui.js"
+    }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun run scripts/build.ts",
+    "demo": "bun run scripts/demo.ts",
+    "report": "bun run scripts/report.ts",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.16",
+    "@opencode/theme": ">=2.0.29",
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": ">=1.9.12"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.29",
+    "@opencode/theme": "2.0.29",
+    "@opentui/core": "0.6.6",
+    "@opentui/solid": "0.6.6",
+    "@types/bun": "^1.4.1",
+    "@types/node": "^24.0.0",
+    "solid-js": "1.9.12",
+    "typescript": "^5.8.0"
+  }
+}
