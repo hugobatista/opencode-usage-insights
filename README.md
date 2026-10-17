@@ -3,16 +3,16 @@
 [![GitHub Tag](https://img.shields.io/github/v/tag/hugobatista/opencode-usage-insights?logo=github&label=latest)](https://github.com/hugobatista/opencode-usage-insights/releases)
 [![Test](https://img.shields.io/github/actions/workflow/status/hugobatista/opencode-usage-insights/test.yml?label=Test)](https://github.com/hugobatista/opencode-usage-insights/actions/workflows/test.yml)
 [![Lint](https://img.shields.io/github/actions/workflow/status/hugobatista/opencode-usage-insights/lint.yml?label=Lint)](https://github.com/hugobatista/opencode-usage-insights/actions/workflows/lint.yml)
-[![npm](https://img.shields.io/npm/v/opencode-usage-insights.svg)](https://www.npmjs.com/package/opencode-usage-insights)
+<!-- npm badge goes here once the first release is published: [![npm](https://img.shields.io/npm/v/opencode-usage-insights.svg)](https://www.npmjs.com/package/opencode-usage-insights) -->
 
 OpenCode TUI plugin. Shows one telemetry line above the composer after every
-turn — response end time, the gap since the previous prompt, the provider (and
-the upstream operator when it can be observed), turn and session token totals,
-plus cache and provider-change warnings. The same plugin records every
-assistant step into a local SQLite database and reads it back in a `/usage`
-panel, so you can answer questions the host cannot: which inference operator is
-actually serving a model, where the prompt cache was lost, how latency moves
-over a period, what each session cost.
+turn — response end time, the gap since the previous prompt, the **endpoint that
+served it**, turn and session token totals, plus cache and endpoint-change
+warnings. The same plugin records every assistant step into a local SQLite
+database and reads it back in an interactive `/usage` panel, so you can answer
+questions the host cannot: which endpoint is really serving a model, where the
+prompt cache was lost, how latency and cost move over a period, and what each
+session used.
 
 Everything is local: one SQLite file under the OpenCode state directory, read by
 the TUI and written by the server-side recorder.
@@ -78,6 +78,10 @@ from a seeded database.
 - [Bun](https://bun.sh) to install dependencies (dev only).
 
 ## Install
+
+> **Not on the npm registry yet.** Until the first release is published,
+> `opencode plugin add` and the package-name form below cannot resolve it — use
+> the local checkout, the last form of this section.
 
 ```sh
 opencode plugin add opencode-usage-insights
