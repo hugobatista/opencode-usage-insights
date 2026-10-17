@@ -291,11 +291,6 @@ export function sparkline(values: readonly number[], maxBars = 48): string {
   return series.map((value) => SPARK[Math.min(SPARK.length - 1, Math.max(0, Math.round((value / max) * (SPARK.length - 1))))]!).join("")
 }
 
-/** `hit 97.8% (n=431)` — a percentage always carries the sample it came from. */
-export function formatHit(stats: CacheStats): string {
-  return `${formatPercent(stats.hit)} (n ${formatCount(stats.steps)})`
-}
-
 /**
  * The live line's buckets, so every aggregate the panel shows reconciles with
  * it: `in` is the uncached prompt (fresh input *and* cache writes), `prompt` is
@@ -335,14 +330,6 @@ export function usageBuckets(usage: {
     cost: usage.cost,
     hit: prompt > 0 ? usage.cached / prompt : undefined,
   }
-}
-
-export function cacheColumns(stats: CacheStats): string[] {
-  return [formatTokens(stats.input), formatTokens(stats.cached), formatTokens(stats.cacheWrite), formatPercent(stats.hit), formatPercent(stats.hitP50)]
-}
-
-export function cacheHeader(): string[] {
-  return ["in", "cached", "write", "hit", "hit p50"]
 }
 
 // ---------------------------------------------------------------------------
