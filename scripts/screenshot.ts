@@ -45,6 +45,7 @@ const FONT_STACK = "MesloLGS Nerd Font Mono, Noto Sans Mono, DejaVu Sans Mono, m
 const THEME = {
   background: RGBA.fromHex("#101215"),
   raised: RGBA.fromHex("#232833"),
+  raisedHigh: RGBA.fromHex("#323a4a"),
   base: RGBA.fromHex("#d7dae0"),
   muted: RGBA.fromHex("#8b93a1"),
   warning: RGBA.fromHex("#e5c07b"),
@@ -73,23 +74,27 @@ const harness = createHarness({
   ],
   theme: {
     text: { base: THEME.base, muted: THEME.muted, feedback: { warning: { base: THEME.warning }, info: { base: THEME.accent } } },
-    background: { base: THEME.background, raised: { base: THEME.raised } },
+    background: { base: THEME.background, raised: { base: THEME.raised, high: THEME.raisedHigh } },
   },
 })
 
-/** Render one claim, capture the frame, and return its SVG. */
-async function renderSvg(render: () => unknown, size: { width: number; height: number }): Promise<string> {
+/**
+ * Render one claim, capture the frame, and return its SVG. The `background` is
+ * the surface the claim sits on: the session panel is drawn on `raised.base`, so
+ * its images use that canvas and the cursor band reads as it does in the TUI.
+ */
+async function renderSvg(render: () => unknown, size: { width: number; height: number }, background: RGBA = THEME.background): Promise<string> {
   // First pass at a generous height: the panel draws a full-height scrollbar
   // even when the view fits, so the painted content — not the frame — decides
   // how tall the image is. The second pass renders at exactly that height.
-  const probe = await renderFrame(render, { width: size.width, height: Math.max(size.height, 60) })
+  const probe = await renderFrame(render, { width: size.width, height: Math.max(size.height, 60) }, background)
   const height = Math.max(1, contentHeight(probe))
-  const frame = height === probe.lines.length ? probe : await renderFrame(render, { width: size.width, height })
-  return frameToSvg(frame, THEME.background)
+  const frame = height === probe.lines.length ? probe : await renderFrame(render, { width: size.width, height }, background)
+  return frameToSvg(frame, background)
 }
 
-async function renderFrame(render: () => unknown, size: { width: number; height: number }): Promise<CapturedFrame> {
-  const setup = await testRender(render as never, { ...size, backgroundColor: THEME.background })
+async function renderFrame(render: () => unknown, size: { width: number; height: number }, background: RGBA): Promise<CapturedFrame> {
+  const setup = await testRender(render as never, { ...size, backgroundColor: background })
   try {
     await setup.renderOnce()
     return setup.captureSpans()
@@ -226,7 +231,7 @@ for (const view of ["overview", "endpoints", "cache"] as const) {
   if (command === undefined) throw new Error("the plugin did not register the /usage command")
   command.run(view)
   results.push(
-    writeImage(`panel-${view}`, await renderSvg(() => panelClaim.render(panelInput as never), { width: 104, height: 40 })),
+    writeImage(`panel-${view}`, await renderSvg(() => panelClaim.render(panelInput as never), { width: 104, height: 40 }, THEME.raised)),
   )
 }
 

@@ -429,6 +429,19 @@ describe("what a view pays for", () => {
     expect(text(buildPanel(request(handle, { view: "db", database: dbInfoOf(db) })))).toContain("what it holds")
     db.close()
   })
+
+  test("the db view's retention rows show the cutoff date the prune uses", () => {
+    const db = seed()
+    const now = BASE + 90 * MIN
+    const view = buildPanel(request(db, { view: "db", database: dbInfo(db, ":memory:", now) }))
+    const body = text(view)
+    expect(body).toContain("older than")
+    // 30 days before `now`, formatted the same way the view does.
+    expect(body).toContain(new Date(now - 30 * 24 * 60 * 60 * 1000).toLocaleDateString("en-GB"))
+    // The row is the cursor's target: Enter prunes from this cutoff.
+    expect(view.find((line) => line.row?.kind === "prune")?.row?.value).toBe("30")
+    db.close()
+  })
 })
 
 describe("each view builds", () => {

@@ -218,7 +218,7 @@ function build(request: PanelRequest): PanelLine[] {
       // builder without them says so instead of inventing a location.
       return request.database === undefined
         ? [{ text: "the database location is unavailable to this panel", tone: "warning" }]
-        : dbLines({ info: request.database, busy: request.busy }, width)
+        : dbLines({ info: request.database, busy: request.busy, now }, width)
     case "turns": {
       const sessionID = request.turnsScope === "session" ? request.sessionID : undefined
       const rows = sortTurns(turns(db, { sessionID, range, filters, limit: 300 }), request.sort, request.sortDesc)

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/solid"
+import { TextAttributes, type RGBA } from "@opentui/core"
 import { formatClock } from "../src/core"
 import { PANEL_NAME } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
@@ -133,6 +134,23 @@ function treeText(setup: unknown, depth = 0): string {
   }
   void depth
   return read(root, depth)
+}
+
+type PanelRowNode = { id: string; bg: RGBA | undefined; attributes: number }
+
+/** The id'd content rows of the panel, with the cursor props: bg and attributes. */
+function panelRows(setup: unknown): PanelRowNode[] {
+  const root = (setup as { renderer: { root?: Record<string, unknown> } }).renderer.root
+  const rows: PanelRowNode[] = []
+  const walk = (node: Record<string, unknown>): void => {
+    const id = node.id
+    if (typeof id === "string" && id.startsWith("line-")) {
+      rows.push({ id, bg: node.bg as RGBA | undefined, attributes: typeof node.attributes === "number" ? node.attributes : 0 })
+    }
+    for (const child of ((node.getChildren as (() => Record<string, unknown>[]) | undefined)?.() ?? [])) walk(child)
+  }
+  if (root !== undefined) walk(root)
+  return rows
 }
 
 describe("module shape", () => {
@@ -554,6 +572,42 @@ describe("rendering", () => {
       expect(frame).toContain("cached")
       expect(frame).toContain("[1 overview]")
       expect(frame).toContain("? help")
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("marks the selected row with a cursor visible on the panel surface", async () => {
+    const db = openStatsDb(resolveDbPath())
+    upsertSession(db, { sessionID: "ses_panel_cursor", startedAt: at(0), title: "Cursor session" })
+    recordStep(db, { messageID: "msg_cursor", sessionID: "ses_panel_cursor", input: 10, createdAt: at(1), completedAt: at(2) })
+    db.close()
+
+    const harness = init({ sessions: [session({ id: "ses_panel_cursor" })] })
+    harness.command("usage-insights.stats")!.run("db")
+    const claim = harness.claim("session.panel")!
+    const input = { name: PANEL_NAME, sessionID: "ses_panel_cursor", width: 110, presentation: "panel", focused: false }
+    const setup = await testRender(() => claim.render(input as never) as never, { width: 120, height: 30 })
+    try {
+      await setup.renderOnce()
+      const raised = harness.theme.background.raised
+      // The host paints the panel surface with `raised.base`, so a cursor of
+      // that same colour is invisible (the bug this guards). `raised.high` is
+      // the rung above it, the token the host itself uses for a selected row.
+      expect(raised.high.equals(raised.base)).toBe(false)
+
+      const highlighted = (): PanelRowNode[] => panelRows(setup).filter((row) => row.bg !== undefined && row.bg.equals(raised.high))
+      const first = highlighted()
+      expect(first).toHaveLength(1)
+      expect(first[0]!.attributes & TextAttributes.BOLD).toBe(TextAttributes.BOLD)
+
+      // The db view's retention rows are its only selectable lines; moving down
+      // must carry the cursor to the next one.
+      harness.command("usage-insights.cursor.down")!.run()
+      await setup.renderOnce()
+      const second = highlighted()
+      expect(second).toHaveLength(1)
+      expect(second[0]!.id).not.toBe(first[0]!.id)
     } finally {
       await setup.dispose()
     }

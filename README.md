@@ -157,7 +157,7 @@ a help overlay that repeats the keys and defines every number.
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move the cursor; the row under it is highlighted. |
 | `pageup` `pagedown` / `home` `end` | Move by ten rows / to the first or last row. |
-| `enter` | Drill into the row: a model → the endpoints that served it and its affinity; an endpoint → the models it served and its latency; a session → its turns; a period → the models of the period. In `db`, prune the steps older than the row (asks first). |
+| `enter` | Drill into the row: a model → the endpoints that served it and its affinity; an endpoint → the models it served and its latency; a session → its turns; a period → the models of the period. In `db`, prune the steps recorded before the selected retention's cutoff date (asks first). |
 | `backspace` | Go back from a drill-down. |
 | `0`–`9` / `[` `]` | Pick a view (`0` is `db`) / cycle views. |
 | `t` / `shift+t` | Next / previous range. |
@@ -187,7 +187,7 @@ durable storage, so the panel reopens where it was left.
 | `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per endpoint when a model is filtered). `n < 5` is dimmed. |
 | `sessions` | Each session with steps, prompts, tokens, `hit`, cost, its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
 | `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line. `a` widens it to every session, titled. |
-| `db` | Where the file lives, what it holds and how much of it is old. `enter` prunes a retention, `v` gives the space back. |
+| `db` | Where the file lives, what it holds and how much of it is old. The retention table lists, per preset (`30`/`90`/`365` days), how many steps a prune would remove and the cutoff date it prunes from — pick one with `↑`/`↓` and `enter` prunes it (a confirmation first); `v` gives the space back. |
 
 The panel sums the stored per-step buckets over the selected range, so a number
 read in one place means the same in the other: `prompt` is everything the

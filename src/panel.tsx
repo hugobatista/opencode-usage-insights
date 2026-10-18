@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { Database } from "bun:sqlite"
-import type { RGBA } from "@opentui/core"
+import { TextAttributes, type RGBA } from "@opentui/core"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
 import { For, createMemo, createRenderEffect, createSignal } from "solid-js"
 import { buildPanel, defaultSort, nextSort, type PanelRequest } from "./panel-build"
@@ -387,7 +387,11 @@ export function Panel(props: {
     }
   }
 
-  const selectedBackground = (): RGBA => props.ctx.theme.background.raised.base
+  // The host paints the panel surface with `background.raised.base` (and
+  // `background.base` full screen), so the cursor has to step up a rung: a
+  // `raised.base` band would be invisible on the panel it sits on. `raised.high`
+  // is the token the host itself uses for a selected row on a raised surface.
+  const selectedBackground = (): RGBA => props.ctx.theme.background.raised.high
   const cursorIndex = (): number => cursor()
 
   return (
@@ -408,15 +412,19 @@ export function Panel(props: {
       >
         <For each={header()}>{(line) => <text fg={color(line.tone)}>{line.text}</text>}</For>
         <For each={content()}>
-          {(line, index) => (
-            <text
-              id={`line-${index()}`}
-              fg={color(line.tone)}
-              bg={index() === selectedLineIndex(content(), cursorIndex()) ? selectedBackground() : undefined}
-            >
-              {line.text}
-            </text>
-          )}
+          {(line, index) => {
+            const selected = () => index() === selectedLineIndex(content(), cursorIndex())
+            return (
+              <text
+                id={`line-${index()}`}
+                fg={color(line.tone)}
+                bg={selected() ? selectedBackground() : undefined}
+                attributes={selected() ? TextAttributes.BOLD : undefined}
+              >
+                {line.text}
+              </text>
+            )
+          }}
         </For>
         <text fg={props.ctx.theme.text.muted}>{""}</text>
         <text fg={props.ctx.theme.text.muted}>{keysFor(view())}</text>

@@ -51,7 +51,7 @@ export type HarnessTheme = {
   }
   background: {
     base: RGBA
-    raised: { base: RGBA }
+    raised: { base: RGBA; high: RGBA }
   }
 }
 
@@ -66,7 +66,7 @@ export const DEFAULT_HARNESS_THEME: HarnessTheme = {
   },
   background: {
     base: RGBA.fromInts(20, 20, 20, 255),
-    raised: { base: RGBA.fromInts(40, 40, 40, 255) },
+    raised: { base: RGBA.fromInts(40, 40, 40, 255), high: RGBA.fromInts(64, 64, 64, 255) },
   },
 }
 
@@ -79,7 +79,7 @@ export type HarnessThemeOverrides = {
   }
   background?: {
     base?: RGBA
-    raised?: { base?: RGBA }
+    raised?: { base?: RGBA; high?: RGBA }
   }
 }
 
@@ -257,7 +257,10 @@ function mergeTheme(base: HarnessTheme, overrides: HarnessThemeOverrides | undef
     },
     background: {
       base: overrides.background?.base ?? base.background.base,
-      raised: { base: overrides.background?.raised?.base ?? base.background.raised.base },
+      raised: {
+        base: overrides.background?.raised?.base ?? base.background.raised.base,
+        high: overrides.background?.raised?.high ?? base.background.raised.high,
+      },
     },
   }
 }

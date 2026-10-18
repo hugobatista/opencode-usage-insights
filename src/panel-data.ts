@@ -379,7 +379,7 @@ export function viewBar(view: PanelView, width = 200): PanelLine {
 }
 
 export function keysFor(of: PanelView): string {
-  if (of === "db") return "↑↓ move · enter prune (asks first) · v vacuum · r refresh · 0-9 view · ? help"
+  if (of === "db") return "↑↓ pick a retention · enter prune (asks first) · v vacuum · r refresh · 0-9 view · ? help"
   if (of === "periods") return "↑↓ move · enter drill · b bucket · t range · m/e filter · x clear · 0-9 view · ? help"
   if (of === "turns") return "↑↓ move · a scope · t range · 1-9 view · ? help"
   return "↑↓ move · enter drill · s sort · t range · m/e filter · x clear · 1-9 view · ? help"
@@ -433,7 +433,8 @@ export function helpLines(width: number): PanelLine[] {
     { text: "" },
     { text: "database", tone: HEADER_TONE },
     { text: "  the db view shows where the file lives, what it holds and how much" },
-    { text: "  of it is old: enter prunes a retention, v gives the space back" },
+    { text: "  of it is old: ↑↓ pick a retention, enter prunes from its cutoff date," },
+    { text: "  v gives the space back" },
     { text: "  local time · SQLite in the OpenCode state directory" },
   ]
   return lines.map((line) => ({ ...line, text: truncate(line.text, width) }))
@@ -1109,7 +1110,7 @@ export function sessionsLines(
 // ---------------------------------------------------------------------------
 
 /** The database view: where it lives, what it holds, and the two cleanups. */
-export function dbLines(data: { info: DbInfo; busy?: boolean | undefined }, width: number): PanelLine[] {
+export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: number }, width: number): PanelLine[] {
   const lines: PanelLine[] = []
   const size = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`
   lines.push({ text: truncate(data.info.path, width), tone: "base" })
@@ -1131,12 +1132,15 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined }, widt
 
   lines.push({ text: "", tone: "muted" })
   lines.push({ text: "clean up", tone: HEADER_TONE })
-  lines.push({ text: "  enter prunes the steps older than the row · v gives the space back", tone: "muted" })
-  const widths = [10, 10]
-  lines.push({ text: formatTableRow(["keep", "prunes"], widths, ["left", "right"]), tone: "muted" })
+  // The retention rows are the only selectable lines here, so the hint says how
+  // to pick one and what Enter does: the row is a cutoff, not a count.
+  lines.push({ text: truncate("  ↑↓ pick a retention · enter prunes the steps older than it (asks first) · v gives the space back", width), tone: "muted" })
+  const widths = [10, 13, 10]
+  lines.push({ text: formatTableRow(["keep", "prunes", "older than"], widths, ["left", "right", "left"]), tone: "muted" })
   for (const option of data.info.removable) {
+    const before = new Date(data.now - option.days * 24 * 60 * 60 * 1000).toLocaleDateString("en-GB")
     lines.push({
-      text: formatTableRow([`${option.days} days`, `${formatCount(option.steps)} steps`], widths, ["left", "right"]),
+      text: formatTableRow([`${option.days} days`, `${formatCount(option.steps)} steps`, before], widths, ["left", "right", "left"]),
       tone: option.steps === 0 ? "muted" : "base",
       row: { kind: "prune", value: String(option.days) },
     })
