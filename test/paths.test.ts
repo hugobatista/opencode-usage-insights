@@ -13,7 +13,9 @@ const POSIX = process.platform !== "win32"
 
 describe("defaultDbPath", () => {
   test("linux honours XDG_STATE_HOME", () => {
-    expect(defaultDbPath({ XDG_STATE_HOME: "/x" }, "linux")).toBe("/x/opencode/stats/stats.db")
+    // The branch is Linux, the separator is the host's (`path.join` does the
+    // joining), so the expectation joins too and holds wherever the suite runs.
+    expect(defaultDbPath({ XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "stats", "stats.db"))
   })
 
   test("linux falls back to ~/.local/state", () => {
@@ -37,7 +39,7 @@ describe("resolveDbPath", () => {
   test("precedence: option, env, default", () => {
     expect(resolveDbPath("/custom.db", { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/custom.db")
     expect(resolveDbPath(undefined, { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/env.db")
-    expect(resolveDbPath(undefined, { XDG_STATE_HOME: "/x" }, "linux")).toBe("/x/opencode/stats/stats.db")
+    expect(resolveDbPath(undefined, { XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "stats", "stats.db"))
   })
 
   test("expands a leading ~ in every source", () => {
