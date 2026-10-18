@@ -11,7 +11,7 @@ import { Panel } from "./panel"
 import { TurnsSidebar } from "./sidebar"
 import { openStatsDbReadOnly, openStatsDbWrite } from "./stats/db"
 import { resolveDbPath } from "./stats/paths"
-import { latestRouter, routerBefore } from "./stats/queries"
+import { routerBefore, routerForSteps } from "./stats/queries"
 
 /**
  * TUI side of the plugin. Two contributions:
@@ -60,7 +60,7 @@ export type Options = {
 
 const ROUTER_CACHE_MS = 5_000
 
-/** Ceiling on the endpoint lookups kept per session and model. */
+/** Ceiling on the endpoint lookups kept, one per rendered turn. */
 const MAX_ROUTER_CACHE = 512
 
 /**
@@ -169,9 +169,16 @@ export default Plugin.define({
       return ctx.data.session.get(sessionID)?.time.created
     }
 
-    function lookupRouter(sessionID: string, modelID: string | undefined): string | undefined {
-      if (modelID === undefined) return undefined
-      const key = `${sessionID}|${modelID}`
+    /**
+     * Endpoint of the turn that is being rendered, keyed by the turn's steps:
+     * a turn whose requests the gateway did not name stays unknown instead of
+     * borrowing the endpoint of an older turn of the same provider and model.
+     */
+    function lookupRouter(sessionID: string, stepIDs: readonly string[]): string | undefined {
+      if (stepIDs.length === 0) return undefined
+      // The turn's last id identifies the turn; the count keeps a growing turn
+      // (steps appended while it streams) from reusing a shorter answer.
+      const key = `${sessionID}#${stepIDs[stepIDs.length - 1]}#${stepIDs.length}`
       const now = Date.now()
       const cached = routerCache.get(key)
       if (cached !== undefined && now - cached.at < ROUTER_CACHE_MS) return cached.value
@@ -179,7 +186,7 @@ export default Plugin.define({
       const handle = db()
       if (handle !== undefined) {
         try {
-          value = latestRouter(handle, sessionID, modelID)
+          value = routerForSteps(handle, sessionID, stepIDs)
         } catch {
           value = undefined
         }
@@ -220,7 +227,7 @@ export default Plugin.define({
       const info = ctx.data.session.get(sessionID) as unknown as RuntimeSessionInfo | undefined
       const stats = computeTurn(toTranscriptTail(messages, 2), sessionTotals(info))
       if (stats !== undefined) {
-        const router = lookupRouter(sessionID, stats.modelID)
+        const router = lookupRouter(sessionID, stats.stepIDs)
         if (router !== undefined) {
           stats.router = router
           // The transcript carries no routing history, so the previous endpoint

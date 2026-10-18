@@ -21,9 +21,14 @@ export const ENDPOINT_HEADER = "x-opencode-endpoint-id" as const
 export const ENDPOINT_MAX = 64
 
 /**
- * Request hosts that name their endpoint. Gateway hosts answer "which gateway",
- * per-operator hosts answer "which operator", and both are the endpoint the
- * request went to.
+ * Request hosts that name the operator behind the request.
+ *
+ * A gateway host is deliberately absent: `opencode.ai`, `openrouter.ai` and
+ * `vercel-ai-gateway` are routers, not the platform that ran the model, and
+ * treating them as the endpoint made every request served without an endpoint
+ * header read as "opencode" — the provider's name wearing the endpoint's
+ * clothes. When the gateway does not name its downstream endpoint, the endpoint
+ * is unknown, and the views say so.
  */
 const KNOWN_ENDPOINT_HOSTS: ReadonlyArray<readonly [string, string]> = [
   ["api.fireworks.ai", "fireworks"],
@@ -53,9 +58,6 @@ const KNOWN_ENDPOINT_HOSTS: ReadonlyArray<readonly [string, string]> = [
   ["api.nvidia.com", "nvidia"],
   ["api.mistral.ai", "mistral"],
   ["api.cloudflare.com", "cloudflare"],
-  ["opencode.ai", "opencode"],
-  ["openrouter.ai", "openrouter"],
-  ["ai-gateway.vercel.sh", "vercel-ai-gateway"],
 ]
 
 export type EndpointInfo = {

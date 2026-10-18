@@ -191,6 +191,12 @@ export function formatTps(value: number | undefined): string {
   return value === undefined ? "–" : `${value.toFixed(1)}/s`
 }
 
+/** A rate that has to fit a sidebar: whole numbers from 10 up. */
+export function formatTpsCompact(value: number | undefined): string {
+  if (value === undefined) return "–"
+  return value >= 10 ? `${Math.round(value)}/s` : `${value.toFixed(1)}/s`
+}
+
 /** Idle gaps are read at a glance: seconds, minutes, hours, days. */
 export function formatGap(value: number | undefined): string {
   if (value === undefined) return "–"
@@ -451,6 +457,9 @@ function usagePairs(usage: Overview | SessionUsage | undefined): (readonly [stri
   ]
   if (buckets.reasoning > 0) pairs.push(["reasoning", formatTokens(buckets.reasoning)])
   pairs.push(["cost", formatCost(buckets.cost)])
+  // The selection's average throughput, the same number the sidebar's session
+  // block shows.
+  if ("tps" in usage && usage.tps !== undefined) pairs.push(["tps", formatTps(usage.tps)])
   return pairs
 }
 
@@ -1172,6 +1181,9 @@ export function turnStats(turn: TurnUsage): TurnStats {
     cacheDropTokens: turn.drops.reduce((sum, drop) => sum + drop.tokens, 0),
     cacheExpired: turn.drops.length > 0,
     steps: turn.steps,
+    // The panel reads the turn's endpoint straight off the row; the ids are
+    // only how the live line asks the recorder about a turn it just rendered.
+    stepIDs: [],
   }
 }
 
@@ -1210,11 +1222,33 @@ export function turnsLines(rows: readonly TurnUsage[], width: number, options?: 
  */
 export function sessionSummaryLines(usage: Overview, budget = 34): PanelLine[] {
   const buckets = usageBuckets(usage)
+  const steps = formatCount(buckets.steps)
+  const input = formatTokens(buckets.input)
+  const cached = formatTokens(buckets.cached)
+  const out = formatTokens(buckets.output)
+  const hit = formatPercent(buckets.hit)
+  const tps = formatTpsCompact(usage.tps)
+  const cost = formatCost(buckets.cost)
+  // The same order as a turn's three lines: how much was sent (`in`, `cached`),
+  // how much came back (`out`), then `hit`, the rate and the cost last.
+  const first = [
+    `  ${steps} steps · in ${input}`,
+    `  ${steps} steps`,
+  ].find((text) => text.length <= budget)
+  const second = [
+    `  cached ${cached} · out ${out}`,
+    `  cached ${cached}`,
+  ].find((text) => text.length <= budget)
+  const last = [
+    `  hit ${hit} · ${tps} · ${cost}`,
+    `  hit ${hit} · ${cost}`,
+    `  ${cost}`,
+  ].find((text) => text.length <= budget)
   return [
     { text: truncate("session", budget), tone: HEADER_TONE },
-    { text: truncate(`  ${formatCount(buckets.steps)} steps · ${formatCost(buckets.cost)}`, budget), tone: "muted" },
-    { text: truncate(`  in ${formatTokens(buckets.input)} · cached ${formatTokens(buckets.cached)}`, budget), tone: "base" },
-    { text: truncate(`  out ${formatTokens(buckets.output)} · hit ${formatPercent(buckets.hit)}`, budget), tone: "base" },
+    { text: truncate(first ?? `  ${steps} steps`, budget), tone: "muted" },
+    { text: truncate(second ?? `  cached ${cached}`, budget), tone: "base" },
+    { text: truncate(last ?? `  ${cost}`, budget), tone: "base" },
     { text: "", tone: "muted" },
   ]
 }
@@ -1235,17 +1269,32 @@ export function sidebarLines(rows: readonly TurnUsage[], options?: LineFormatOpt
     const prompt = formatTokens(display.prompt)
     const output = formatTokens(display.output)
     const cost = formatCost(turn.totals.cost)
+    // The cache hit of the turn, on the same step the numbers come from. One
+    // decimal, with a trailing `.0` dropped: the sidebar has no room to spare.
+    const hit = formatPercent(display.prompt > 0 ? display.cached / display.prompt : undefined).replace(/\.0%$/, "%")
+    const tps = turn.tps === undefined ? undefined : formatTpsCompact(turn.tps)
     const suffix = turn.drops.length > 0 ? " · ⚠" : ""
-    // The cost of the turn is always shown; when the budget is tight the
-    // parenthesised prompt is the first thing to go.
-    const candidates = [
-      `  ${labels.input} ${input} (${prompt}) · ${labels.output} ${output} · ${cost}${suffix}`,
-      `  ${labels.input} ${input} · ${labels.output} ${output} · ${cost}${suffix}`,
-      `  ${labels.input} ${input} · ${labels.output} ${output}${suffix}`,
+    // Three compact lines: when and through what, the prompt volumes, then what
+    // the turn cost — in tokens per second and in money — and how much of the
+    // prompt came from cache.
+    const volumes = [
+      `  ${labels.input} ${input} (${prompt}) · ${labels.output} ${output}`,
+      `  ${labels.input} ${input} · ${labels.output} ${output}`,
+      `  ${labels.input} ${input}`,
+    ]
+    const facts = [
+      `  hit ${hit}${tps === undefined ? "" : ` · ${tps}`} · ${cost}${suffix}`,
+      `  hit ${hit}${tps === undefined ? "" : ` · ${tps}`}${suffix}`,
+      `  ${tps === undefined ? "" : `${tps} · `}${cost}${suffix}`,
+      `  hit ${hit}${suffix}`,
     ]
     lines.push({ text: truncate(`${clock} ${identity}`, budget), tone: turn.routerChanged ? "warning" : "base" })
     lines.push({
-      text: truncate(candidates.find((text) => text.length <= budget) ?? candidates[candidates.length - 1]!, budget),
+      text: truncate(volumes.find((text) => text.length <= budget) ?? volumes[volumes.length - 1]!, budget),
+      tone: "muted",
+    })
+    lines.push({
+      text: truncate(facts.find((text) => text.length <= budget) ?? facts[facts.length - 1]!, budget),
       tone: turn.drops.length > 0 ? "warning" : "muted",
     })
   }

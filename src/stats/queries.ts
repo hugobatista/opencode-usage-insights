@@ -169,6 +169,12 @@ export type Overview = Usage & {
   firstAt: number | undefined
   lastAt: number | undefined
   cacheHitRatio: number | undefined
+  /**
+   * Tokens generated per second of streaming, over the whole selection: the
+   * produced tokens divided by the summed streaming windows. A weighted average,
+   * not the mean of the per-step rates the latency view reports as p50.
+   */
+  tps: number | undefined
 }
 
 export function overview(db: Database, range?: Range, filters?: Filters): Overview {
@@ -178,10 +184,14 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
       `SELECT ${USAGE_SELECT},
               COUNT(DISTINCT session_id) AS sessions,
               MIN(${STEP_TIME}) AS firstAt,
-              MAX(COALESCE(completed_at, ${STEP_TIME})) AS lastAt
+              MAX(COALESCE(completed_at, ${STEP_TIME})) AS lastAt,
+              COALESCE(SUM(CASE WHEN streamed_at > created_at THEN output_tokens + reasoning_tokens ELSE 0 END), 0) AS produced,
+              COALESCE(SUM(CASE WHEN streamed_at > created_at THEN streamed_at - created_at ELSE 0 END), 0) AS window
        FROM steps ${steps.where}`,
     )
-    .get(...steps.params) as (UsageRow & { sessions: number | null; firstAt: number | null; lastAt: number | null }) | null
+    .get(...steps.params) as
+    | (UsageRow & { sessions: number | null; firstAt: number | null; lastAt: number | null; produced: number | null; window: number | null })
+    | null
 
   const prompts = rangeWhere(range, "created_at")
   const promptRow = db.query(`SELECT COUNT(*) AS prompts FROM prompts ${prompts.where}`).get(...prompts.params) as { prompts: number } | null
@@ -194,6 +204,7 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
     firstAt: row?.firstAt ?? undefined,
     lastAt: row?.lastAt ?? undefined,
     cacheHitRatio: cacheHitRatio(usage),
+    tps: row === null ? undefined : tokensPerSecond(row.produced ?? 0, 0, row.window ?? 0),
   }
 }
 
@@ -490,6 +501,12 @@ export type TurnUsage = {
   drops: TurnDrop[]
   /** Finish reason of the turn's last step. */
   finish: string | undefined
+  /**
+   * Tokens generated per second of streaming over the turn's steps: produced
+   * tokens divided by their summed streaming windows. For a one-step turn it is
+   * that step's rate.
+   */
+  tps: number | undefined
 }
 
 type TurnStepRow = {
@@ -505,6 +522,7 @@ type TurnStepRow = {
   reasoning_tokens: number | null
   cost: number | null
   created_at: number | null
+  streamed_at: number | null
   recorded_at: number
   completed_at: number | null
   finish: string | null
@@ -579,7 +597,7 @@ export function turns(
     .query(
       `SELECT message_id, session_id, provider_id, model_id, variant,
               input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost,
-              created_at, recorded_at, completed_at, finish, router
+              created_at, streamed_at, recorded_at, completed_at, finish, router
          FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
         ORDER BY session_id, ${STEP_TIME}`,
     )
@@ -635,6 +653,13 @@ export function turns(
     const modelID = last.model_id ?? undefined
     const variant = last.variant ?? undefined
     const router = lastWith((row) => row.router)
+    let produced = 0
+    let window = 0
+    for (const row of bucket) {
+      if (row.created_at === null || row.streamed_at === null || row.streamed_at <= row.created_at) continue
+      produced += (row.output_tokens ?? 0) + (row.reasoning_tokens ?? 0)
+      window += row.streamed_at - row.created_at
+    }
     const previous = result.length > 0 && result[result.length - 1]!.sessionID === last.session_id ? result[result.length - 1] : undefined
     result.push({
       sessionID: last.session_id,
@@ -656,6 +681,7 @@ export function turns(
       totals,
       drops,
       finish: last.finish ?? undefined,
+      tps: tokensPerSecond(produced, 0, window),
     })
     bucket = []
   }
@@ -719,19 +745,24 @@ export function routerBefore(db: Database, sessionID: string, at: number | undef
 }
 
 /**
- * Routing endpoint of the newest step recorded for a session+model pair. The
- * TUI reads this for the telemetry line because the line renders from the TUI
- * process while the recorder (the server process) is still writing the step
- * that just finished.
+ * Routing endpoint of one turn: the newest endpoint the recorder stored for
+ * the given steps of a session. The TUI reads this for the telemetry line
+ * because the line renders from the TUI process while the recorder (the server
+ * process) is still writing the step that just finished. Scoped to the turn's
+ * own steps on purpose: the same provider and model can be routed to a
+ * different endpoint per request, so the newest endpoint of the session is not
+ * necessarily the one that served the turn being rendered.
  */
-export function latestRouter(db: Database, sessionID: string, modelID: string): string | undefined {
+export function routerForSteps(db: Database, sessionID: string, messageIDs: readonly string[]): string | undefined {
+  if (messageIDs.length === 0) return undefined
+  const placeholders = messageIDs.map(() => "?").join(", ")
   const row = db
     .query(
       `SELECT router FROM steps
-        WHERE session_id = $sessionID AND model_id = $modelID AND router IS NOT NULL
+        WHERE session_id = ? AND message_id IN (${placeholders}) AND router IS NOT NULL
         ORDER BY recorded_at DESC LIMIT 1`,
     )
-    .get({ $sessionID: sessionID, $modelID: modelID }) as { router: string | null } | null
+    .get(sessionID, ...messageIDs) as { router: string | null } | null
   return row?.router ?? undefined
 }
 

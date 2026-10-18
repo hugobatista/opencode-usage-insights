@@ -255,6 +255,7 @@ describe("computeTurn", () => {
     expect(stats!.providerChanged).toBe(false)
     expect(stats!.modelChanged).toBe(false)
     expect(stats!.cacheExpired).toBe(false)
+    expect(stats!.stepIDs).toEqual(["a1"])
     expect(stats!.totals).toEqual({
       input: 100,
       cached: 900,
@@ -274,6 +275,22 @@ describe("computeTurn", () => {
       step("a2", 200_000, { completed: 200_600 }),
     ])
     expect(stats!.promptGapMs).toBe(192_000)
+  })
+
+  test("lists the settled steps of the turn being measured", () => {
+    const stats = computeTurn([
+      prompt("u1", 1_000),
+      step("a1", 2_000, { completed: 2_600 }),
+      prompt("u2", 3_000),
+      step("a2", 4_000, { completed: 4_600 }),
+      step("a3", 5_000),
+      step("a4", 6_000, { completed: 6_600 }),
+    ])
+    // The ids are how the TUI asks the recorder who served these steps: an
+    // older turn's endpoint must not be attributed to this one, and a step that
+    // never settled has no recorded outcome to attribute.
+    expect(stats!.stepIDs).toEqual(["a2", "a4"])
+    expect(stats!.steps).toBe(2)
   })
 
   test("flags a provider change against the previous turn", () => {

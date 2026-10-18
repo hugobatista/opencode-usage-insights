@@ -21,7 +21,7 @@ import { normalizeToken, sanitizeLabel, TEXT_LIMIT } from "../text"
  *   that gives up quickly instead of holding the recorder up.
  */
 
-export const SCHEMA_VERSION = 7
+export const SCHEMA_VERSION = 8
 
 /** Longest title or path kept: a label on a line, not a document. */
 const LABEL_LIMIT = 4 * TEXT_LIMIT
@@ -192,6 +192,10 @@ function dropUnused(db: Database): void {
     const kinds = REMOVED_EVENT_KINDS.map((kind) => `'${kind}'`).join(", ")
     db.exec(`DELETE FROM events WHERE kind IN (${kinds})`)
   }
+  // A gateway name is not an endpoint: the old discovery stored the host of the
+  // gateway itself when the gateway named no downstream endpoint. Clearing those
+  // values makes the history agree with what the recorder writes now.
+  db.exec("UPDATE steps SET router = NULL WHERE router IN ('opencode', 'openrouter', 'vercel-ai-gateway')")
 }
 
 function schemaVersion(db: Database): number {

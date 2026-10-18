@@ -59,6 +59,7 @@ function overview(overrides: Partial<Overview> = {}): Overview {
     firstAt: undefined,
     lastAt: undefined,
     cacheHitRatio: 340_000 / 352_000,
+    tps: 42.5,
     ...overrides,
   }
 }
@@ -264,6 +265,8 @@ describe("overviewLines", () => {
     expect(text(lines)).toContain(`${padCell("hit", 11)}95.2%`)
     expect(text(lines)).toContain(`${padCell("out", 11)}900`)
     expect(text(lines)).toContain(`${padCell("cost", 11)}$0.4200`)
+    // The selection's average throughput rides with the totals.
+    expect(text(lines)).toContain(`${padCell("tps", 11)}42.5/s`)
     expect(text(lines)).not.toContain("reasoning")
     expect(text(lines)).not.toContain("this session")
   })
@@ -521,9 +524,10 @@ describe("sessionSummaryLines", () => {
     const lines = sessionSummaryLines(overview({ steps: 12, cost: 1.25 }))
     expect(lines[0]!.text).toBe("session")
     expect(lines[0]!.tone).toBe("accent")
-    expect(lines[1]!.text).toBe("  12 steps · $1.25")
-    expect(text(lines)).toContain("in 17k · cached 340k")
-    expect(text(lines)).toContain("out 900 · hit 95.2%")
+    // The same order as a turn's lines: steps/in, cached/out, then hit, rate, cost.
+    expect(lines[1]!.text).toBe("  12 steps · in 17k")
+    expect(lines[2]!.text).toBe("  cached 340k · out 900")
+    expect(lines[3]!.text).toBe("  hit 95.2% · 43/s · $1.25")
     for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(34)
   })
 
@@ -617,6 +621,7 @@ describe("turnsLines", () => {
     totals: usage,
     drops: [],
     finish: "stop",
+    tps: 50,
     ...overrides,
   })
 
@@ -651,12 +656,37 @@ describe("turnsLines", () => {
     expect(text(lines)).toContain("no finished turns for this range")
   })
 
-  test("sidebarLines shows two compact lines per turn within the budget", () => {
+  test("sidebarLines gives each turn three compact lines", () => {
     const lines = sidebarLines([turn({ steps: 2 }), turn({ endAt: 1_500, router: "orcarouter-glm-5.3" })], { budget: 34 })
-    expect(lines).toHaveLength(4)
+    expect(lines).toHaveLength(6)
     expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} orcarouter-dsv4.1flash`)
-    expect(lines[1]!.text).toBe("  in 1.62k · out 1.06k · $0.0100")
+    // The volumes, then what the turn cost in tokens per second and money.
+    expect(lines[1]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
+    expect(lines[2]!.text).toBe("  hit 99.6% · 50/s · $0.0100")
     for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(34)
     expect(sidebarLines([], {})).toEqual([{ text: "no finished turns yet", tone: "muted" }])
+  })
+
+  test("sidebarLines drops the volumes that do not fit, never the rate", () => {
+    const lines = sidebarLines([turn({ steps: 2 })], { budget: 20 })
+    expect(lines[2]!.text).toBe("  hit 99.6% · 50/s")
+  })
+
+  test("sidebarLines falls back to provider/model when no endpoint was observed", () => {
+    const lines = sidebarLines([turn({ router: undefined })], { budget: 40 })
+    // A gateway is not an endpoint: without one, the turn names the model it ran.
+    expect(lines[0]!.text).toContain("opencode-go/deepseek-v4.1-flash")
+  })
+
+  test("sidebarLines leaves the rate out when the step never streamed", () => {
+    const lines = sidebarLines([turn({ steps: 1, tps: undefined })], { budget: 34 })
+    expect(lines[2]!.text).toBe("  hit 99.6% · $0.0100")
+  })
+
+  test("sidebarLines flags a lost cache on the facts line", () => {
+    const lines = sidebarLines([turn({ steps: 2, drops: [{ messageID: "m", tokens: 1_000, gapMs: 60_000 }] })], { budget: 34 })
+    expect(lines[2]!.text).toContain("hit 99.6%")
+    expect(lines[2]!.text).toContain("⚠")
+    expect(lines[2]!.tone).toBe("warning")
   })
 })

@@ -18,11 +18,11 @@ import {
 import { cacheDropsOf, cachePairs, latencyOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
 import {
   cacheHitRatio,
-  latestRouter,
   models,
   overview,
   percentile,
   routerBefore,
+  routerForSteps,
   sessions,
   timeline,
   turns,
@@ -178,6 +178,24 @@ describe("stats queries", () => {
     expect(usage.cacheHitRatio).toBeCloseTo(313_500 / (313_500 + 2_550 + 1_200), 10)
   })
 
+  test("overview reports the weighted streaming rate", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "r1", sessionID: "s", output: 100, createdAt: 0, streamedAt: 1_000, completedAt: 1_100 })
+    recordStep(db, { messageID: "r2", sessionID: "s", output: 300, reasoning: 100, createdAt: 2_000, streamedAt: 3_000, completedAt: 3_100 })
+    // A step with no streaming window contributes neither tokens nor time.
+    recordStep(db, { messageID: "r3", sessionID: "s", output: 50 })
+    // (100 + 400) tokens over (1s + 1s): the weighted rate, not the mean of rates.
+    expect(overview(db).tps).toBeCloseTo(250, 6)
+    db.close()
+  })
+
+  test("overview has no rate when nothing streamed", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "r1", sessionID: "s", output: 50 })
+    expect(overview(db).tps).toBeUndefined()
+    db.close()
+  })
+
   test("overview respects the range", () => {
     const usage = overview(seed(), { from: 0, to: 1_600_000 })
     expect(usage).toMatchObject({ steps: 5, sessions: 2, prompts: 3, input: 1_150, cached: 263_500, output: 470 })
@@ -314,10 +332,10 @@ describe("stats queries", () => {
     expect(routerBefore(db, "s2", 4_000)).toBeUndefined()
   })
 
-  test("latestUpstream returns the newest evidence seen for a session and model", () => {
+  test("routerForSteps reports the endpoint of the turn's own steps", () => {
     const db = freshDb()
     recordStep(db, {
-      messageID: "u1",
+      messageID: "t1a",
       sessionID: "s1",
       providerID: "opencode",
       modelID: "m1",
@@ -325,13 +343,19 @@ describe("stats queries", () => {
       router: "orcarouter-dsv4.1flash",
       recordedAt: 1_000,
     })
-    recordStep(db, { messageID: "u2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 2_000, router: "siliconflow", recordedAt: 2_000 })
-    recordStep(db, { messageID: "u3", sessionID: "s1", providerID: "opencode", modelID: "m2", createdAt: 3_000, recordedAt: 3_000 })
+    recordStep(db, { messageID: "t1b", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, router: "siliconflow", recordedAt: 1_100 })
+    // The next turn of the same provider and model was not named by a gateway.
+    recordStep(db, { messageID: "t2a", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 2_000, recordedAt: 2_000 })
 
-    // The newest endpoint for the pair, which is what the line reports.
-    expect(latestRouter(db, "s1", "m1")).toBe("siliconflow")
-    expect(latestRouter(db, "s1", "m2")).toBeUndefined()
-    expect(latestRouter(db, "s9", "m1")).toBeUndefined()
+    // Newest endpoint among the steps of one turn.
+    expect(routerForSteps(db, "s1", ["t1a", "t1b"])).toBe("siliconflow")
+    expect(routerForSteps(db, "s1", ["t1a"])).toBe("orcarouter-dsv4.1flash")
+    // A turn the gateway did not name stays unknown instead of borrowing the
+    // endpoint of an older turn of the same session and model.
+    expect(routerForSteps(db, "s1", ["t2a"])).toBeUndefined()
+    expect(routerForSteps(db, "s1", [])).toBeUndefined()
+    expect(routerForSteps(db, "s1", ["missing"])).toBeUndefined()
+    expect(routerForSteps(db, "s2", ["t1a"])).toBeUndefined()
   })
 })
 
@@ -373,6 +397,20 @@ describe("turns", () => {
     expect(loop.totals).toMatchObject({ input: 120, cached: 1_900, output: 60, steps: 2 })
     expect(loop.latest).toMatchObject({ input: 100, cached: 900 })
     expect(loop.drops).toEqual([{ messageID: "a2", tokens: 100, gapMs: 300 }])
+  })
+
+  test("reports the turn's weighted rate over its steps", () => {
+    const db = freshDb()
+    recordPrompt(db, { sessionID: "s", messageID: "p1", createdAt: 0 })
+    recordStep(db, { messageID: "t1", sessionID: "s", output: 100, createdAt: 100, streamedAt: 1_100, completedAt: 1_200, finish: "tool-calls" })
+    recordStep(db, { messageID: "t2", sessionID: "s", output: 300, createdAt: 2_000, streamedAt: 2_600, completedAt: 2_700, finish: "stop" })
+    // (100 + 300) tokens over (1000 + 600) ms: the turn's weighted rate.
+    expect(turns(db)[0]!.tps).toBeCloseTo((400 / 1_600) * 1000, 6)
+    db.close()
+  })
+
+  test("has no rate for a turn that never streamed", () => {
+    expect(turns(seedTurns())[0]!.tps).toBeUndefined()
   })
 
   test("marks where the routing endpoint or the provider changed", () => {

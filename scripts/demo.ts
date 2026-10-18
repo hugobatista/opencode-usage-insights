@@ -9,9 +9,9 @@ import { rmSync } from "node:fs"
 import { computeTurn, formatLine, type LineIdentity, type Totals, type TurnTotalsView } from "../src/core"
 import { toTranscript, type RuntimeMessage } from "../src/line"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
-import { PANEL_VIEWS, sidebarLines, type PanelLine } from "../src/panel-data"
+import { PANEL_VIEWS, sessionSummaryLines, sidebarLines, type PanelLine } from "../src/panel-data"
 import { dbInfo } from "../src/stats/maintenance"
-import { turns } from "../src/stats/queries"
+import { overview, turns } from "../src/stats/queries"
 import {
   DEMO_SESSION_ID,
   DEMO_SIDEBAR_TURNS,
@@ -74,8 +74,12 @@ section(
   turnLine([...recorderTurn2, ...recorderTurn3, ...liveTurn], recorderTotals, { router: "orcarouter-dsv4.1flash" }) || "(no line yet)",
 )
 section(
-  "sidebar history (compact, last 3 turns)",
-  body(sidebarLines(turns(db, { sessionID: DEMO_SESSION_ID, limit: DEMO_SIDEBAR_TURNS }), { budget: 34 })),
+  "sidebar (the session's totals, then three lines per turn)",
+  body([
+    ...sessionSummaryLines(overview(db, undefined, { sessionID: DEMO_SESSION_ID }), 34),
+    { text: "turns", tone: "accent" },
+    ...sidebarLines(turns(db, { sessionID: DEMO_SESSION_ID, limit: DEMO_SIDEBAR_TURNS }), { budget: 34 }),
+  ]),
 )
 
 // Every view of the panel, rendered from the same request the TUI builds.

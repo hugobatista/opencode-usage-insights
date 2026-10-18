@@ -102,6 +102,13 @@ export type TurnStats = {
   cacheExpired: boolean
   /** Assistant steps in the turn. */
   steps: number
+  /**
+   * Message ids of the settled steps of the turn, oldest first. The TUI looks
+   * up the endpoint the recorder stored for these steps, so the line reports
+   * who served *this* turn: a lookup by provider and model alone would tag a
+   * turn with the endpoint of an older one.
+   */
+  stepIDs: string[]
 }
 
 export type TurnSegment = {
@@ -343,6 +350,7 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
     cacheDropTokens: drops.reduce((sum, drop) => sum + drop.tokens, 0),
     cacheExpired: drops.length > 0,
     steps: settled.length,
+    stepIDs: settled.map((step) => step.id),
   }
 }
 

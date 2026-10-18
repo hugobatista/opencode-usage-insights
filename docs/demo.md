@@ -48,12 +48,20 @@ turn · response still streaming (no line until the response ends)
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 (no line yet)
 
-sidebar history (compact, last 3 turns)
+sidebar (the session's totals, then three lines per turn)
 ────────────────────────────────────────────────────────────────────────────────────────────────────
+session
+  3 steps · in 130.3k
+  cached 3.24M · out 8.25k
+  hit 96.1% · 1618/s · $1.69
+
+turns
 09:42 orcarouter-claude
-  in 23.8k · out 3.3k · $1.42
+  in 23.8k (119.8k) · out 3.3k
+  hit 80.1% · 1179/s · $1.42
 09:24 orcarouter-dsv4.1-flash-free
-  in 10.3k · out 1.25k · $0.2700
+  in 10.3k (1.62M) · out 1.25k
+  hit 99.4% · 2152/s · $0.2700
 
 /usage overview
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -62,8 +70,8 @@ steps      7                                      in         287.1k
 prompt     4.87M                                  cached     4.58M
 hit        94.1%                                  out        26.6k
 write      45.6k                                  reasoning  900
-cost       $2.70                                  first      12/10/2026, 09:01:00
-last       15/10/2026, 07:20:31
+cost       $2.70                                  tps        2709.2/s
+first      12/10/2026, 09:01:00                   last       15/10/2026, 07:20:31
 
 activity █▁▁▁▁▁▁▁▁▁▃▁▁▁▁▁▁▁▃▁▁▁▁▁▆  25 buckets
 
@@ -72,7 +80,7 @@ steps      3                                      in         130.3k
 prompt     3.37M                                  cached     3.24M
 hit        96.1%                                  out        8.25k
 write      23.9k                                  reasoning  900
-cost       $1.69
+cost       $1.69                                  tps        1617.6/s
 
 data coverage
 models     3 · unknown 0.0%                       endpoints  2 · unknown 28.6%
@@ -190,8 +198,8 @@ Docs pass  07:20:31 · Δ 20m00s · orcarouter-dsv4.1-flash-free · in 8.6k (410
 
 /usage db
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-/tmp/usage-insights-demo-mnBRbZ/stats.db
-0.0 MB + 0.5 MB wal · schema v7
+/tmp/usage-insights-demo-3RPeI8/stats.db
+0.0 MB + 0.5 MB wal · schema v8
 
 what it holds
   sessions    3 rows
@@ -206,4 +214,5 @@ keep           prunes
 30 days       0 steps
 90 days       0 steps
 365 days      0 steps
+
 ```

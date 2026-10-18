@@ -27,7 +27,11 @@ written by the server-side recorder and read by the TUI.
   drill-downs, sorting, filters and state remembered between openings.
   `/usage models 7d`, `/usage affinity`, `/usage endpoints 30d`.
 - **The session sidebar**: the session's own totals and its last turns, in the
-  same buckets as the line.
+  same buckets as the line. Three lines per turn — when and through what, the
+  prompt volumes, then `hit · tok/s · cost` — and the session's average
+  throughput on its totals:
+  `16:54 orcarouter-dsv4.1flash` / `in 1.7k (427.3k) · out 1.06k` /
+  `hit 99.7% · 1.2k/s · $0.0006`.
 - **The record** (server entry): every assistant step with tokens, cost,
   timings, finish reason, provider/model, session and parent ids, and the
   endpoint that served it; prompts, session lifecycle and compaction events too.
@@ -188,9 +192,23 @@ durable storage, so the panel reopens where it was left.
 The panel sums the stored per-step buckets over the selected range, so a number
 read in one place means the same in the other: `prompt` is everything the
 provider saw (`cached + fresh + writes`), `in` the uncached part, `hit` is
-`cached / prompt`, `out` everything generated (visible output + reasoning), and
+`cached / prompt`, and `out` everything generated (visible output + reasoning).
+
+The endpoint is what the gateway names in `x-opencode-endpoint-id`, or the host
+of a per-operator provider. A **gateway host is not an endpoint**: when the
+gateway names no downstream endpoint, the request has no observed endpoint and
+the views say so (`– (never observed)`) instead of showing the gateway's name as
+if it had run the model. The line and the sidebar then fall back to
+`provider/model`. The line reports the endpoint of the turn it belongs to: a
+turn the gateway did not name falls back even when an earlier turn of the same
+provider and model had an endpoint.
+
 `tps`/`wall`/`stream` are produced tokens per streaming second / request to
-completed step / request to the last chunk. A change of identity is not by
+completed step / request to the last chunk. The sidebar's rate (per turn, and
+the session average on its totals) is the **weighted** one — produced tokens
+divided by the summed streaming windows — so it answers "how fast did this
+produce"; the `latency` view reports the p50 of the per-step rates instead, which
+answers "how fast is a typical step". A change of identity is not by
 itself a fault — a gateway may re-route deliberately — so `affinity` pairs the
 count with the cache reuse it actually cost. The panel's `?` overlay defines
 every number in place.
@@ -204,7 +222,7 @@ Options apply to both entries (each side reads the ones it needs):
 | `enabled` | `true` | `false` disables that side completely — no line, no panel, no recording. |
 | `db` | per-OS state path | SQLite path override. Must match between the server and TUI entries. |
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
-| `sidebar` | `true` | Show the session summary and the per-prompt history in the session sidebar (the slot is invisible while the sidebar is hidden). |
+| `sidebar` | `true` | Show the session summary and the per-prompt history — cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
 | `sidebarTurns` | `5` | How many turns the sidebar history shows. |
 | `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
 | `identity` | `"endpoint"` | Which identity the line leads with: `endpoint` shows the endpoint that served the turn (falling back to `provider/model`); `model` always shows `provider/model#variant`. |

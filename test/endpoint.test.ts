@@ -46,10 +46,13 @@ describe("inferFromHeaders", () => {
 })
 
 describe("inferFromUrl", () => {
-  test("names the gateway a host belongs to", () => {
-    expect(inferFromUrl("https://opencode.ai/zen/v1/chat")?.router).toBe("opencode")
-    expect(inferFromUrl("https://openrouter.ai/api/v1/chat")?.router).toBe("openrouter")
-    expect(inferFromUrl("https://ai-gateway.vercel.sh/v1/chat")?.router).toBe("vercel-ai-gateway")
+  test("does not mistake a gateway for the operator behind it", () => {
+    // The gateway is the route, not who ran the model: without its own header
+    // the endpoint is unknown, and the views say so instead of showing the
+    // provider's name as if it were the endpoint.
+    expect(inferFromUrl("https://opencode.ai/zen/v1/chat")).toBeUndefined()
+    expect(inferFromUrl("https://openrouter.ai/api/v1/chat")).toBeUndefined()
+    expect(inferFromUrl("https://ai-gateway.vercel.sh/v1/chat")).toBeUndefined()
   })
 
   test("names the operator a per-operator host belongs to", () => {
@@ -95,9 +98,9 @@ describe("mergeEndpoint", () => {
   })
 
   test("falls back to the host when no header named one", () => {
-    expect(mergeEndpoint(undefined, { router: "opencode", source: "endpoint:opencode.ai" })).toEqual({
-      router: "opencode",
-      source: "endpoint:opencode.ai",
+    expect(mergeEndpoint(undefined, { router: "fireworks", source: "endpoint:api.fireworks.ai" })).toEqual({
+      router: "fireworks",
+      source: "endpoint:api.fireworks.ai",
     })
   })
 
