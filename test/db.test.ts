@@ -122,7 +122,7 @@ describe("opening modes", () => {
     }
   })
 
-  test("writes take the lock with a short wait, not five seconds", () => {
+  test("writes refuse a locked database instead of waiting the lock out", () => {
     const directory = tempDir("busy")
     const path = join(directory, "usage.db")
     try {
@@ -130,10 +130,16 @@ describe("opening modes", () => {
       const blocker = openStatsDb(path)
       blocker.exec("BEGIN IMMEDIATE")
       const maintenance = openStatsDbWrite(path)
-      const started = Bun.nanoseconds()
-      expect(() => maintenance.exec("VACUUM")).toThrow()
-      const elapsedMs = (Bun.nanoseconds() - started) / 1e6
-      expect(elapsedMs).toBeLessThan(1_000)
+      // The 250 ms busy timeout asserted above is what makes the refusal
+      // quick. The wall clock is not asserted: a shared CI machine stretches
+      // any millisecond budget without the connection misbehaving.
+      let refused = false
+      try {
+        maintenance.exec("VACUUM")
+      } catch (error) {
+        refused = (error as { code?: string }).code === "SQLITE_BUSY"
+      }
+      expect(refused).toBe(true)
       maintenance.close()
       blocker.exec("ROLLBACK")
       blocker.close()
