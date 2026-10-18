@@ -49,7 +49,7 @@ written by the server-side recorder and read by the TUI.
 
 | | |
 | --- | --- |
-| **OS** | Linux, macOS and Windows. The database lives in the per-user state directory of each (table below). CI runs the data layer — paths, database, recorder, queries, panel assembly, dump round-trip, file permissions — on all three, and the whole suite (including the TUI render tests) on Linux. `bun run check:platform` runs that same check by hand. |
+| **OS** | Linux, macOS and Windows. The database lives in the per-user state directory of each (table below); `test/paths.test.ts` asserts the path rules of all three from any machine, and `bun run check:platform` exercises the data layer — paths, database, recorder, queries, panel assembly, dump round-trip, file permissions — on the OS it runs on. CI runs the whole suite (including the TUI render tests) on Linux. |
 | **Runtime** | Bun, the runtime OpenCode ships with. SQLite comes from `bun:sqlite`: there is no native module to build and nothing to compile on install. |
 
 ## Install

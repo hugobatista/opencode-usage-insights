@@ -71,7 +71,8 @@ PRs that are too large to review efficiently will be asked to be split.
   of the request. Never guess an endpoint from the provider id.
 - Changes that touch the queries, the panel assembly or the line should keep
   `bun run bench` green; changes to paths, the database or maintenance should
-  keep `bun run check:platform` green.
+  keep `bun run check:platform` green. CI runs the suite on Linux, so run that
+  check on macOS or Windows when you touch those.
 
 ## Response Time Expectations
 
