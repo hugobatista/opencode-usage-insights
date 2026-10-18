@@ -68,13 +68,13 @@ jobs:
             test/core.test.ts \
             test/db.test.ts \
             test/endpoint.test.ts \
-            test/insights.test.ts \
             test/line.test.ts \
             test/maintenance.test.ts \
             test/panel-build.test.ts \
             test/panel-data.test.ts \
             test/paths.test.ts \
             test/recorder.test.ts \
+            test/reports.test.ts \
             test/stats.test.ts \
             test/text.test.ts
 
