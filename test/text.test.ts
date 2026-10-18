@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { isToken, normalizeToken, sanitizeLabel, sanitizeText, TEXT_LIMIT } from "../src/text"
+import { isToken, sanitizeLabel, sanitizeText, TEXT_LIMIT } from "../src/text"
 
 /**
  * Text hygiene: the values that come from outside the plugin (a gateway header,
@@ -44,9 +44,9 @@ describe("sanitizeLabel", () => {
   })
 })
 
-describe("endpoint tokens", () => {
-  test("accepts the shapes a gateway and a model id use", () => {
-    for (const token of ["orcarouter-dsv4.1flash", "thesean-dsv4.1flash", "openrouter", "a/b:c-d.e_f", "gpt-4.1", "x".repeat(64)]) {
+describe("identity tokens", () => {
+  test("accepts the identifiers a provider or a model is named with", () => {
+    for (const token of ["opencode-go", "deepseek", "deepseek-v4.1-flash", "opencode/anthropic", "a:b/c_d"]) {
       expect(isToken(token)).toBe(true)
     }
   })
@@ -55,13 +55,5 @@ describe("endpoint tokens", () => {
     for (const token of ["", " leading", "with space", "esc\u001b[31m", "semi;colon", "x".repeat(65), "quote\"d"]) {
       expect(isToken(token)).toBe(false)
     }
-  })
-
-  test("normalizes to lowercase, so one endpoint groups once", () => {
-    expect(normalizeToken("  OrcaRouter-DSV4.1Flash  ")).toBe("orcarouter-dsv4.1flash")
-    expect(normalizeToken("GW-1")).toBe("gw-1")
-    expect(normalizeToken("\u001b[31mred")).toBeUndefined()
-    expect(normalizeToken("   ")).toBeUndefined()
-    expect(normalizeToken("x".repeat(65))).toBeUndefined()
   })
 })

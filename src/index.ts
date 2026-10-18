@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin"
 import type { Database } from "bun:sqlite"
-import { createRecorder, type HttpResponseInput, type RecorderEvent } from "./recorder"
+import { createRecorder, type RecorderEvent } from "./recorder"
 import { openStatsDb } from "./stats/db"
 import { resolveDbPath } from "./stats/paths"
 
@@ -9,9 +9,11 @@ import { resolveDbPath } from "./stats/paths"
  * every assistant step, prompt and lifecycle event into the stats database;
  * the TUI entry reads the same database for its live line and stats panel.
  *
- * The plugin is observational: it never rewrites prompts, requests or
- * responses, and a failure inside the recorder is swallowed so a session can
- * never be interrupted by its own telemetry.
+ * Everything the recorder stores comes from the event stream — the provider
+ * and model a step ran as, the tokens and the timing. The plugin is
+ * observational: it never rewrites prompts, requests or responses, registers
+ * no hook on the request path, and a failure inside the recorder is swallowed
+ * so a session can never be interrupted by its own telemetry.
  */
 
 export type Options = {
@@ -63,21 +65,7 @@ export default Plugin.define({
       }
     })()
 
-    let hook: { dispose: () => Promise<void> } | undefined
-    try {
-      hook = await ctx.session.hook("http.response", (event) => {
-        try {
-          recorder.handleHttpResponse(event as HttpResponseInput)
-        } catch {
-          // Discovery is best-effort.
-        }
-      })
-    } catch {
-      hook = undefined
-    }
-
     return async () => {
-      await hook?.dispose()
       abort.abort()
       await stream
       db.close()

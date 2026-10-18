@@ -26,7 +26,7 @@ import { SCHEMA_VERSION, openStatsDb } from "../src/stats/db"
 import { dbInfo } from "../src/stats/maintenance"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
 import { PANEL_VIEWS } from "../src/panel-data"
-import { affinityOf, cacheDropsOf, cachePairs, cacheStatsByModel, coverageOf, gapReportOf, latencyGroupsOf, latencyOf, stepRows, timingRows, ttlEvidenceOf } from "../src/stats/aggregates"
+import { cacheDropsOf, cachePairs, cacheStatsByModel, coverageOf, gapReportOf, latencyGroupsOf, latencyOf, stepRows, switchesOf, timingRows, ttlEvidenceOf } from "../src/stats/aggregates"
 import { filterOptions } from "../src/stats/queries"
 import { models, overview, sessions, turns } from "../src/stats/queries"
 
@@ -55,16 +55,15 @@ function parseArgs(argv: readonly string[]): Args {
   }
 }
 
-/** Providers, models and endpoints a real database mixes. */
+/** Providers, models and variants a real database mixes. */
 const MODELS = [
   ["anthropic", "claude-sonnet-4-5", "default"],
   ["anthropic", "claude-haiku-4-5", undefined],
   ["deepseek", "deepseek-v4.1-flash", undefined],
+  ["opencode-go", "deepseek-v4.1-flash", undefined],
   ["opencode", "big-pickle", undefined],
   ["google", "gemini-3-pro", "high"],
 ] as const
-
-const ROUTERS = [undefined, "orcarouter-dsv4.1flash", "thesean-dsv4.1flash", "openrouter", "vercel-ai-gateway"]
 
 /** Window the synthetic history spans, ending today: the 7d range must be full. */
 const WINDOW = 10 * 24 * 60 * 60 * 1000
@@ -158,7 +157,6 @@ function build(db: Database, steps: number, sessionCount: number): void {
           streamedAt: streamed,
           completedAt: streamed + 30 + Math.floor(random() * 300),
           finish: index === perTurn - 1 ? "stop" : "tool-calls",
-          router: ROUTERS[Math.floor(random() * ROUTERS.length)],
           recordedAt: started + 10,
         })
         at = streamed + 40
@@ -239,8 +237,7 @@ function plans(db: Database): Array<{ label: string; plan: string }> {
 const PANEL_BUDGETS: Partial<Record<(typeof PANEL_VIEWS)[number], number>> = {
   "overview": 700,
   "models": 1800,
-  "endpoints": 1200,
-  "affinity": 1200,
+  "providers": 1200,
   "cache": 1600,
   "periods": 800,
   "latency": 2100,
@@ -309,7 +306,7 @@ function main(): void {
     { name: "latency groups 7d", budget: 1300, run: () => latencyGroupsOf(timingRows(db, { range: range7d }), "model") },
     { name: "turns session (300)", budget: 40, run: () => turns(db, { sessionID, limit: 300 }) },
     { name: "cache pair pass 7d", budget: 800, run: () => cachePairs(db, { range: range7d }) },
-    { name: "affinity 7d", budget: 1200, run: () => affinityOf(cachePairs(db, { range: range7d })) },
+    { name: "switches 7d", budget: 1200, run: () => switchesOf(cachePairs(db, { range: range7d })) },
     { name: "cacheDrops 7d", budget: 1100, run: () => cacheDropsOf(db, cachePairs(db, { range: range7d })) },
     { name: "cacheTtlEvidence 7d", budget: 1000, run: () => ttlEvidenceOf(cachePairs(db, { range: range7d })) },
     { name: "cache survival 7d", budget: 1000, run: () => gapReportOf(cachePairs(db, { range: range7d })) },

@@ -190,7 +190,7 @@ describe("lineParts", () => {
   test("renders the default line with muted separators", () => {
     const parts = lineParts(stats)
     expect(lineText(parts)).toBe(
-      `${formatClock(at(205))} · Δ 3m20s · opencode/deepseek-v4.1-flash-free · in 1k (1.53M), cached 1.53M, out 50 · sess in 97.2k (3.16M), cached 3.06M, out 3.75k`,
+      `${formatClock(at(205))} · Δ 3m20s · opencode/deepseek-v4.1-flash-free · in 1k (1.53M), cached 1.53M, out 50, cost $0.0200 · sess in 97.2k (3.16M), cached 3.06M, out 3.75k, cost $0.1400`,
     )
     expect(parts.filter((part) => part.text === " · ").every((part) => part.tone === "muted")).toBe(true)
     expect(parts.find((part) => part.text.startsWith("Δ"))?.tone).toBe("muted")
@@ -202,7 +202,9 @@ describe("lineParts", () => {
       labels: { delta: "gap", turn: "step", session: "total" },
       fields: { clock: false, variant: false },
     })
-    expect(lineText(parts)).toBe("gap 3m20s · opencode/deepseek-v4.1-flash-free · step in 1k (1.53M), cached 1.53M, out 50 · total in 97.2k (3.16M), cached 3.06M, out 3.75k")
+    expect(lineText(parts)).toBe(
+      "gap 3m20s · opencode/deepseek-v4.1-flash-free · step in 1k (1.53M), cached 1.53M, out 50, cost $0.0200 · total in 97.2k (3.16M), cached 3.06M, out 3.75k, cost $0.1400",
+    )
   })
 
   test("marks a provider change and keeps the model-change hint quiet", () => {
@@ -264,7 +266,7 @@ describe("lineParts", () => {
     expect(lineText(lineParts(expired))).toContain("⚠ cache expired (−30k×2)")
   })
 
-  test("suppresses the small OpenAI cache reads that are endpoint noise", () => {
+  test("suppresses the small OpenAI cache reads that are provider noise", () => {
     const noisy = (cacheRead: number) =>
       computeTurn([
         { type: "user", id: "prt_1", time: { created: at(0) } },

@@ -83,7 +83,6 @@ function main(): void {
         streamedAt: BASE + MIN + 900,
         completedAt: BASE + MIN + 1_400,
         finish: "stop",
-        router: "orcarouter-dsv4.1flash",
         recordedAt: BASE + MIN,
       })
       recordEvent(db, { sessionID: "ses_check", kind: "compaction", at: BASE + 2 * MIN })
@@ -123,7 +122,7 @@ function main(): void {
       reader.close()
     })
 
-    check("records a session from the event stream, endpoint included", () => {
+    check("records a session from the event stream, provider and model included", () => {
       const db = openStatsDb(path)
       const recorder = createRecorder(db, { now: () => BASE + 5 * MIN })
       const events: RecorderEvent[] = [
@@ -131,23 +130,20 @@ function main(): void {
         { type: "session.step.started", created: BASE, data: { sessionID: "ses_events", assistantMessageID: "msg_event_step", model: { providerID: "opencode", id: "m1" } } },
       ]
       for (const event of events) recorder.handleEvent(event)
-      recorder.handleHttpResponse({
-        sessionID: "ses_events",
-        model: { providerID: "opencode", id: "m1" },
-        response: { headers: { "x-opencode-endpoint-id": "Gateway-1" } },
-      })
       recorder.handleEvent({
         type: "session.step.ended",
         created: BASE + MIN,
         data: { sessionID: "ses_events", assistantMessageID: "msg_event_step", tokens: { input: 10, output: 2, cache: { read: 5 } } },
       })
-      const row = db.query("SELECT session_id, router, input_tokens FROM steps WHERE message_id = 'msg_event_step'").get() as {
+      const row = db.query("SELECT session_id, provider_id, model_id, input_tokens FROM steps WHERE message_id = 'msg_event_step'").get() as {
         session_id: string
-        router: string | null
+        provider_id: string | null
+        model_id: string | null
         input_tokens: number
       }
       assert(row.session_id === "ses_events", "the step was not recorded")
-      assert(row.router === "gateway-1", `the endpoint was not normalized: ${row.router}`)
+      assert(row.provider_id === "opencode", `the provider was not recorded: ${row.provider_id}`)
+      assert(row.model_id === "m1", `the model was not recorded: ${row.model_id}`)
       assert(row.input_tokens === 10, "the tokens were not recorded")
       recorder.handleEvent({ type: "session.deleted", created: BASE + 2 * MIN, data: { sessionID: "ses_events" } })
       db.close()

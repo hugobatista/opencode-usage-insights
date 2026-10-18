@@ -1,9 +1,9 @@
 # Internals
 
-How the plugin works under the hood: the local database, where the endpoint
-identity comes from, the rules the hot paths keep, and how the TUI side is
-tested. The [README](../README.md) covers what a user sees; this file covers
-why it behaves the way it does.
+How the plugin works under the hood: the local database, where the identity of a
+step comes from, the rules the hot paths keep, and how the TUI side is tested.
+The [README](../README.md) covers what a user sees; this file covers why it
+behaves the way it does.
 
 ## Database
 
@@ -25,8 +25,7 @@ Tables: `sessions`, `prompts`, `steps`, `events` and `meta` (the schema
 version). The `steps` table is the interesting one: `message_id` (primary key),
 `session_id`, `parent_id`, provider/model/variant, input/output/reasoning and
 cache-read/cache-write tokens, cost, `created_at`, `streamed_at`,
-`completed_at`, `finish`, `router` (the endpoint that served the request) and
-`recorded_at`.
+`completed_at`, `finish` and `recorded_at`.
 
 Throughput is not stored: `tps` is everything the model generated
 (`output + reasoning`) over the streaming window (`created → streamed`), and the
@@ -50,39 +49,64 @@ writer's lock — and prune and compact use a separate short-lived writer with a
 250 ms busy timeout, so maintenance fails fast with a message instead of
 stalling the recorder.
 
-## How the endpoint is found
+## The identity of a step
 
-OpenCode reports the provider it routes through (`providerID`) — where the
-request came from, not who served it. The endpoint that actually served the
-request comes from two sources, and the header wins:
+Every view groups a step by one thing: the **provider the model ran through**,
+as OpenCode is configured (`provider_id` in the table, `opencode`,
+`opencode-go`, `deepseek`, …), and the model itself.
 
-1. **The gateway's own response header** (`x-opencode-endpoint-id`), as in
-   `x-opencode-endpoint-id: orcarouter-dsv4.1flash`. The value has to be a single
-   token (letters, digits, `. _ : / -`, at most 64 characters) and is folded to
-   lowercase, so a gateway that changes the case between responses still reads
-   as one endpoint.
-2. **The host of the request URL**, when no header named one: gateway hosts
-   (`opencode.ai` → `opencode`, `openrouter.ai` → `openrouter`,
-   `ai-gateway.vercel.sh` → `vercel-ai-gateway`) and per-operator hosts
-   (`api.fireworks.ai` → `fireworks`, `api.deepseek.com` → `deepseek`,
-   `bedrock-runtime.us-east-1.amazonaws.com` → `bedrock`,
-   `us-central1-aiplatform.googleapis.com` → `vertex`, and the rest of the list
-   in `src/endpoint.ts`).
+That is the whole answer available, and it is deliberate. For a while the plugin
+also recorded the *routing endpoint* a gateway named in a response header
+(`x-opencode-endpoint-id`), which said which downstream operator actually ran the
+inference behind a gateway. The Zen routes stopped publishing it — the header
+came from a legacy handler that was removed when the routes became a thin
+forwarding proxy ([anomalyco/opencode#54563](https://github.com/anomalyco/opencode/pull/54563))
+— and no other source names that upstream: the response body of a routed request
+is provider-neutral, the request host is the gateway, and the host binary
+contains no reference to the header. So there is nothing left to discover, and
+nothing is inferred in its place.
 
-A host matches on a label boundary only: the domain itself, a subdomain of it
-(`gateway.api.fireworks.ai`), or a region label joined to it by a dash
-(`us-central1-aiplatform.googleapis.com`). A host that merely contains a known
-domain — `api.anthropic.com.evil.tld` — names nothing, so a lookalike cannot
-label the telemetry.
+What the recorder writes is what the event stream carries. `recordStep` takes
+the provider from the step's own model reference (or, for a step that started
+before the plugin loaded, from the last model the session selected), and
+validates it as a single token (letters, digits, `. _ : / -`, at most 64
+characters) before it becomes a grouping key: a value that is not a provider id
+is stored as absent rather than splitting the views on a typo. Case is left
+alone — the provider reads the way it is configured.
 
-What the recorder learns is applied to the step in flight and to the steps of
-the same session and model that were recorded without an endpoint, and it is
-never overwritten once set: a re-route is not retroactive. A value that is not a
-token — a sentence, a control character, a name a gateway invented — is not an
-endpoint and is not stored. The operator a header *might* have mentioned is
-deliberately not recorded: the plugin answers "who ran this inference" with the
-endpoint alone, and `bun run report --json` still exposes the provider for
-anyone auditing a route.
+Two consequences are load-bearing in the analysis layer:
+
+- **A provider switch forfeits the cache.** The prompt cache belongs to the
+  provider that holds it, so `cacheDrop` — the rule shared with the live line —
+  takes a scope. The switch and loss reports measure a drop across a provider
+  switch (`"model"`: the model is the same, so the two steps share a cache to
+  lose), while the survival report and the TTL evidence keep the strict
+  `"provider"` scope: two providers are two caches, and a switch between them is
+  not an idle-gap sample.
+- **A model that ran through two providers is one model with two rows.** The
+  `models` view keeps the family together and names the providers in a column;
+  the `providers` view leads with the provider and lists the models it served.
+
+## What the line counts
+
+The line has two totals groups — the turn and the session — and they follow
+different rules on purpose:
+
+- **Tokens follow the view.** `turnTotals: "latest"` (the default) reports the
+  prompt the turn ended with: summing `input`/`cached` over the steps of a
+  tool-call loop would count the same re-sent prompt once per step, which is not
+  what a context view means. `"sum"` adds every step instead, which is the
+  billing view of the tokens.
+- **Money is always summed.** Every step of a turn is paid for, so the turn's
+  cost is the sum over its steps whatever the token view shows (`totalsText`
+  takes the cost explicitly for that reason, never the `latest` step's share).
+  The session's cost is the one the host reports for the session.
+- **A zero cost is left out.** A free model reads as free instead of repeating
+  `$0`; `fields.cost: false` hides the segment entirely for a narrower line.
+- **Switches the line warns about are between turns.** A provider change against
+  the previous prompt is `changed`, a model change inside one provider is
+  `model changed`; the same comparison between *steps* is what the `models`
+  view's detail line counts.
 
 ## Privacy and security
 
@@ -91,11 +115,11 @@ credentials, no telemetry. Everything it records stays in the SQLite file in the
 user's own state directory.
 
 **What is stored.** Per step: timings, token counts and cost, the
-provider/model/variant it ran as, the endpoint label, the finish reason, the
-session and parent ids, and the session's title and working directory as the
-host reports them. **Prompts and responses are not stored**: the recorder reads
-event payloads for numbers and identifiers and keeps nothing else — no message
-text, no tool arguments, no file contents, no environment variables.
+provider/model/variant it ran as, the finish reason, the session and parent ids,
+and the session's title and working directory as the host reports them.
+**Prompts and responses are not stored**: the recorder reads event payloads for
+numbers and identifiers and keeps nothing else — no message text, no tool
+arguments, no file contents, no environment variables.
 
 **What protects it.**
 
@@ -108,23 +132,22 @@ text, no tool arguments, no file contents, no environment variables.
   maintenance action that cannot take the lock tells the user and stops, instead
   of stalling the request pipeline that records usage.
 - **Validated input.** Anything that reaches the database from outside — a
-  gateway's endpoint header, a session title, an imported NDJSON dump — is
+  provider id the host reports, a session title, an imported NDJSON dump — is
   validated as an identifier token or stripped of control characters and capped
   in length, both when it is stored and again when it is rendered. A terminal
-  escape sequence in a response header cannot reach the terminal, and a dump
-  cannot import a value that does not fit its column.
+  escape sequence in a title cannot reach the terminal, and a dump cannot import
+  a value that does not fit its column.
 - **Parameterized SQL everywhere**, and no dynamic table or column names taken
   from data.
 
 ## Performance
 
-The plugin sits on paths the host waits for: the recorder's event handlers, the
-`http.response` hook (which the host awaits) and the composer line. The rules it
-keeps are:
+The plugin sits on paths the host waits for: the recorder's event handlers and
+the composer line. The rules it keeps are:
 
-- **Writes are small and rare.** A step is one upsert; an endpoint is written
-  once per session and model and only when it changed; a repeated observation
-  costs a map lookup, not a statement.
+- **Writes are small and rare.** A step is one upsert, written when it ends;
+  nothing is written on a response, because the response carries nothing the
+  views read.
 - **Reads are index-driven.** Every range filter compares the expression the
   `steps_at` index covers, the per-prompt history is bounded to the last few
   prompts, and the line and the sidebar never scan a session's whole history.

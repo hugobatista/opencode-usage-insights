@@ -1,7 +1,6 @@
 import {
   formatLineSegments,
   type LineFields,
-  type LineIdentity,
   type LineLabels,
   type LineTone,
   type Totals,
@@ -141,16 +140,16 @@ export function sessionTotals(info: RuntimeSessionInfo | undefined): Totals | un
  */
 export function lineParts(
   stats: TurnStats | undefined,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; identity?: LineIdentity },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
 ): LinePart[] {
   if (stats === undefined) return []
   const parts: LinePart[] = []
   const segments = formatLineSegments(stats, options)
   segments.forEach((segment, index) => {
     if (index > 0) parts.push({ text: " · ", tone: "muted" })
-    // The line leads with identities that came from outside (the endpoint a
-    // gateway named, a model id): one text renderable, one terminal, so no
-    // control character may reach it.
+    // The line leads with identities that came from outside (the provider and
+    // the model): one text renderable, one terminal, so no control character
+    // may reach it.
     parts.push({ text: sanitizeLabel(segment.text), tone: segment.tone })
   })
   return parts

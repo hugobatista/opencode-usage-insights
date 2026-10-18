@@ -28,7 +28,7 @@ What did you expect to happen?
 
 If applicable, add screenshots, logs, or files to help explain your problem.
 
-If the problem is about the numbers (tokens, cache, the endpoint that served a
+If the problem is about the numbers (tokens, cache, the provider that ran a
 request), please include the output of `bun run report --json` from a checkout,
 or the relevant rows from the database (`steps` table). Redact anything private.
 

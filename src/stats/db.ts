@@ -1,9 +1,8 @@
 import { Database } from "bun:sqlite"
 import { chmodSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { EndpointInfo } from "../endpoint"
 import { ensureRegularFile } from "./paths"
-import { normalizeToken, sanitizeLabel, TEXT_LIMIT } from "../text"
+import { isToken, sanitizeLabel, TEXT_LIMIT } from "../text"
 
 /**
  * Persistent usage store. One SQLite database holds every recorded step,
@@ -21,7 +20,7 @@ import { normalizeToken, sanitizeLabel, TEXT_LIMIT } from "../text"
  *   that gives up quickly instead of holding the recorder up.
  */
 
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 /** Longest title or path kept: a label on a line, not a document. */
 const LABEL_LIMIT = 4 * TEXT_LIMIT
@@ -66,13 +65,11 @@ CREATE TABLE IF NOT EXISTS steps (
   streamed_at INTEGER,
   completed_at INTEGER,
   finish TEXT,
-  router TEXT,
   recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS steps_session ON steps(session_id, created_at);
 CREATE INDEX IF NOT EXISTS steps_model ON steps(provider_id, model_id, variant);
 CREATE INDEX IF NOT EXISTS steps_completed ON steps(completed_at);
-CREATE INDEX IF NOT EXISTS steps_router ON steps(router);
 -- Every range filter and every ordering compares the step's own clock, which
 -- falls back to the recording time for a step that was already in flight when
 -- the plugin loaded. The index has to cover that expression, or every ranged
@@ -101,6 +98,7 @@ export type StepRecord = {
   messageID: string
   sessionID: string
   parentID?: string | undefined
+  /** The provider the model ran through, as OpenCode configured it (`opencode-go`). */
   providerID?: string | undefined
   modelID?: string | undefined
   variant?: string | undefined
@@ -114,8 +112,6 @@ export type StepRecord = {
   streamedAt?: number | undefined
   completedAt?: number | undefined
   finish?: string | undefined
-  /** Gateway routing endpoint that served the request (`orcarouter-dsv4.1flash`). */
-  router?: string | undefined
   /** Clock of the recording itself, defaults to `Date.now()`. */
   recordedAt?: number | undefined
 }
@@ -154,20 +150,17 @@ function jsonText(value: unknown): string | null {
 }
 
 /**
- * Columns added after the first release, applied to an existing database, with
- * an optional statement that backfills them.
- */
-const MIGRATIONS: ReadonlyArray<readonly [string, string, string?]> = [
-  ["router", "ALTER TABLE steps ADD COLUMN router TEXT"],
-]
-
-/**
  * Columns and tables the recorder used to write and no view ever read. They are
  * dropped from an existing database, together with the rows of the events that
  * followed the same fate, so a long-lived file shrinks instead of carrying dead
  * weight forever.
+ *
+ * `router` is here because the gateway that named the routing endpoint in a
+ * response header (`x-opencode-endpoint-id`) stopped naming one: the identity a
+ * step is grouped by is the provider the model ran through, and the endpoint a
+ * gateway happened to route to is no longer observable at all.
  */
-const REMOVED_COLUMNS = ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"] as const
+const REMOVED_COLUMNS = ["provider_state", "upstream", "upstream_source", "upstream_model", "tps", "router"] as const
 const REMOVED_EVENT_KINDS = ["execution", "step-failed", "model-selected", "usage-recorded"] as const
 
 function dropUnused(db: Database): void {
@@ -179,9 +172,10 @@ function dropUnused(db: Database): void {
   const indexes = new Set(objects.filter((row) => row.type === "index").map((row) => row.name))
 
   if (tables.has("http_responses")) db.exec("DROP TABLE http_responses")
-  // The index reads a column that is about to go: SQLite refuses to drop an
+  // These indexes read a column that is about to go: SQLite refuses to drop an
   // indexed column, so the index goes first.
   if (indexes.has("steps_upstream")) db.exec("DROP INDEX steps_upstream")
+  if (indexes.has("steps_router")) db.exec("DROP INDEX steps_router")
 
   const columns = new Set((db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name))
   for (const name of REMOVED_COLUMNS) {
@@ -192,41 +186,16 @@ function dropUnused(db: Database): void {
     const kinds = REMOVED_EVENT_KINDS.map((kind) => `'${kind}'`).join(", ")
     db.exec(`DELETE FROM events WHERE kind IN (${kinds})`)
   }
-  // A gateway name is not an endpoint: the old discovery stored the host of the
-  // gateway itself when the gateway named no downstream endpoint. Clearing those
-  // values makes the history agree with what the recorder writes now.
-  db.exec("UPDATE steps SET router = NULL WHERE router IN ('opencode', 'openrouter', 'vercel-ai-gateway')")
-}
-
-function schemaVersion(db: Database): number {
-  const row = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | null
-  const parsed = row === null ? Number.NaN : Number.parseInt(row.value, 10)
-  return Number.isFinite(parsed) ? parsed : 0
 }
 
 /**
- * The endpoint identity is a grouping key: two spellings of the same endpoint
- * would split its history and read as a change. Values recorded before the
- * rule existed are folded into the lowercase form.
+ * Bring an existing file up to date. There is no version ladder: a column the
+ * schema carries is created with the table, and a column the recorder stopped
+ * writing is dropped by `dropUnused`, which is idempotent and also heals a
+ * database a half-applied run left behind.
  */
-function normalizeRouters(db: Database): void {
-  db.exec("UPDATE steps SET router = lower(router) WHERE router IS NOT NULL AND router <> lower(router)")
-}
-
 function migrate(db: Database): void {
-  const version = schemaVersion(db)
-  const steps = db.query("PRAGMA table_info(steps)").all() as { name: string }[]
-  const existing = new Set(steps.map((column) => column.name))
-  for (const [name, statement, backfill] of MIGRATIONS) {
-    if (existing.has(name)) continue
-    db.exec(statement)
-    if (backfill !== undefined) db.exec(backfill)
-  }
-  // Anything the recorder used to write and no view ever read is dropped here.
-  // It is cheap and idempotent, so it also heals a database a half-applied
-  // migration left behind.
   dropUnused(db)
-  if (version < 7) normalizeRouters(db)
 }
 
 /**
@@ -316,20 +285,24 @@ export function openStatsDbWrite(path: string): Database {
 
 /**
  * Insert or refresh an assistant step. Idempotent by message ID so replayed
- * events, restarts and NDJSON imports never duplicate usage. Non-null fields
- * discovered later (the routing endpoint) survive a re-record with `NULL`
+ * events, restarts and NDJSON imports never duplicate usage. A non-null field
+ * (the provider, the model, the finish reason) survives a re-record with `NULL`
  * through COALESCE.
+ *
+ * The provider is the identity every view groups by, so it is validated as a
+ * token before it is stored: a value that is not a provider id is recorded as
+ * absent instead of becoming a grouping key.
  */
 export function recordStep(db: Database, record: StepRecord): void {
   db.query(
     `INSERT INTO steps (
        message_id, session_id, parent_id, provider_id, model_id, variant,
        input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost,
-       created_at, streamed_at, completed_at, finish, router, recorded_at
+       created_at, streamed_at, completed_at, finish, recorded_at
      ) VALUES (
        $messageID, $sessionID, $parentID, $providerID, $modelID, $variant,
        $input, $output, $reasoning, $cacheRead, $cacheWrite, $cost,
-       $createdAt, $streamedAt, $completedAt, $finish, $router, $recordedAt
+       $createdAt, $streamedAt, $completedAt, $finish, $recordedAt
      )
      ON CONFLICT(message_id) DO UPDATE SET
        session_id = excluded.session_id,
@@ -347,13 +320,12 @@ export function recordStep(db: Database, record: StepRecord): void {
        streamed_at = COALESCE(excluded.streamed_at, steps.streamed_at),
        completed_at = COALESCE(excluded.completed_at, steps.completed_at),
        finish = COALESCE(excluded.finish, steps.finish),
-       router = COALESCE(excluded.router, steps.router),
        recorded_at = excluded.recorded_at`,
   ).run({
     $messageID: record.messageID,
     $sessionID: record.sessionID,
     $parentID: record.parentID ?? null,
-    $providerID: record.providerID ?? null,
+    $providerID: record.providerID !== undefined && isToken(record.providerID) ? record.providerID : null,
     $modelID: record.modelID ?? null,
     $variant: record.variant ?? null,
     $input: record.input ?? 0,
@@ -366,7 +338,6 @@ export function recordStep(db: Database, record: StepRecord): void {
     $streamedAt: record.streamedAt ?? null,
     $completedAt: record.completedAt ?? null,
     $finish: record.finish === undefined ? null : sanitizeLabel(record.finish, 64),
-    $router: record.router === undefined ? null : (normalizeToken(record.router) ?? null),
     $recordedAt: record.recordedAt ?? Date.now(),
   })
 }
@@ -416,43 +387,6 @@ export function upsertSession(db: Database, record: SessionRecord): void {
     $startedAt: record.startedAt ?? null,
     $updatedAt: record.updatedAt ?? null,
   })
-}
-
-/**
- * Attach the endpoint discovered after the step was recorded. A step that
- * already carries the same endpoint is left alone: the recorder runs on the
- * request path, and a no-op write there is a cost with no reader.
- */
-export function setStepRouter(db: Database, messageID: string, info: EndpointInfo): void {
-  const router = info.router === undefined ? undefined : normalizeToken(info.router)
-  if (router === undefined) return
-  db.query(
-    `UPDATE steps
-        SET router = $router
-      WHERE message_id = $messageID AND router IS NOT $router`,
-  ).run({ $router: router, $messageID: messageID })
-}
-
-/**
- * Apply the endpoint learned from a compaction to every step of that session
- * and model that still lacks one. Returns the number of rows touched.
- */
-export function setStepRouterForSessionModel(
-  db: Database,
-  sessionID: string,
-  modelID: string | undefined,
-  info: EndpointInfo,
-): number {
-  const router = info.router === undefined ? undefined : normalizeToken(info.router)
-  if (router === undefined) return 0
-  const result = db
-    .query(
-      `UPDATE steps
-          SET router = $router
-        WHERE session_id = $sessionID AND router IS NULL AND ($modelID IS NULL OR model_id = $modelID)`,
-    )
-    .run({ $router: router, $sessionID: sessionID, $modelID: modelID ?? null })
-  return result.changes
 }
 
 /** Dump every table as NDJSON (`{"table": "...", "row": {...}}` per line). */

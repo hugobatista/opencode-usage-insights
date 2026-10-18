@@ -2,7 +2,13 @@
 // declarations. Host-provided modules stay external so the plugin uses the
 // host runtime.
 import solidPlugin from "@opentui/solid/bun-plugin"
+import { rmSync } from "node:fs"
 import { join } from "node:path"
+
+// The package ships whatever `dist` holds, and neither Bun.build nor tsc
+// removes what a deleted module left behind: a stale `endpoint.d.ts` outlived
+// the module it described once. Start from an empty directory.
+rmSync("dist", { recursive: true, force: true })
 
 const result = await Bun.build({
   entrypoints: ["src/index.ts", "src/tui.tsx"],

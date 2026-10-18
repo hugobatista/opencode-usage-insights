@@ -6,7 +6,7 @@
  *   bun run demo [width]
  */
 import { rmSync } from "node:fs"
-import { computeTurn, formatLine, type LineIdentity, type Totals, type TurnTotalsView } from "../src/core"
+import { computeTurn, formatLine, type Totals, type TurnTotalsView } from "../src/core"
 import { toTranscript, type RuntimeMessage } from "../src/line"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
 import { PANEL_VIEWS, sessionSummaryLines, sidebarLines, type PanelLine } from "../src/panel-data"
@@ -23,6 +23,7 @@ import {
   loopTurn,
   openDemoDatabase,
   recorderTotals,
+  recorderTotalsAfterOpus,
   recorderTurn1,
   recorderTurn2,
   recorderTurn3,
@@ -34,13 +35,11 @@ const { db, root, path: demoPath, now } = openDemoDatabase()
 function turnLine(
   messages: RuntimeMessage[],
   totals: Totals,
-  options: { router?: string; turnTotals?: TurnTotalsView; identity?: LineIdentity } = {},
+  options: { turnTotals?: TurnTotalsView } = {},
 ): string {
   const stats = computeTurn(toTranscript(messages), totals)
   if (stats === undefined) return ""
-  // The TUI fills this from the recorder's database; the demo sets it directly.
-  if (options.router !== undefined) stats.router = options.router
-  return formatLine(stats, { turnTotals: options.turnTotals, identity: options.identity })
+  return formatLine(stats, { turnTotals: options.turnTotals })
 }
 
 const section = (title: string, text: string) => {
@@ -50,31 +49,31 @@ const section = (title: string, text: string) => {
 const body = (lines: readonly PanelLine[]) => lines.map((entry) => entry.text.replace(/\s+$/, "")).join("\n")
 
 section(
-  "turn · prompt cache survived (the endpoint that served the turn)",
-  turnLine([...recorderTurn1, ...recorderTurn2], recorderTotals, { router: "orcarouter-dsv4.1-flash-free" }),
+  "turn · prompt cache survived (the provider and model that ran the turn)",
+  turnLine([...recorderTurn1, ...recorderTurn2], recorderTotals),
 )
 section(
   "turn · prompt cache expired after an idle gap",
-  turnLine([...cacheTurn1, ...cacheTurn2], cacheTotals, { router: "orcarouter-glm-5.3-flash" }),
+  turnLine([...cacheTurn1, ...cacheTurn2], cacheTotals),
 )
 section(
-  "turn · provider changed (no endpoint learned: falls back to provider/model)",
-  turnLine([...recorderTurn2, ...recorderTurn3], recorderTotals, {}),
+  "turn · provider changed (opencode → anthropic)",
+  turnLine([...recorderTurn2, ...recorderTurn3], recorderTotalsAfterOpus),
 )
 section(
   "turn · tool-call loop, latest view (the prompt size the turn ended with)",
-  turnLine(loopTurn, recorderTotals, { router: "orcarouter-dsv4.1flash" }),
+  turnLine(loopTurn, recorderTotals),
 )
 section(
   'turn · tool-call loop, sum view (turnTotals: "sum" — every step of the turn)',
-  turnLine(loopTurn, recorderTotals, { router: "orcarouter-dsv4.1flash", turnTotals: "sum" }),
+  turnLine(loopTurn, recorderTotals, { turnTotals: "sum" }),
 )
 section(
   "turn · response still streaming (no line until the response ends)",
-  turnLine([...recorderTurn2, ...recorderTurn3, ...liveTurn], recorderTotals, { router: "orcarouter-dsv4.1flash" }) || "(no line yet)",
+  turnLine([...recorderTurn2, ...recorderTurn3, ...liveTurn], recorderTotalsAfterOpus) || "(no line yet)",
 )
 section(
-  "sidebar (the session's totals, then three lines per turn)",
+  "sidebar (the session's totals, then the turns — three lines each, plus the model at both ends of the block and on every change)",
   body([
     ...sessionSummaryLines(overview(db, undefined, { sessionID: DEMO_SESSION_ID }), 34),
     { text: "turns", tone: "accent" },

@@ -24,7 +24,7 @@ export type Range = {
 }
 
 /**
- * Panel filters. They narrow every aggregation to one model, one endpoint or
+ * Panel filters. They narrow every aggregation to one model, one provider or
  * one session, and are applied with the same `WHERE` builder the range uses so
  * a filtered view and a drill-down agree.
  */
@@ -38,11 +38,12 @@ export type Filters = {
    */
   modelKey?: string | undefined
   /**
-   * The routing endpoint that served the request (`router`). It is the one
-   * identity that answers "who ran this inference": the provider you configured
-   * says where the request came from, which is evidence, not an answer.
+   * The provider the model ran through, as OpenCode configured it
+   * (`opencode-go`, `deepseek`, `deepinfra`). It is the identity every view
+   * groups by: a gateway may re-route the request, but the upstream that
+   * actually ran it is not observable.
    */
-  router?: string | undefined
+  provider?: string | undefined
   /**
    * One session, exactly. Used by the `session` range and by the overview's
    * "this session" block, which must not pick up the steps of every other
@@ -143,9 +144,9 @@ export function buildWhere(
     clauses.push(`${MODEL_KEY_SQL} = ?`)
     params.push(filters.modelKey)
   }
-  if (filters?.router !== undefined && filters.router !== "") {
-    clauses.push("router = ?")
-    params.push(filters.router)
+  if (filters?.provider !== undefined && filters.provider !== "") {
+    clauses.push("provider_id = ?")
+    params.push(filters.provider)
   }
   if (filters?.sessionID !== undefined && filters.sessionID !== "") {
     clauses.push("session_id = ?")
@@ -210,8 +211,6 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
 
 export type ProviderUsage = Usage & {
   providerID: string
-  /** Gateway routing endpoints that served the requests. */
-  routers: string[]
   firstAt: number | undefined
   lastAt: number | undefined
 }
@@ -227,22 +226,20 @@ type ModelRow = UsageRow & {
   provider_id: string | null
   model_id: string | null
   variant: string | null
-  router_list: string | null
   first_at: number | null
   last_at: number | null
 }
 
 /**
  * Usage per model, each with the providers that served it. This is the view
- * that answers "which inference providers is this model actually coming from
- * over the selected period".
+ * that answers "through which provider is this model actually coming, over the
+ * selected period".
  */
 export function models(db: Database, range?: Range, filters?: Filters): ModelUsage[] {
   const filter = buildWhere(range, filters)
   const rows = db
     .query(
       `SELECT provider_id, model_id, variant,
-              GROUP_CONCAT(DISTINCT router) AS router_list,
               ${USAGE_SELECT},
               MIN(${STEP_TIME}) AS first_at,
               MAX(COALESCE(completed_at, recorded_at)) AS last_at
@@ -266,7 +263,6 @@ export function models(db: Database, range?: Range, filters?: Filters): ModelUsa
     model.providers.push({
       ...usage,
       providerID: row.provider_id ?? "(unknown)",
-      routers: row.router_list ? row.router_list.split(",").filter(Boolean) : [],
       firstAt: row.first_at ?? undefined,
       lastAt: row.last_at ?? undefined,
     })
@@ -488,9 +484,6 @@ export type TurnUsage = {
   providerID: string | undefined
   modelID: string | undefined
   variant: string | undefined
-  router: string | undefined
-  /** The displayed identity differs from the previous turn of the session. */
-  routerChanged: boolean
   providerChanged: boolean
   modelChanged: boolean
   steps: number
@@ -526,7 +519,6 @@ type TurnStepRow = {
   recorded_at: number
   completed_at: number | null
   finish: string | null
-  router: string | null
 }
 
 /** A turn is finished when its last step ended without asking for more tools. */
@@ -597,7 +589,7 @@ export function turns(
     .query(
       `SELECT message_id, session_id, provider_id, model_id, variant,
               input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost,
-              created_at, streamed_at, recorded_at, completed_at, finish, router
+              created_at, streamed_at, recorded_at, completed_at, finish
          FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
         ORDER BY session_id, ${STEP_TIME}`,
     )
@@ -642,17 +634,9 @@ export function turns(
       }
       reference = message
     }
-    const lastWith = <Value>(pick: (row: TurnStepRow) => Value | null): Value | undefined => {
-      for (let index = bucket.length - 1; index >= 0; index -= 1) {
-        const value = pick(bucket[index]!)
-        if (value !== null) return value
-      }
-      return undefined
-    }
     const providerID = last.provider_id ?? undefined
     const modelID = last.model_id ?? undefined
     const variant = last.variant ?? undefined
-    const router = lastWith((row) => row.router)
     let produced = 0
     let window = 0
     for (const row of bucket) {
@@ -669,8 +653,6 @@ export function turns(
       providerID,
       modelID,
       variant,
-      router,
-      routerChanged: previous?.router !== undefined && router !== undefined && previous.router !== router,
       providerChanged: previous?.providerID !== undefined && providerID !== undefined && previous.providerID !== providerID,
       modelChanged:
         previous !== undefined &&
@@ -727,58 +709,19 @@ function promptFloor(db: Database, sessionID: string, count: number): number | u
   return rows.length === count ? rows[count - 1]!.created_at : undefined
 }
 
-/**
- * Routing endpoint of the newest step recorded before `at`. The TUI compares
- * it with the endpoint of the turn it is about to render, because the same
- * provider and model can be routed to a different endpoint per request.
- */
-export function routerBefore(db: Database, sessionID: string, at: number | undefined): string | undefined {
-  if (at === undefined) return undefined
-  const row = db
-    .query(
-      `SELECT router FROM steps
-        WHERE session_id = $sessionID AND router IS NOT NULL AND COALESCE(created_at, recorded_at) < $at
-        ORDER BY COALESCE(created_at, recorded_at) DESC LIMIT 1`,
-    )
-    .get({ $sessionID: sessionID, $at: at }) as { router: string | null } | null
-  return row?.router ?? undefined
-}
-
-/**
- * Routing endpoint of one turn: the newest endpoint the recorder stored for
- * the given steps of a session. The TUI reads this for the telemetry line
- * because the line renders from the TUI process while the recorder (the server
- * process) is still writing the step that just finished. Scoped to the turn's
- * own steps on purpose: the same provider and model can be routed to a
- * different endpoint per request, so the newest endpoint of the session is not
- * necessarily the one that served the turn being rendered.
- */
-export function routerForSteps(db: Database, sessionID: string, messageIDs: readonly string[]): string | undefined {
-  if (messageIDs.length === 0) return undefined
-  const placeholders = messageIDs.map(() => "?").join(", ")
-  const row = db
-    .query(
-      `SELECT router FROM steps
-        WHERE session_id = ? AND message_id IN (${placeholders}) AND router IS NOT NULL
-        ORDER BY recorded_at DESC LIMIT 1`,
-    )
-    .get(sessionID, ...messageIDs) as { router: string | null } | null
-  return row?.router ?? undefined
-}
-
 // ---------------------------------------------------------------------------
 // Filter pickers
 // ---------------------------------------------------------------------------
 
 export type FilterOption = { value: string; steps: number }
 
-/** Distinct models and endpoints, most used first. */
-export function filterOptions(db: Database): { models: FilterOption[]; endpoints: FilterOption[] } {
+/** Distinct models and providers, most used first. */
+export function filterOptions(db: Database): { models: FilterOption[]; providers: FilterOption[] } {
   const pick = (column: string): FilterOption[] =>
     (
       db
         .query(`SELECT ${column} AS value, COUNT(*) AS steps FROM steps WHERE ${column} IS NOT NULL GROUP BY ${column} ORDER BY steps DESC`)
         .all() as { value: string; steps: number }[]
     ).map((row) => ({ value: row.value, steps: row.steps }))
-  return { models: pick("model_id"), endpoints: pick("router") }
+  return { models: pick("model_id"), providers: pick("provider_id") }
 }

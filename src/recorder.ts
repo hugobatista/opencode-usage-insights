@@ -1,7 +1,6 @@
 import type { Database } from "bun:sqlite"
-import { recordEvent, recordPrompt, recordStep, setStepRouterForSessionModel, upsertSession } from "./stats/db"
+import { recordEvent, recordPrompt, recordStep, upsertSession } from "./stats/db"
 import { COMPACTION_KIND } from "./stats/queries"
-import { inferFromHeaders, inferFromUrl, mergeEndpoint, type EndpointInfo } from "./endpoint"
 
 /**
  * Event-driven recorder. Every handler is idempotent and defensive: the
@@ -9,8 +8,10 @@ import { inferFromHeaders, inferFromUrl, mergeEndpoint, type EndpointInfo } from
  * unexpected shape, so unknown events are ignored and malformed payloads are
  * dropped rather than thrown.
  *
- * Pure with respect to its inputs (database plus events) so the whole
- * recording policy can be unit-tested without the plugin runtime.
+ * Everything written comes from the event stream: the step's provider, model
+ * and variant, its tokens, its timing and its outcome. Pure with respect to
+ * its inputs (database plus events) so the whole recording policy can be
+ * unit-tested without the plugin runtime.
  */
 
 export type SessionModelRef = {
@@ -50,14 +51,6 @@ export type RecorderEvent = {
   data?: RecorderEventData | undefined
 }
 
-export type HttpResponseInput = {
-  sessionID?: string | undefined
-  kind?: string | undefined
-  model?: SessionModelRef | undefined
-  request?: { method?: string | undefined; url?: string | undefined } | undefined
-  response?: { status?: number | undefined; headers?: Headers | Record<string, string | undefined> | undefined } | undefined
-}
-
 export type PendingStep = {
   messageID: string
   sessionID: string
@@ -74,8 +67,6 @@ export type RecorderOptions = {
 export type Recorder = {
   /** Apply one session event. Unknown or malformed events are ignored. */
   handleEvent(event: RecorderEvent): void
-  /** Learn the routing endpoint from one model response. */
-  handleHttpResponse(event: HttpResponseInput): void
   pendingFor(sessionID: string): PendingStep | undefined
 }
 
@@ -93,8 +84,6 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
   const pending = new Map<string, PendingStep>()
   /** Last model selected per session, used when a step starts unobserved. */
   const lastModel = new Map<string, SessionModelRef>()
-  /** Endpoint evidence learned per session, applied to its steps. */
-  const known = new Map<string, { modelID: string | undefined; info: EndpointInfo }>()
   const now = options?.now ?? (() => Date.now())
 
   /**
@@ -167,36 +156,9 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
   /** Drop everything remembered about a session that is gone. */
   function forget(sessionID: string): void {
     lastModel.delete(sessionID)
-    known.delete(sessionID)
     for (const [messageID, step] of pending) {
       if (step.sessionID === sessionID) pending.delete(messageID)
     }
-  }
-
-  /**
-   * How much an observation is worth: the gateway naming its own routing
-   * endpoint beats inferring it from the host, which beats nothing. Without
-   * this a response that carries no endpoint header would downgrade the one a
-   * previous response named.
-   */
-  function strength(info: EndpointInfo | undefined): number {
-    if (info?.router === undefined) return 0
-    return info.source?.startsWith("header:") === true ? 2 : 1
-  }
-
-  function noteRouter(sessionID: string, modelID: string | undefined, info: EndpointInfo): void {
-    const previous = known.get(sessionID)
-    // A stronger observation wins; at equal strength the newest one does, so a
-    // gateway that re-routes is still seen.
-    const merged = strength(previous?.info) > strength(info) ? previous!.info : mergeEndpoint(info, previous?.info)
-    const info2: EndpointInfo = merged ?? info
-    // The same answer for the same model means the database already agrees: the
-    // rows recorded since the last observation carry the endpoint at insert
-    // time, and the older ones were filled when it was learned. Writing again
-    // would cost the response path a statement to change nothing.
-    const settled = previous !== undefined && previous.modelID === modelID && previous.info.router === info2.router
-    remember(known, sessionID, { modelID, info: info2 }, MAX_TRACKED_SESSIONS)
-    if (!settled) write(() => setStepRouterForSessionModel(db, sessionID, modelID, info2))
   }
 
   function recordPendingStep(messageID: string, data: RecorderEventData, finish: string | undefined, at: number): void {
@@ -205,8 +167,6 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
     const info = pending.get(messageID)
     pending.delete(messageID)
     const model = info?.model ?? lastModel.get(sessionID)
-    const learned = known.get(sessionID)
-    const matched = learned !== undefined && (learned.modelID === undefined || learned.modelID === model?.id) ? learned.info : undefined
     write(() =>
       recordStep(db, {
         messageID,
@@ -224,7 +184,6 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
         streamedAt: info?.streamed,
         completedAt: at,
         finish,
-        router: matched?.router,
         recordedAt: now(),
       }),
     )
@@ -346,21 +305,5 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
     return found
   }
 
-  function handleHttpResponse(event: HttpResponseInput): void {
-    const sessionID = event.sessionID
-    if (typeof sessionID !== "string") return
-
-    // The endpoint that served the request: the gateway's own header first,
-    // then the host the request went to. Nothing else about the exchange is
-    // kept — the headers a gateway happens to send are not who ran the model.
-    const inferred = mergeEndpoint(inferFromHeaders(event.response?.headers), inferFromUrl(event.request?.url))
-    if (inferred === undefined) return
-
-    noteRouter(sessionID, event.model?.id, inferred)
-    // The step in flight is not a row yet: `recordPendingStep` writes it when it
-    // ends, carrying the endpoint learned from this response. Writing here would
-    // be a statement that changes nothing, on the request path.
-  }
-
-  return { handleEvent, handleHttpResponse, pendingFor }
+  return { handleEvent, pendingFor }
 }

@@ -11,8 +11,6 @@ import {
   openStatsDbWrite,
   recordEvent,
   recordStep,
-  setStepRouter,
-  setStepRouterForSessionModel,
   upsertSession,
 } from "../src/stats/db"
 
@@ -42,20 +40,29 @@ describe("schema", () => {
     db.close()
   })
 
-  test("folds endpoint spellings recorded before the rule into lowercase", () => {
-    const directory = tempDir("router-case")
+  test("drops the router column and its index from a database that carries them", () => {
+    const directory = tempDir("router-drop")
     const path = join(directory, "usage.db")
     try {
-      // A database from before the normalization: version 6, mixed-case router.
+      // A database from before the endpoint identity was removed: schema 8, a
+      // router column, its index, and a value in it.
       const first = openStatsDb(path)
-      recordStep(first, { messageID: "s1", sessionID: "ses", modelID: "m", router: "orcarouter-dsv4.1flash", recordedAt: BASE })
-      first.query("UPDATE steps SET router = 'OrcaRouter-DSV4.1Flash' WHERE message_id = 's1'").run()
-      first.query("UPDATE meta SET value = '6' WHERE key = 'schema_version'").run()
+      recordStep(first, { messageID: "s1", sessionID: "ses", providerID: "opencode", modelID: "m", recordedAt: BASE })
+      first.exec("ALTER TABLE steps ADD COLUMN router TEXT")
+      first.exec("CREATE INDEX steps_router ON steps(router)")
+      first.query("UPDATE steps SET router = 'orcarouter-dsv4.1flash' WHERE message_id = 's1'").run()
+      first.query("UPDATE meta SET value = '8' WHERE key = 'schema_version'").run()
       first.close()
 
       const second = openStatsDb(path)
-      const row = second.query("SELECT router FROM steps WHERE message_id = 's1'").get() as { router: string }
-      expect(row.router).toBe("orcarouter-dsv4.1flash")
+      const columns = (second.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
+      expect(columns).not.toContain("router")
+      const indexes = (second.query("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map((row) => row.name)
+      expect(indexes).not.toContain("steps_router")
+      // What a view reads — the provider and the model — survives the drop.
+      const row = second.query("SELECT provider_id, model_id FROM steps WHERE message_id = 's1'").get() as { provider_id: string; model_id: string }
+      expect(row.provider_id).toBe("opencode")
+      expect(row.model_id).toBe("m")
       const version = (second.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value
       expect(version).toBe(String(SCHEMA_VERSION))
       second.close()
@@ -182,29 +189,19 @@ describe("writing", () => {
     db.close()
   })
 
-  test("stores the endpoint as a validated, lowercase token", () => {
+  test("stores the provider as a token and drops what is not one", () => {
     const db = openStatsDb(":memory:")
-    recordStep(db, { messageID: "w2", sessionID: "ses", router: "  GW-1  ", recordedAt: BASE })
-    recordStep(db, { messageID: "w3", sessionID: "ses", router: "gw\u001b[31m", recordedAt: BASE })
-    const rows = db.query("SELECT message_id, router FROM steps ORDER BY message_id").all() as { message_id: string; router: string | null }[]
-    // A value that is not an endpoint id is not stored as one.
+    recordStep(db, { messageID: "w2", sessionID: "ses", providerID: "opencode-go", recordedAt: BASE })
+    recordStep(db, { messageID: "w3", sessionID: "ses", providerID: "not a provider", recordedAt: BASE })
+    recordStep(db, { messageID: "w4", sessionID: "ses", providerID: "DeepSeek", recordedAt: BASE })
+    const rows = db.query("SELECT message_id, provider_id FROM steps ORDER BY message_id").all() as { message_id: string; provider_id: string | null }[]
+    // A value that is not a provider id is not stored as one; case is kept, so
+    // the provider reads the way it is configured.
     expect(rows).toEqual([
-      { message_id: "w2", router: "gw-1" },
-      { message_id: "w3", router: null },
+      { message_id: "w2", provider_id: "opencode-go" },
+      { message_id: "w3", provider_id: null },
+      { message_id: "w4", provider_id: "DeepSeek" },
     ])
-    db.close()
-  })
-
-  test("a repeat of the same endpoint costs no write", () => {
-    const db = openStatsDb(":memory:")
-    recordStep(db, { messageID: "n1", sessionID: "ses", modelID: "m", input: 1, recordedAt: BASE })
-    expect(setStepRouterForSessionModel(db, "ses", "m", { router: "gw-1" })).toBe(1)
-    // The same observation again: the database already agrees.
-    expect(setStepRouterForSessionModel(db, "ses", "m", { router: "gw-1" })).toBe(0)
-    setStepRouter(db, "n1", { router: "gw-1" })
-    setStepRouter(db, "n1", { router: "Gw-1" })
-    const row = db.query("SELECT router FROM steps WHERE message_id = 'n1'").get() as { router: string }
-    expect(row.router).toBe("gw-1")
     db.close()
   })
 
@@ -273,12 +270,19 @@ describe("importNdjson", () => {
   test("round-trips what the recorder wrote", () => {
     const db = target()
     upsertSession(db, { sessionID: "ses", title: "One", directory: "/tmp/ses", startedAt: BASE })
-    recordStep(db, { messageID: "rt1", sessionID: "ses", modelID: "m", input: 10, output: 2, cost: 0.5, createdAt: BASE, recordedAt: BASE })
-    const dump = `{"table":"sessions","row":{"session_id":"ses","title":"One","directory":"/tmp/ses","started_at":${BASE},"updated_at":${BASE}}}\n{"table":"steps","row":{"message_id":"rt1","session_id":"ses","model_id":"m","input_tokens":10,"output_tokens":2,"cost":0.5,"created_at":${BASE},"recorded_at":${BASE},"router":null}}`
+    recordStep(db, { messageID: "rt1", sessionID: "ses", providerID: "opencode-go", modelID: "m", input: 10, output: 2, cost: 0.5, createdAt: BASE, recordedAt: BASE })
+    const dump = `{"table":"sessions","row":{"session_id":"ses","title":"One","directory":"/tmp/ses","started_at":${BASE},"updated_at":${BASE}}}\n{"table":"steps","row":{"message_id":"rt1","session_id":"ses","provider_id":"opencode-go","model_id":"m","input_tokens":10,"output_tokens":2,"cost":0.5,"created_at":${BASE},"recorded_at":${BASE}}}`
     const fresh = target()
     expect(importNdjson(fresh, dump)).toBe(2)
-    const steps = fresh.query("SELECT message_id, input_tokens, cost FROM steps").all()
-    expect(steps).toEqual([{ message_id: "rt1", input_tokens: 10, cost: 0.5 }])
+    // A dump written before the endpoint was dropped still imports: the row's
+    // own columns are the ones the table has, and an unknown one is ignored.
+    const older = `{"table":"steps","row":{"message_id":"old1","session_id":"ses","router":"gw-1","model_id":"m","recorded_at":${BASE}}}`
+    expect(importNdjson(fresh, older)).toBe(1)
+    const steps = fresh.query("SELECT message_id, provider_id, input_tokens, cost FROM steps ORDER BY message_id").all()
+    expect(steps).toEqual([
+      { message_id: "old1", provider_id: null, input_tokens: 0, cost: 0 },
+      { message_id: "rt1", provider_id: "opencode-go", input_tokens: 10, cost: 0.5 },
+    ])
     db.close()
     fresh.close()
   })

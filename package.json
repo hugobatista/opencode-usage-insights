@@ -1,7 +1,7 @@
 {
   "name": "opencode-usage-insights",
   "version": "0.1.1",
-  "description": "OpenCode V2 plugin: a live turn telemetry line plus a persistent SQLite usage record, read back by an interactive /usage panel — models, endpoints, prompt cache, affinity, periods and latency.",
+  "description": "OpenCode V2 plugin: a live turn telemetry line plus a persistent SQLite usage record, read back by an interactive /usage panel — models, providers, prompt cache, periods and latency.",
   "type": "module",
   "license": "MIT",
   "author": {

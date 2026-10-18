@@ -92,7 +92,6 @@ describe("recorder steps", () => {
       streamed_at: 550,
       completed_at: 900,
       finish: "stop",
-      router: null,
       recorded_at: NOW,
     })
     expect(recorder.pendingFor("s1")).toBeUndefined()
@@ -126,69 +125,46 @@ describe("recorder steps", () => {
   })
 })
 
-describe("recorder endpoint discovery", () => {
-  test("applies the endpoint to the step in flight and to later steps", () => {
+describe("recorder identity", () => {
+  test("records the provider and the model the step ran as", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      model: { providerID: "opencode", id: "m1" },
-      request: { url: "https://opencode.ai/zen/v1/chat" },
-      response: { status: 200, headers: { "x-opencode-endpoint-id": "thesean-dsv4.1flash" } },
+    recorder.handleEvent({
+      type: "session.step.started",
+      created: 50,
+      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" } },
     })
-    // The step in flight learns it, and so does the next one.
-    recorder.handleHttpResponse({ sessionID: "s1", model: { providerID: "opencode", id: "m1" }, request: { url: "https://opencode.ai/zen/v1/chat" }, response: { headers: {} } })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    recorder.handleEvent({ type: "session.step.started", created: 90, data: { sessionID: "s1", assistantMessageID: "a2", model: { providerID: "opencode", id: "m1" } } })
-    recorder.handleEvent({ type: "session.step.ended", created: 99, data: { sessionID: "s1", assistantMessageID: "a2", tokens: { input: 1 } } })
-    const rows = db.query("SELECT message_id, router FROM steps ORDER BY message_id").all() as Record<string, unknown>[]
-    expect(rows).toEqual([
-      { message_id: "a1", router: "thesean-dsv4.1flash" },
-      { message_id: "a2", router: "thesean-dsv4.1flash" },
-    ])
+    expect(stepRow(db).provider_id).toBe("opencode-go")
+    expect(stepRow(db).model_id).toBe("deepseek-v4.1-flash")
     db.close()
   })
 
-  test("learns the endpoint from the host when no header names one", () => {
+  test("attributes a step that started before the plugin loaded to the last model selected", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "fireworks", id: "m1" } } })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      model: { providerID: "fireworks", id: "m1" },
-      request: { url: "https://api.fireworks.ai/inference/v1/chat/completions" },
-      response: { status: 200, headers: { "x-served-by": "fireworks" } },
-    })
+    // The session published its model before the plugin was listening.
+    recorder.handleEvent({ type: "session.model.selected", created: 10, data: { sessionID: "s1", model: { providerID: "deepseek", id: "deepseek-flash" } } })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    expect(stepRow(db).router).toBe("fireworks")
+    expect(stepRow(db).provider_id).toBe("deepseek")
+    expect(stepRow(db).model_id).toBe("deepseek-flash")
     db.close()
   })
 
-  test("stores nothing about an exchange that names no endpoint", () => {
+  test("keeps the provider of the step itself, not of the session's newest model", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      model: { providerID: "opencode", id: "m1" },
-      request: { url: "https://example.com/v1/chat" },
-      // Operator and CDN headers only: neither is the endpoint.
-      response: { status: 200, headers: { "x-served-by": "together", server: "cloudflare", "cf-ray": "abc" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode-go", id: "m1" } } })
+    // The user switches provider while the step is still streaming.
+    recorder.handleEvent({ type: "session.model.selected", created: 60, data: { sessionID: "s1", model: { providerID: "deepseek", id: "m2" } } })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    expect(stepRow(db).router).toBeNull()
+    expect(stepRow(db).provider_id).toBe("opencode-go")
     db.close()
   })
 
-  test("keeps the endpoint learned for a session across steps of the same model", () => {
+  test("a session that is gone takes its remembered model with it", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
-    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      model: { providerID: "opencode", id: "m1" },
-      request: { url: "https://opencode.ai/zen/v1/chat" },
-      response: { headers: { "x-opencode-endpoint-id": "luminal-dsv4.1flash" } },
-    })
-    expect(stepRow(db).router).toBe("luminal-dsv4.1flash")
+    recorder.handleEvent({ type: "session.created", created: 10, data: { sessionID: "s1", model: { providerID: "opencode", id: "m1" } } })
+    recorder.handleEvent({ type: "session.deleted", created: 20, data: { sessionID: "s1" } })
+    recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
+    expect(stepRow(db).provider_id).toBeNull()
     db.close()
   })
 })
@@ -233,59 +209,21 @@ describe("recorder robustness", () => {
     const { db, recorder } = harness()
     recorder.handleEvent({ type: "session.created", created: 1, data: { sessionID: "s1", model: MODEL } })
     recorder.handleEvent({ type: "session.step.started", created: 2, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      model: MODEL,
-      response: { headers: { "x-opencode-endpoint-id": "gw-1" } },
-    })
     // The session is deleted before its step ends: the in-flight entry and the
-    // endpoint learned for it go too, so a deleted session leaves nothing.
+    // model remembered for it go too, so a deleted session leaves nothing.
     recorder.handleEvent({ type: "session.deleted", created: 3, data: { sessionID: "s1" } })
     expect(recorder.pendingFor("s1")).toBeUndefined()
     recorder.handleEvent({ type: "session.step.ended", created: 4, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    expect(stepRow(db).router).toBeNull()
+    expect(stepRow(db).provider_id).toBeNull()
     db.close()
   })
 
-  test("a gateway that repeats its endpoint costs no write", () => {
+  test("records a step whose model was never observed without an identity", () => {
     const { db, recorder } = harness()
-    const response = {
-      sessionID: "s1",
-      model: MODEL,
-      request: { url: "https://opencode.ai/zen/v1/chat" },
-      response: { headers: { "x-opencode-endpoint-id": "gw-1" } },
-    }
-    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
-    recorder.handleHttpResponse(response)
     recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    // The step carries the endpoint the gateway named, applied when it was
-    // written rather than by a second statement on the response path.
-    expect(stepRow(db).router).toBe("gw-1")
-
-    // The next response observes the same endpoint for the same model: there
-    // is nothing left to apply, and the response path stays a map lookup.
-    const changes = () => (db.query("SELECT total_changes() AS n").get() as { n: number }).n
-    const before = changes()
-    recorder.handleHttpResponse(response)
-    expect(changes()).toBe(before)
-    db.close()
-  })
-
-  test("a gateway that re-routes is seen", () => {
-    const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
-    recorder.handleHttpResponse({ sessionID: "s1", model: MODEL, response: { headers: { "x-opencode-endpoint-id": "gw-1" } } })
-    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    recorder.handleEvent({ type: "session.step.started", created: 30, data: { sessionID: "s1", assistantMessageID: "a2", model: MODEL } })
-    recorder.handleHttpResponse({ sessionID: "s1", model: MODEL, response: { headers: { "x-opencode-endpoint-id": "gw-2" } } })
-    recorder.handleEvent({ type: "session.step.ended", created: 40, data: { sessionID: "s1", assistantMessageID: "a2", tokens: { input: 1 } } })
-    // The re-route is not retroactive: a1 keeps the endpoint that served it,
-    // and only steps recorded without one are filled in.
-    const rows = db.query("SELECT message_id, router FROM steps ORDER BY message_id").all()
-    expect(rows).toEqual([
-      { message_id: "a1", router: "gw-1" },
-      { message_id: "a2", router: "gw-2" },
-    ])
+    expect(stepRow(db).provider_id).toBeNull()
+    expect(stepRow(db).model_id).toBeNull()
+    expect(stepRow(db).input_tokens).toBe(1)
     db.close()
   })
 

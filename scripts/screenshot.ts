@@ -226,7 +226,7 @@ const panelInput = {
   focus: () => {},
   toggleFullscreen: () => {},
 }
-for (const view of ["overview", "endpoints", "cache"] as const) {
+for (const view of ["overview", "providers", "cache"] as const) {
   const command = harness.command("usage-insights.stats")
   if (command === undefined) throw new Error("the plugin did not register the /usage command")
   command.run(view)

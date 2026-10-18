@@ -8,9 +8,9 @@ import { overview, turns } from "./stats/queries"
 
 /**
  * Sidebar history: the session's accumulated usage, then the last finished
- * turns, two compact lines each (when + endpoint, then the prompt volumes).
- * Reads the same database, the same buckets and the same formatter as the panel
- * and the live line, and refreshes whenever a turn ends.
+ * turns — when and through which provider, the model when it changed, and the
+ * prompt volumes. Reads the same database, the same buckets and the same
+ * formatter as the panel and the live line, and refreshes whenever a turn ends.
  */
 
 export type TurnsSidebarDeps = {

@@ -81,7 +81,7 @@ export function Panel(props: {
     const current = settings()
     return {
       ...(current.modelID !== "" ? { modelID: current.modelID } : {}),
-      ...(current.routerID !== "" ? { router: current.routerID } : {}),
+      ...(current.providerID !== "" ? { provider: current.providerID } : {}),
     }
   }
 
@@ -276,15 +276,15 @@ export function Panel(props: {
     setAnchor(undefined)
   }
 
-  async function pickFilter(kind: "model" | "endpoint"): Promise<void> {
+  async function pickFilter(kind: "model" | "provider"): Promise<void> {
     const db = props.deps.db()
     if (db === undefined) return
     const all = filterOptions(db)
-    const list = kind === "model" ? all.models : all.endpoints
+    const list = kind === "model" ? all.models : all.providers
     const current = settings()
-    const selected = kind === "model" ? current.modelID : current.routerID
+    const selected = kind === "model" ? current.modelID : current.providerID
     const value = await props.ctx.ui.dialog.select<string>({
-      title: kind === "model" ? "Filter by model" : "Filter by endpoint (who served it)",
+      title: kind === "model" ? "Filter by model" : "Filter by provider",
       current: selected,
       options: [
         { title: `any · ${list.length} observed`, value: "" },
@@ -294,7 +294,7 @@ export function Panel(props: {
     if (value === undefined) return
     props.update((draft) => {
       if (kind === "model") draft.modelID = value
-      else draft.routerID = value
+      else draft.providerID = value
     })
     setAnchor(undefined)
     setDetail(undefined)
@@ -349,11 +349,11 @@ export function Panel(props: {
           draft.view = "turns"
         })),
         command("usage-insights.filter.model", "Filter by model", "m", () => void pickFilter("model")),
-        command("usage-insights.filter.endpoint", "Filter by endpoint", "e", () => void pickFilter("endpoint")),
+        command("usage-insights.filter.provider", "Filter by provider", "p", () => void pickFilter("provider")),
         command("usage-insights.filter.clear", "Clear filters", "x", () => {
           props.update((draft) => {
             draft.modelID = ""
-            draft.routerID = ""
+            draft.providerID = ""
           })
           setAnchor(undefined)
         }),

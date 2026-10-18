@@ -1,33 +1,32 @@
 import type { Database } from "bun:sqlite"
 import { formatTokens } from "./core"
 import {
-  affinityOf,
   cacheDropsOf,
   cachePairs,
   cacheStatsByModel,
   cacheStatsOf,
   coverageOf,
-  endpointBreakdownOf,
-  endpointSummaryOf,
+  providerBreakdownOf,
+  providerSummaryOf,
   gapReportOf,
   latencyGroupsOf,
   latencyOf,
   periodsOf,
   stepRows,
+  switchesOf,
   timingRows,
   ttlEvidenceOf,
-  type AffinityReport,
   type CacheStats,
-  type EndpointRow,
+  type ProviderRow,
   type PairRow,
-  type EndpointSummary,
+  type ProviderSummary,
   type Dimension,
   type LatencyGroupRow,
+  type SwitchRow,
 } from "./stats/aggregates"
 import { childSessionIDs, modelKey, models, overview, sessionUsageOf, sessions, STEP_TIME, turns, type Filters } from "./stats/queries"
 import type { DbInfo } from "./stats/maintenance"
 import {
-  affinityLines,
   cacheLines,
   dbLines,
   formatCount,
@@ -35,8 +34,8 @@ import {
   modelsLines,
   overviewLines,
   periodLines,
-  endpointSummaryLines,
-  endpointsLines,
+  providerSummaryLines,
+  providerLines,
   sessionsLines,
   turnsLines,
   type CacheModelRow,
@@ -83,8 +82,7 @@ export type PanelRequest = {
 /** Sorting options per view; the first is the default. */
 export const SORT_KEYS: Partial<Record<PanelView, readonly string[]>> = {
   models: ["steps", "cached", "hit", "out", "cost"],
-  endpoints: ["steps", "cached", "hit", "cost", "share", "tps"],
-  affinity: ["changes", "lost", "steps"],
+  providers: ["steps", "cached", "hit", "cost", "share", "tps"],
   latency: ["n", "tps", "wall"],
   sessions: ["last", "steps", "cached", "cost"],
   turns: ["time", "cost", "tokens"],
@@ -115,8 +113,6 @@ export function detailLabel(row: PanelRow): string {
       return `session ${row.value}`
     case "period":
       return `period ${row.value}`
-    case "endpoint":
-      return `endpoint ${row.value}`
     case "provider":
       return `provider ${row.value}`
     case "prune":
@@ -166,23 +162,21 @@ function build(request: PanelRequest): PanelLine[] {
     }
     case "models": {
       const rows = sortModels(models(db, range, filters), request.sort, request.sortDesc)
-      // One read of the pairs serves the reuse table and the change counts.
+      // One read of the pairs serves the reuse table and the switch counts.
       const pairs = cachePairs(db, { range, filters })
-      const affinity = affinityOf(pairs)
+      const switches = switchesOf(pairs)
       return modelsLines(
         rows,
         width,
         {
           cache: cacheByModel(pairs),
-          changes: new Map(affinity.rows.map((row) => [modelKey(row.modelID, row.variant), row.changes])),
+          switches: switchesByModel(switches.rows),
         },
         40,
       )
     }
-    case "endpoints":
-      return endpointSummaryLines(sortEndpoints(endpointSummaryOf(stepRows(db, { range, filters })), request.sort, request.sortDesc), width, 40)
-    case "affinity":
-      return affinityLines(sortAffinity(affinityOf(cachePairs(db, { range, filters })), request.sort, request.sortDesc), width, 40)
+    case "providers":
+      return providerSummaryLines(sortProviders(providerSummaryOf(stepRows(db, { range, filters })), request.sort, request.sortDesc), width, 40)
     case "cache": {
       // One read of the pairs serves the losses, the TTL bounds and the
       // survival buckets: they are three views of the same comparison.
@@ -202,7 +196,7 @@ function build(request: PanelRequest): PanelLine[] {
     case "latency": {
       // One read of the timings serves the overall block and the group table.
       const timings = timingRows(db, { range, filters })
-      const by: Dimension = filters.modelID !== undefined ? "endpoint" : "model"
+      const by: Dimension = filters.modelID !== undefined ? "provider" : "model"
       return latencyLines(latencyOf(timings), width, sortLatency(latencyGroupsOf(timings, by), request.sort, request.sortDesc), 14)
     }
     case "sessions": {
@@ -267,6 +261,8 @@ function buildDetail(
     // model for the provider, so it gets its own detail.
     const scoped: Filters = { ...filters, modelKey: modelKey(row.value, row.variant) }
     const stats = cacheStatsOf(db, { range, filters: scoped })
+    // One read of the steps serves the provider breakdown and the latency.
+    const steps = stepRows(db, { range, filters: scoped })
     return [
       head,
       {
@@ -278,9 +274,11 @@ function buildDetail(
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...endpointsLines(endpointBreakdownOf(stepRows(db, { range, filters: scoped })), width, 40),
+      ...providerLines(providerBreakdownOf(steps), width, 40),
       { text: "", tone: "muted" },
-      ...affinityLines(affinityOf(cachePairs(db, { range, filters: scoped })), width, 10),
+      // One model, so its latency is worth reading per provider: that is what
+      // the model's own identity no longer separates.
+      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "provider"), 14),
       { text: "", tone: "muted" },
       back,
     ]
@@ -289,9 +287,9 @@ function buildDetail(
     const rows = turns(db, { sessionID: row.value, limit: 80 })
     return [head, { text: "", tone: "muted" }, ...turnsLines(rows, width, request.format), { text: "", tone: "muted" }, back]
   }
-  if (row.kind === "endpoint") {
-    // An endpoint detail: every model that endpoint served, then its latency.
-    const scoped: Filters = { ...filters, router: row.value }
+  if (row.kind === "provider") {
+    // A provider detail: every model it served, then its latency.
+    const scoped: Filters = { ...filters, provider: row.value }
     // One read of the steps serves the reuse line and the latency block.
     const steps = stepRows(db, { range, filters: scoped })
     const stats = cacheStatsOf(db, { range, filters: scoped })
@@ -304,7 +302,7 @@ function buildDetail(
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...endpointsLines(endpointBreakdownOf(steps), width, 40),
+      ...providerLines(providerBreakdownOf(steps), width, 40),
       { text: "", tone: "muted" },
       ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "model"), 14),
       { text: "", tone: "muted" },
@@ -319,7 +317,7 @@ function buildDetail(
       head,
       { text: `${formatCount(period?.steps ?? 0)} steps`, tone: "muted" },
       { text: "", tone: "muted" },
-      ...endpointSummaryLines(endpointSummaryOf(stepRows(db, { range, filters })), width, 40),
+      ...providerSummaryLines(providerSummaryOf(stepRows(db, { range, filters })), width, 40),
       { text: "", tone: "muted" },
       back,
     ]
@@ -346,7 +344,7 @@ function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortEndpoints(rows: readonly EndpointSummary[], sort: string, desc: boolean): EndpointSummary[] {
+function sortProviders(rows: readonly ProviderSummary[], sort: string, desc: boolean): ProviderSummary[] {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "cached") return row.cache.cached
@@ -357,16 +355,6 @@ function sortEndpoints(rows: readonly EndpointSummary[], sort: string, desc: boo
     return row.usage.steps
   }
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
-}
-
-function sortAffinity(report: AffinityReport, sort: string, desc: boolean): AffinityReport {
-  const sign = desc ? -1 : 1
-  const pick = (row: (typeof report.rows)[number]): number => {
-    if (sort === "lost") return row.cacheLost
-    if (sort === "steps") return row.steps
-    return row.changes
-  }
-  return { ...report, rows: [...report.rows].sort((left, right) => sign * (pick(right) - pick(left))) }
 }
 
 function sortLatency(rows: readonly LatencyGroupRow[], sort: string, desc: boolean): LatencyGroupRow[] {
@@ -411,6 +399,11 @@ export function cacheByModel(pairs: readonly PairRow[]): Map<string, CacheStats>
     map.set(modelKey(row.modelID, row.variant), row.cache)
   }
   return map
+}
+
+/** The switch summary per `modelKey`, as the models view reads it. */
+export function switchesByModel(rows: readonly SwitchRow[]): Map<string, SwitchRow> {
+  return new Map(rows.map((row) => [modelKey(row.modelID, row.variant), row]))
 }
 
 /** The cache table of the cache view: the models holding the most cache. */

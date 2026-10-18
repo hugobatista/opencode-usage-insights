@@ -47,8 +47,8 @@ PRs that are too large to review efficiently will be asked to be split.
 
 ## Ground Rules for This Plugin
 
-- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/stats/`,
-  `src/endpoint.ts` and `src/text.ts` must stay free of host imports
+- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/stats/` and
+  `src/text.ts` must stay free of host imports
   (`@opencode/*`, `@opentui/*`, `solid-js`) so they remain unit-testable
   without a TUI runtime.
 - Every view or line change needs a test at the level it lives at: pure text for
@@ -67,8 +67,10 @@ PRs that are too large to review efficiently will be asked to be split.
   responses, and never let a telemetry failure surface as a session error.
 - A database write must be idempotent (upsert by message id) — replayed events
   and restarts are normal.
-- Report an endpoint only from evidence: a gateway's response header or the host
-  of the request. Never guess an endpoint from the provider id.
+- The identity of a step is the provider the model ran through and the model
+  itself, both taken from the event stream. Never infer who ran a request from
+  anything else: a gateway's upstream is not observable, and a guess would
+  label the telemetry with a name no evidence supports.
 - Changes that touch the queries, the panel assembly or the line should keep
   `bun run bench` green; changes to paths, the database or maintenance should
   keep `bun run check:platform` green. CI runs the suite on Linux, so run that

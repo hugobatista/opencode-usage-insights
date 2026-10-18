@@ -5,7 +5,7 @@
 [![Lint](https://img.shields.io/github/actions/workflow/status/hugobatista/opencode-usage-insights/lint.yml?label=Lint)](https://github.com/hugobatista/opencode-usage-insights/actions/workflows/lint.yml)
 [![npm](https://img.shields.io/npm/v/opencode-usage-insights.svg)](https://www.npmjs.com/package/opencode-usage-insights)
 
-OpenCode plugin for one question the host cannot answer: **which endpoint is
+OpenCode plugin for one question the host cannot answer: **which provider is
 actually serving each model** — and what that costs. It shows a telemetry line
 above the composer after every finished turn and records every assistant step
 in a local SQLite file, read back through an interactive `/usage` panel.
@@ -18,23 +18,24 @@ written by the server-side recorder and read by the TUI.
 ## What it does
 
 - **The line** (`session.composer.top`): end time, the gap since the previous
-  prompt, the endpoint that served the turn, turn and session token totals, and
-  warnings when the prompt cache or the endpoint identity changed. It belongs to
-  finished work, so it stays hidden while a turn is running.
-- **The `/usage` panel**: ten keyboard-driven views — `overview`, `models`,
-  `endpoints`, `affinity`, `cache`, `periods`, `latency`, `sessions`, `turns`,
+  prompt, the provider and model that ran the turn, turn and session token
+  totals, and warnings when the prompt cache or the provider identity changed.
+  It belongs to finished work, so it stays hidden while a turn is running.
+- **The `/usage` panel**: nine keyboard-driven views — `overview`, `models`,
+  `providers`, `cache`, `periods`, `latency`, `sessions`, `turns`,
   `db` — over five ranges (`session`, `today`, `7d`, `30d`, `all`), with
   drill-downs, sorting, filters and state remembered between openings.
-  `/usage models 7d`, `/usage affinity`, `/usage endpoints 30d`.
+  `/usage models 7d`, `/usage providers 30d`, `/usage turns 7d`.
 - **The session sidebar**: the session's own totals and its last turns, in the
-  same buckets as the line. Three lines per turn — when and through what, the
-  prompt volumes, then `hit · tok/s · cost` — and the session's average
-  throughput on its totals:
-  `16:54 orcarouter-dsv4.1flash` / `in 1.7k (427.3k) · out 1.06k` /
-  `hit 99.7% · 1.2k/s · $0.0006`.
+  same buckets as the line. Three lines per turn — when and through which
+  provider, the prompt volumes, then `hit · tok/s · cost` — plus the model at
+  both ends of the block and on any turn that changed it, so the history reads
+  whether it is the whole session or a window of a long one:
+  `16:54 opencode-go` / `deepseek-v4.1-flash max` /
+  `in 1.7k (427.3k) · out 1.06k` / `hit 99.7% · 1.2k/s · $0.0006`.
 - **The record** (server entry): every assistant step with tokens, cost,
-  timings, finish reason, provider/model, session and parent ids, and the
-  endpoint that served it; prompts, session lifecycle and compaction events too.
+  timings, finish reason, the provider and model it ran as, and its session and
+  parent ids; prompts, session lifecycle and compaction events too.
 - **Portable data** (from a checkout): `bun run report --ndjson` exports the
   whole database, and `--import` merges it back on another machine.
 - **Observational by design**: the plugin never rewrites prompts, requests or
@@ -87,7 +88,7 @@ To pass [options](#configuration), use the object form:
 ```jsonc
 {
   "plugins": [
-    { "package": "opencode-usage-insights", "options": { "identity": "endpoint" } }
+    { "package": "opencode-usage-insights", "options": { "sidebarTurns": 5 } }
   ]
 }
 ```
@@ -115,16 +116,17 @@ turn finishes, and `/usage` (alias `/insights`) opens the panel.
 ## The line
 
 ```text
-14:32:07 · Δ 3m12s · orcarouter-dsv4.1-flash-free · in 85.4k (1.62M), cached 1.53M, out 3.7k · sess in 2.1M (14.5M), cached 12.4M, out 88k · ⚠ cache expired (−11.7k)
+14:32:07 · Δ 3m12s · opencode-go/deepseek-v4.1-flash max · in 85.4k (1.62M), cached 1.53M, out 3.7k, cost $0.21 · sess in 2.1M (14.5M), cached 12.4M, out 88k, cost $1.90 · ⚠ cache expired (−11.7k)
 ```
 
 | Segment | Meaning |
 | --- | --- |
 | `14:32:07` | When the response ended (`completed`, else `streamed`, else `created`). |
 | `Δ 3m12s` | Time since the previous prompt of the same session. |
-| `orcarouter-dsv4.1-flash-free` | The endpoint that served the turn (`identity: "endpoint"`, the default): the gateway names it in a response header, or the request host names the operator. Without one the segment falls back to `providerID/modelID` (variant as a trailing word); `identity: "model"` always shows that form. Yellow with `changed` when it differs from the previous prompt. |
-| `in 85.4k (1.62M), cached 1.53M, out 3.7k` | `in` is the uncached part of the prompt (fresh input + cache writes), the parenthesised value the whole prompt — shown only when the two differ — `cached` its cached part, and `out` everything generated (visible output + reasoning). With several steps the segment reads `3 steps · …` and reports the step the turn ended with (`latest`); `turnTotals: "sum"` adds every step instead. |
-| `sess in 2.1M (14.5M), cached 12.4M, out 88k` | The session totals reported by the host, in the same buckets. |
+| `opencode-go/deepseek-v4.1-flash max` | The identity of the turn: the provider the model ran through, as OpenCode is configured, and the model (the variant as a trailing word; `fields.model`/`fields.variant` hide either). Yellow with `changed` when the provider differs from the previous prompt, `model changed` when only the model does. |
+| `in 85.4k (1.62M), cached 1.53M, out 3.7k, cost $0.21` | `in` is the uncached part of the prompt (fresh input + cache writes), the parenthesised value the whole prompt — shown only when the two differ — `cached` its cached part, `out` everything generated (visible output + reasoning), and `cost` what the turn was billed. With several steps the segment reads `3 steps · …` and reports the step the turn ended with (`latest`) for the tokens, while the cost is always the turn's own — every step is paid for; `turnTotals: "sum"` adds every step's tokens instead. |
+| `cost $0.21` | Money, not tokens: a turn sums every step's cost whatever the token view shows. A cost of zero is left out, so a free model reads as free. `fields.cost: false` hides it. |
+| `sess in 2.1M (14.5M), cached 12.4M, out 88k, cost $1.90` | The session totals reported by the host, in the same buckets, with the cost of the whole session. |
 | `⚠ cache expired (−11.7k)` | Yellow. The prompt cache read fell by that many tokens against a comparable previous step; `×N` when several steps in the turn lost cache. |
 
 The turn segment carries no label by default — the numbers are the turn's, and
@@ -146,7 +148,7 @@ and any argument — including an unknown token, which is ignored — keeps it o
 There is no default key binding — the command is palette-only, so it never
 shadows a key you use.
 
-![The /usage endpoints view](docs/images/panel-endpoints.png)
+![The /usage providers view](docs/images/panel-providers.png)
 
 The view bar at the top names every view and brackets the active one; `?` opens
 a help overlay that repeats the keys and defines every number.
@@ -157,14 +159,14 @@ a help overlay that repeats the keys and defines every number.
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move the cursor; the row under it is highlighted. |
 | `pageup` `pagedown` / `home` `end` | Move by ten rows / to the first or last row. |
-| `enter` | Drill into the row: a model → the endpoints that served it and its affinity; an endpoint → the models it served and its latency; a session → its turns; a period → the models of the period. In `db`, prune the steps recorded before the selected retention's cutoff date (asks first). |
+| `enter` | Drill into the row: a model → the providers it ran through and their latency; a provider → the models it served and its latency; a session → its turns; a period → the providers of the period. In `db`, prune the steps recorded before the selected retention's cutoff date (asks first). |
 | `backspace` | Go back from a drill-down. |
-| `0`–`9` / `[` `]` | Pick a view (`0` is `db`) / cycle views. |
+| `1`–`9` / `[` `]` | Pick a view (`9` is `db`) / cycle views. |
 | `t` / `shift+t` | Next / previous range. |
 | `s` / `shift+s` | Cycle the sort column / reverse it. |
 | `b` | `periods` bucket: day → week → month. |
 | `a` | `turns` scope: this session ↔ every session. |
-| `m` `e` | Filter by model or by **endpoint** (a picker of the values actually observed). |
+| `m` `p` | Filter by model or by **provider** (a picker of the values actually observed). |
 | `x` | Clear the filters. |
 | `r` | Re-read the database. |
 | `v` | `db`: compact the file, giving the space of deleted rows back. |
@@ -178,13 +180,12 @@ durable storage, so the panel reopens where it was left.
 
 | View | Answers |
 | --- | --- |
-| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many steps lack a model, an endpoint or a completion — a zero elsewhere is only trustworthy when this is complete). |
-| `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **endpoints that actually served it** and how often its identity changed. `enter` opens the per-endpoint detail. |
-| `endpoints` | **Who served the work**: one row per routing endpoint, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. A request whose endpoint was never observed is dimmed — the panel does not invent an identity. |
-| `affinity` | How often the step's identity changed against the step before it in the same session — the model and the endpoint — the cache those changes cost, and the most frequent transitions. |
-| `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time**, reuse kept per endpoint, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
-| `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost — with a sparkline per metric and a totals row. `enter` lists the models of a period. |
-| `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per endpoint when a model is filtered). `n < 5` is dimmed. |
+| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many models and providers were observed, and how many steps lack a model or a completion — a zero elsewhere is only trustworthy when this is complete). |
+| `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **providers it ran through** and how often it switched model or provider — with the cache a provider switch cost. `enter` opens the per-provider detail. |
+| `providers` | **Who ran the work**: one row per provider, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. Steps recorded without a provider (a model that was never observed) are dimmed and cannot be drilled into. |
+| `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time**, reuse kept per provider, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
+| `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost — with a sparkline per metric and a totals row. `enter` lists the providers of a period. |
+| `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per provider when a model is filtered). `n < 5` is dimmed. |
 | `sessions` | Each session with steps, prompts, tokens, `hit`, cost, its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
 | `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line. `a` widens it to every session, titled. |
 | `db` | Where the file lives, what it holds and how much of it is old. The retention table lists, per preset (`30`/`90`/`365` days), how many steps a prune would remove and the cutoff date it prunes from — pick one with `↑`/`↓` and `enter` prunes it (a confirmation first); `v` gives the space back. |
@@ -194,24 +195,27 @@ read in one place means the same in the other: `prompt` is everything the
 provider saw (`cached + fresh + writes`), `in` the uncached part, `hit` is
 `cached / prompt`, and `out` everything generated (visible output + reasoning).
 
-The endpoint is what the gateway names in `x-opencode-endpoint-id`, or the host
-of a per-operator provider. A **gateway host is not an endpoint**: when the
-gateway names no downstream endpoint, the request has no observed endpoint and
-the views say so (`– (never observed)`) instead of showing the gateway's name as
-if it had run the model. The line and the sidebar then fall back to
-`provider/model`. The line reports the endpoint of the turn it belongs to: a
-turn the gateway did not name falls back even when an earlier turn of the same
-provider and model had an endpoint.
+The identity of a step is the **provider the model ran through** — `opencode`,
+`opencode-go`, `deepseek`, whatever the provider is called in the OpenCode
+configuration — and the model itself. That is what every view groups by, and it
+is also the whole answer available: a gateway such as OpenCode Console may
+re-route a request to another operator, but that upstream is not observable from
+the plugin, and the identity a request *would* have been routed to is not
+evidence of who ran it. The provider is: the same model through `deepseek` and
+through `opencode-go` are two rows, two caches and two latency profiles, and a
+switch between them forfeits the cache the previous one held (the switch counts
+and the cache losses in the `models` view count exactly that).
 
 `tps`/`wall`/`stream` are produced tokens per streaming second / request to
 completed step / request to the last chunk. The sidebar's rate (per turn, and
 the session average on its totals) is the **weighted** one — produced tokens
 divided by the summed streaming windows — so it answers "how fast did this
 produce"; the `latency` view reports the p50 of the per-step rates instead, which
-answers "how fast is a typical step". A change of identity is not by
-itself a fault — a gateway may re-route deliberately — so `affinity` pairs the
-count with the cache reuse it actually cost. The panel's `?` overlay defines
-every number in place.
+answers "how fast is a typical step". A switch from one step to the next is not
+by itself a fault — moving to another model or provider is a deliberate choice —
+so the `models` view pairs the count with the cache the switch actually cost,
+which only a provider switch can: two models never share a cache to lose. The
+panel's `?` overlay defines every number in place.
 
 ## Configuration
 
@@ -225,7 +229,6 @@ Options apply to both entries (each side reads the ones it needs):
 | `sidebar` | `true` | Show the session summary and the per-prompt history — cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
 | `sidebarTurns` | `5` | How many turns the sidebar history shows. |
 | `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
-| `identity` | `"endpoint"` | Which identity the line leads with: `endpoint` shows the endpoint that served the turn (falling back to `provider/model`); `model` always shows `provider/model#variant`. |
 | `fields` | see below | Toggle line segments. |
 | `labels` | see below | Override line labels (the plugin is English-only by default). |
 
@@ -234,7 +237,7 @@ Options apply to both entries (each side reads the ones it needs):
 ```jsonc
 {
   "options": {
-    "fields": { "clock": true, "delta": true, "model": true, "variant": true, "turn": true, "session": true, "reasoning": false, "cost": false, "cacheExpiry": true },
+    "fields": { "clock": true, "delta": true, "model": true, "variant": true, "turn": true, "session": true, "reasoning": false, "cost": true, "cacheExpiry": true },
     "turnTotals": "latest",
     "labels": { "delta": "Δ", "turn": "", "session": "sess", "step": "step", "steps": "steps", "input": "in", "cached": "cached", "output": "out", "reasoning": "reason", "cost": "cost", "cacheExpired": "cache expired", "providerChanged": "changed", "modelChanged": "model changed" }
   }
@@ -260,11 +263,11 @@ option overrides both. The file is private to the user: its directory is created
 through a read-only connection, so it can never write, migrate or take the
 recorder's lock.
 
-Per step the database holds tokens, cost, timings, finish reason, the
-provider/model it ran as, the endpoint label, and the session title and working
-directory. **Prompts and responses are not stored**, and nothing leaves the
-machine. The schema, the indexes, the endpoint-discovery rules and the security
-notes live in [docs/internals.md](docs/internals.md).
+Per step the database holds tokens, cost, timings, finish reason, the provider
+and the model it ran as, and the session title and working directory. **Prompts
+and responses are not stored**, and nothing leaves the machine. The schema, the
+indexes, the identity rules and the security notes live in
+[docs/internals.md](docs/internals.md).
 
 ## CLI report
 
@@ -274,9 +277,9 @@ From a checkout, the database can be read without opening the TUI:
 bun run report                          # overview over all time
 bun run report models 7d                # one view, one range
 bun run report all                      # every view
-bun run report endpoints --model deepseek-v4.1-flash-free
+bun run report providers --model deepseek-v4.1-flash
 bun run report periods --granularity month
-bun run report affinity --endpoint orcarouter-dsv4.1flash
+bun run report models --provider opencode-go
 bun run report --json                   # raw rows and every analysis, for scripting
 bun run report --ndjson > backup.jsonl  # export the whole database
 bun run report --import backup.jsonl    # merge an export (idempotent)
@@ -285,7 +288,7 @@ bun run report --help
 
 The views come from the same `buildPanel` the TUI renders, so the terminal and
 the panel never drift apart. `--width`, `--granularity`, `--model`,
-`--endpoint`, `--sort` and `--asc` mirror what the panel's keys do.
+`--provider`, `--sort` and `--asc` mirror what the panel's keys do.
 
 ## Development
 
@@ -302,7 +305,8 @@ bun run docs:images  # re-render docs/images/*.png (needs ImageMagick)
   turn accounting, the host-shape adapter, the view models, and the database,
   queries and analysis layer. No host imports, so they are unit-testable without
   a TUI runtime.
-- `src/endpoint.ts`, `src/text.ts` — endpoint discovery and text hygiene.
+- `src/text.ts` — text hygiene and the token shape a provider id is validated
+  against.
 - `src/recorder.ts` — the event-stream state machine that fills the database.
 - `src/panel-build.ts`, `src/panel.tsx`, `src/sidebar.tsx` — panel assembly, the
   panel component, and the sidebar contribution.

@@ -21,11 +21,11 @@ function seed(): Database {
   upsertSession(db, { sessionID: "s3", title: "Docs pass", directory: "/code/docs", startedAt: BASE + 2 * MIN })
 
   const steps = [
-    { messageID: "m1", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE, streamedAt: BASE + 1_000, completedAt: BASE + 30_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 300, cost: 0.10, router: "router-1", finish: "stop" },
-    { messageID: "m2", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 1_000, completedAt: BASE + 5 * MIN + 20_000, input: 1_200, cacheRead: 90_000, output: 200, cost: 0.08, router: "router-2", finish: "stop" },
-    { messageID: "m3", sessionID: "s1", providerID: "anthropic", modelID: "model-b", createdAt: BASE + 40 * MIN, streamedAt: BASE + 40 * MIN + 2_000, completedAt: BASE + 41 * MIN, input: 12_000, cacheRead: 0, cacheWrite: 9_000, output: 900, reasoning: 400, cost: 1.20, router: "router-3", finish: "stop" },
-    { messageID: "m4", sessionID: "s2", providerID: "opencode", modelID: "model-a", createdAt: BASE + 2 * MIN, streamedAt: BASE + 2 * MIN + 800, completedAt: BASE + 2 * MIN + 8_000, input: 500, cacheRead: 40_000, output: 100, cost: 0.02, router: "router-1", finish: "stop" },
-    { messageID: "m5", sessionID: "s3", providerID: "opencode", modelID: "model-a", createdAt: BASE + 70 * MIN, streamedAt: BASE + 70 * MIN + 900, completedAt: BASE + 70 * MIN + 15_000, input: 800, cacheRead: 60_000, cacheWrite: 200, output: 250, cost: 0.05, router: "router-1", finish: "stop" },
+    { messageID: "m1", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE, streamedAt: BASE + 1_000, completedAt: BASE + 30_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 300, cost: 0.10, finish: "stop" },
+    { messageID: "m2", sessionID: "s1", providerID: "opencode-go", modelID: "model-a", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 1_000, completedAt: BASE + 5 * MIN + 20_000, input: 1_200, cacheRead: 90_000, output: 200, cost: 0.08, finish: "stop" },
+    { messageID: "m3", sessionID: "s1", providerID: "anthropic", modelID: "model-b", createdAt: BASE + 40 * MIN, streamedAt: BASE + 40 * MIN + 2_000, completedAt: BASE + 41 * MIN, input: 12_000, cacheRead: 0, cacheWrite: 9_000, output: 900, reasoning: 400, cost: 1.20, finish: "stop" },
+    { messageID: "m4", sessionID: "s2", providerID: "opencode", modelID: "model-a", createdAt: BASE + 2 * MIN, streamedAt: BASE + 2 * MIN + 800, completedAt: BASE + 2 * MIN + 8_000, input: 500, cacheRead: 40_000, output: 100, cost: 0.02, finish: "stop" },
+    { messageID: "m5", sessionID: "s3", providerID: "opencode", modelID: "model-a", createdAt: BASE + 70 * MIN, streamedAt: BASE + 70 * MIN + 900, completedAt: BASE + 70 * MIN + 15_000, input: 800, cacheRead: 60_000, cacheWrite: 200, output: 250, cost: 0.05, finish: "stop" },
   ]
   for (const step of steps) recordStep(db, step as never)
   recordPrompt(db, { sessionID: "s1", messageID: "p1", createdAt: BASE - 1_000 })
@@ -42,8 +42,23 @@ function seed(): Database {
     cacheRead: 61_000,
     output: 120,
     cost: 0.04,
-    router: "router-1",
     finish: "tool-calls",
+  })
+  // A second step in the subagent session: same provider and model as m4, so
+  // the cache-survival report has a comparable pair to read.
+  recordStep(db, {
+    messageID: "m7",
+    sessionID: "s2",
+    providerID: "opencode",
+    modelID: "model-a",
+    createdAt: BASE + 6 * MIN,
+    streamedAt: BASE + 6 * MIN + 400,
+    completedAt: BASE + 6 * MIN + 9_000,
+    input: 600,
+    cacheRead: 40_500,
+    output: 110,
+    cost: 0.003,
+    finish: "stop",
   })
   return db
 }
@@ -77,10 +92,10 @@ describe("buildPanel", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "overview" }))
     expect(lines[0]!.text).toContain("all time")
-    expect(lines[0]!.text).toContain("6 steps")
+    expect(lines[0]!.text).toContain("7 steps")
     expect(text(lines)).toContain("this session")
     expect(text(lines)).toContain("data coverage")
-    expect(text(lines)).toContain("endpoints")
+    expect(text(lines)).toContain("providers")
     expect(find(lines, "activity")).toBeDefined()
     db.close()
   })
@@ -94,8 +109,9 @@ describe("buildPanel", () => {
     // (14.9k fresh + 9.5k written) and a 275.4k prompt.
     expect(block).toContain("in         24.4k")
     expect(block).toContain("prompt     275.4k")
-    // The sibling that started later (s3) is only in the all-time block above.
-    expect(body.slice(0, body.indexOf("this session"))).toContain("in         25.9k")
+    // The subagent that started later (s2, two steps) is only in the all-time
+    // block above.
+    expect(body.slice(0, body.indexOf("this session"))).toContain("in         26.5k")
     expect(block).toContain("subagents")
     expect(block).toContain("their own sessions")
     db.close()
@@ -111,45 +127,43 @@ describe("buildPanel", () => {
   test("the session scope is ignored when there is no session to scope to", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "overview", range: "session", sessionID: "", sessionStart: undefined }))
-    expect(lines[0]!.text).toContain("6 steps")
+    expect(lines[0]!.text).toContain("7 steps")
     db.close()
   })
 
-  test("models: one row per model, with the cache and where it was served, and a cursor", () => {
+  test("models: one row per model, with the cache and the providers it ran through, and a cursor", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "models" }))
     const rows = lines.filter((line) => line.row?.kind === "model")
     expect(rows.map((line) => line.row!.value).sort()).toEqual(["model-a", "model-b"])
     const modelA = rows.find((line) => line.row!.value === "model-a")!
     expect(modelA.text).toContain("model-a")
-    expect(modelA.text).toContain("router-1, router-2")
+    expect(modelA.text).toContain("opencode, opencode-go")
     expect(text(lines)).not.toContain("via Fireworks")
-    expect(text(lines)).toContain("1 identity change")
+    expect(text(lines)).toContain("2 switches (2 provider)")
     db.close()
   })
 
-  test("endpoints: one row per endpoint, with the models it served", () => {
+  test("providers: one row per provider, with the models it served", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "endpoints" }))
-    expect(lines[0]!.text).toContain("endpoint")
+    const lines = buildPanel(request(db, { view: "providers" }))
+    expect(lines[0]!.text).toContain("provider")
     expect(lines[0]!.text).toContain("models")
-    expect(text(lines)).toContain("router-1")
-    expect(text(lines)).toContain("router-3")
-    // The reported operator and the configured provider are not surfaced.
-    expect(text(lines)).not.toContain("AWS Bedrock")
-    expect(text(lines)).not.toContain("anthropic")
-    expect(lines.filter((line) => line.row?.kind === "endpoint").length).toBeGreaterThan(0)
+    expect(text(lines)).toContain("opencode-go")
+    expect(text(lines)).toContain("anthropic")
+    expect(lines.filter((line) => line.row?.kind === "provider").length).toBeGreaterThan(0)
     db.close()
   })
 
-  test("affinity: counts the changes per model and names the transitions", () => {
+  test("models: the detail line names the switches and what a switch cost", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "affinity" }))
-    expect(lines[0]!.tone).toBe("warning")
-    expect(lines[0]!.text).toContain("identity change")
-    expect(text(lines)).toContain("endpoint")
-    expect(text(lines)).toContain("top transitions")
-    expect(text(lines)).toContain("router-1 → router-2")
+    const lines = buildPanel(request(db, { view: "models" }))
+    const body = text(lines)
+    // model-a switched twice against the step before it — m1 opencode → m2
+    // opencode-go lost the cache, m3 → m6 changed the model — and one switch of
+    // the pair was a provider one.
+    expect(body).toContain("2 switches (2 provider)")
+    expect(body).toContain("10k lost on a switch")
     db.close()
   })
 
@@ -228,49 +242,50 @@ describe("filters and detail", () => {
     db.close()
   })
 
-  test("an endpoint filter narrows every view", () => {
+  test("a provider filter narrows every view", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "models", filters: { router: "router-1" } }))
-    // Only model-a was served through router-1: model-b came through router-3.
+    const lines = buildPanel(request(db, { view: "models", filters: { provider: "opencode-go" } }))
+    // Only model-a ran through opencode-go: model-b came through anthropic.
     const rows = lines.filter((line) => line.row?.kind === "model")
     expect(rows.map((line) => line.row!.value)).toEqual(["model-a"])
     db.close()
   })
 
-  test("an endpoint filter narrows the endpoint rows", () => {
+  test("a provider filter narrows the provider rows", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "endpoints", filters: { router: "router-3" } }))
-    expect(text(lines)).toContain("router-3")
-    expect(text(lines)).not.toContain("router-1")
+    const lines = buildPanel(request(db, { view: "providers", filters: { provider: "anthropic" } }))
+    expect(text(lines)).toContain("anthropic")
+    expect(text(lines)).not.toContain("opencode-go")
     db.close()
   })
 
-  test("drilling into a model shows its providers and its affinity", () => {
+  test("drilling into a model shows its providers and its latency per provider", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "models", detail: { kind: "model", value: "model-a" } }))
     expect(lines[0]!.text).toBe("model model-a")
     expect(text(lines)).toContain("hit")
-    expect(text(lines)).toContain("router-1")
+    expect(text(lines)).toContain("opencode-go")
+    expect(text(lines)).toContain("by group")
     expect(text(lines)).toContain("backspace")
     db.close()
   })
 
-  test("drilling into an endpoint shows its models and its latency", () => {
+  test("drilling into a provider shows its models and its latency", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "endpoints", detail: { kind: "endpoint", value: "router-1" } }))
-    expect(lines[0]!.text).toBe("endpoint router-1")
+    const lines = buildPanel(request(db, { view: "providers", detail: { kind: "provider", value: "opencode" } }))
+    expect(lines[0]!.text).toBe("provider opencode")
     expect(text(lines)).toContain("model-a")
     expect(text(lines)).toContain("by group")
     db.close()
   })
 
-  test("drilling into a period lists the models that were active", () => {
+  test("drilling into a period lists the providers that were active", () => {
     const db = seed()
     const days = buildPanel(request(db, { view: "periods" }))
     const key = days.find((line) => line.row?.kind === "period")!.row!.value
     const lines = buildPanel(request(db, { view: "periods", detail: { kind: "period", value: key } }))
     expect(lines[0]!.text).toBe(`period ${key}`)
-    expect(text(lines)).toContain("router-1")
+    expect(text(lines)).toContain("opencode")
     expect(text(lines)).toContain("models")
     db.close()
   })
@@ -313,7 +328,7 @@ describe("the db view", () => {
 
 describe("view plumbing", () => {
   test("keeps the documented view order", () => {
-    expect([...PANEL_VIEWS]).toEqual(["overview", "models", "endpoints", "affinity", "cache", "periods", "latency", "sessions", "turns", "db"])
+    expect([...PANEL_VIEWS]).toEqual(["overview", "models", "providers", "cache", "periods", "latency", "sessions", "turns", "db"])
   })
 
   test("cycles the sort keys of a view", () => {
@@ -328,7 +343,7 @@ describe("view plumbing", () => {
   test("labels a drill-down target", () => {
     expect(detailLabel({ kind: "model", value: "m", variant: "max" })).toBe("model m max")
     expect(detailLabel({ kind: "session", value: "s" })).toBe("session s")
-    expect(detailLabel({ kind: "endpoint", value: "orcarouter" })).toBe("endpoint orcarouter")
+    expect(detailLabel({ kind: "provider", value: "opencode-go" })).toBe("provider opencode-go")
   })
 
   test("never throws: an unreadable database becomes a line", () => {
@@ -399,7 +414,7 @@ describe("what a view pays for", () => {
   test("nothing asks SQLite for a window function", () => {
     const db = seed()
     const { handle, sql } = watched(db)
-    for (const view of ["overview", "models", "endpoints", "affinity", "cache", "periods", "latency"] as PanelView[]) {
+    for (const view of ["overview", "models", "providers", "cache", "periods", "latency"] as PanelView[]) {
       buildPanel(request(handle, { view }))
     }
     // Percentiles and pair comparisons are folded in JS over narrow rows: a

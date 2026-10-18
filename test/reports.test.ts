@@ -3,14 +3,14 @@ import { describe, expect, test } from "bun:test"
 import { cacheDrop, stepGap, type AssistantMessage } from "../src/core"
 import { openStatsDb, recordEvent, recordStep, upsertSession, type StepRecord } from "../src/stats/db"
 import {
-  affinityOf,
+  switchesOf,
   stepRows,
   cacheDropsOf,
   cachePairs,
   cacheStatsOf,
   coverageOf,
-  endpointBreakdownOf,
-  endpointSummaryOf,
+  providerBreakdownOf,
+  providerSummaryOf,
   GAP_BUCKETS,
   gapReportOf,
   isoWeek,
@@ -37,12 +37,12 @@ const MIN = 60_000
 const BASE = 1_800_000_000_000
 
 const STEPS: StepRecord[] = [
-  { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: BASE, streamedAt: BASE + 300, completedAt: BASE + 1_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 200, cost: 0.01, finish: "stop", router: "r1" },
-  { messageID: "a2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: BASE + 3 * MIN, streamedAt: BASE + 3 * MIN + 200, completedAt: BASE + 3 * MIN + 1_000, input: 1_200, cacheRead: 90_000, output: 300, cost: 0.02, finish: "stop", router: "r2" },
-  { messageID: "a3", sessionID: "s1", providerID: "opencode", modelID: "m2", createdAt: BASE + 4 * MIN, streamedAt: BASE + 4 * MIN + 400, completedAt: BASE + 4 * MIN + 2_000, input: 800, cacheRead: 0, output: 100, cost: 0.03, finish: "stop", router: "r2" },
-  { messageID: "a4", sessionID: "s1", providerID: "anthropic", modelID: "m2", createdAt: BASE + 60 * MIN, streamedAt: BASE + 60 * MIN + 1_000, completedAt: BASE + 60 * MIN + 2_000, input: 2_000, cacheRead: 0, output: 400, cost: 0.04, finish: "stop", router: "r3" },
-  { messageID: "b1", sessionID: "s2", providerID: "opencode", modelID: "m1", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 300, completedAt: BASE + 5 * MIN + 1_000, input: 400, cacheRead: 50_000, output: 100, cost: 0.005, finish: "stop", router: "r1" },
-  { messageID: "b2", sessionID: "s2", providerID: "opencode", modelID: "m1", createdAt: BASE + 15 * MIN, streamedAt: BASE + 15 * MIN + 200, completedAt: BASE + 15 * MIN + 1_000, input: 500, cacheRead: 49_800, output: 120, cost: 0.006, finish: "stop", router: "r1" },
+  { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: BASE, streamedAt: BASE + 300, completedAt: BASE + 1_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 200, cost: 0.01, finish: "stop" },
+  { messageID: "a2", sessionID: "s1", providerID: "opencode-go", modelID: "m1", createdAt: BASE + 3 * MIN, streamedAt: BASE + 3 * MIN + 200, completedAt: BASE + 3 * MIN + 1_000, input: 1_200, cacheRead: 90_000, output: 300, cost: 0.02, finish: "stop" },
+  { messageID: "a3", sessionID: "s1", providerID: "opencode-go", modelID: "m2", createdAt: BASE + 4 * MIN, streamedAt: BASE + 4 * MIN + 400, completedAt: BASE + 4 * MIN + 2_000, input: 800, cacheRead: 0, output: 100, cost: 0.03, finish: "stop" },
+  { messageID: "a4", sessionID: "s1", providerID: "anthropic", modelID: "m2", createdAt: BASE + 60 * MIN, streamedAt: BASE + 60 * MIN + 1_000, completedAt: BASE + 60 * MIN + 2_000, input: 2_000, cacheRead: 0, output: 400, cost: 0.04, finish: "stop" },
+  { messageID: "b1", sessionID: "s2", providerID: "opencode", modelID: "m1", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 300, completedAt: BASE + 5 * MIN + 1_000, input: 400, cacheRead: 50_000, output: 100, cost: 0.005, finish: "stop" },
+  { messageID: "b2", sessionID: "s2", providerID: "opencode", modelID: "m1", createdAt: BASE + 15 * MIN, streamedAt: BASE + 15 * MIN + 200, completedAt: BASE + 15 * MIN + 1_000, input: 500, cacheRead: 49_800, output: 120, cost: 0.006, finish: "stop" },
 ]
 
 function seed(): Database {
@@ -70,19 +70,31 @@ function message(step: StepRecord): AssistantMessage {
 }
 
 /** The consecutive pairs of each session, in order: what every pair report sees. */
-function pairs(steps: readonly StepRecord[] = STEPS): Array<{ previous: StepRecord; current: StepRecord; gap: number | undefined; lost: number | undefined }> {
+function pairs(
+  steps: readonly StepRecord[] = STEPS,
+): Array<{ previous: StepRecord; current: StepRecord; gap: number | undefined; lost: number | undefined; lostProvider: number | undefined }> {
   const bySession = new Map<string, StepRecord[]>()
   for (const step of steps) {
     const list = bySession.get(step.sessionID)
     if (list === undefined) bySession.set(step.sessionID, [step])
     else list.push(step)
   }
-  const out: Array<{ previous: StepRecord; current: StepRecord; gap: number | undefined; lost: number | undefined }> = []
+  const out: Array<{ previous: StepRecord; current: StepRecord; gap: number | undefined; lost: number | undefined; lostProvider: number | undefined }> = []
   for (const list of bySession.values()) {
     for (let index = 1; index < list.length; index += 1) {
       const previous = list[index - 1]!
       const current = list[index]!
-      out.push({ previous, current, gap: stepGap(message(previous), message(current)), lost: cacheDrop(message(previous), message(current)) })
+      out.push({
+        previous,
+        current,
+        gap: stepGap(message(previous), message(current)),
+        // The model scope: what the switch and loss reports measure, because
+        // a provider switch forfeits the cache the previous provider held.
+        lost: cacheDrop(message(previous), message(current), "model"),
+        // The provider scope: two providers are two caches, which is what a
+        // cache-survival sample requires.
+        lostProvider: cacheDrop(message(previous), message(current)),
+      })
     }
   }
   return out
@@ -94,9 +106,8 @@ describe("coverage", () => {
     expect(coverageOf(db)).toEqual({
       steps: 6,
       models: 2,
-      endpoints: 3,
+      providers: 3,
       missingModel: 0,
-      missingEndpoint: 0,
       unsettled: 0,
       missingTps: 0,
       firstAt: BASE,
@@ -105,10 +116,10 @@ describe("coverage", () => {
     db.close()
   })
 
-  test("counts a missing model, endpoint, completion and throughput", () => {
+  test("counts a missing model, provider, completion and throughput", () => {
     const db = seed()
     recordStep(db, { messageID: "n1", sessionID: "s2", createdAt: BASE + 70 * MIN, input: 10, output: 0, recordedAt: BASE + 70 * MIN })
-    expect(coverageOf(db)).toMatchObject({ steps: 7, missingModel: 1, missingEndpoint: 1, unsettled: 1, missingTps: 1 })
+    expect(coverageOf(db)).toMatchObject({ steps: 7, providers: 3, missingModel: 1, unsettled: 1, missingTps: 1 })
     db.close()
   })
 
@@ -144,31 +155,32 @@ describe("cache stats", () => {
   })
 })
 
-describe("affinity", () => {
+describe("switches", () => {
   test("counts each dimension, as the pair rules see it", () => {
     const db = seed()
-    const report = affinityOf(cachePairs(db))
-    const same = (left: AssistantMessage, right: AssistantMessage) =>
-      left.model?.providerID === right.model?.providerID && left.model?.id === right.model?.id && (left.model?.variant ?? "") === (right.model?.variant ?? "")
+    const report = switchesOf(cachePairs(db))
     const expected = pairs().filter((pair) => pair.previous.modelID !== undefined && pair.current.modelID !== undefined)
     const changes = expected.filter((pair) => {
       const modelChanged = modelKey(pair.previous.modelID!, pair.previous.variant) !== modelKey(pair.current.modelID!, pair.current.variant)
-      const endpointChanged = pair.previous.router !== undefined && pair.current.router !== undefined && pair.previous.router !== pair.current.router
-      return modelChanged || endpointChanged
+      const providerChanged = pair.previous.providerID !== undefined && pair.current.providerID !== undefined && pair.previous.providerID !== pair.current.providerID
+      return modelChanged || providerChanged
     })
     expect(report.totals.pairs).toBe(expected.length)
     expect(report.totals.changes).toBe(changes.length)
-    const lost = changes.filter((pair) => same(message(pair.previous), message(pair.current)) && (pair.lost ?? 0) > 0)
+    // The cost rule: the model is the same, so the two steps share a cache to
+    // lose, whichever provider served them.
+    const lost = changes.filter(
+      (pair) => modelKey(pair.previous.modelID!, pair.previous.variant) === modelKey(pair.current.modelID!, pair.current.variant) && (pair.lost ?? 0) > 0,
+    )
     expect(report.totals.cacheLost).toBe(lost.reduce((sum, pair) => sum + (pair.lost ?? 0), 0))
     expect(report.totals.cacheLostEvents).toBe(lost.length)
-    // The m1 family changed endpoint once (a1 → a2) and kept the cache once.
+    // The m1 family switched provider once (a1 → a2), losing the cache it held.
     const m1 = report.rows.find((row) => row.modelID === "m1")!
-    expect(m1).toMatchObject({ steps: 2, pairs: 2, changes: 1, modelChanges: 0, endpointChanges: 1, cacheLost: 10_000, cacheLostEvents: 1 })
+    expect(m1).toMatchObject({ steps: 2, pairs: 2, changes: 1, modelChanges: 0, providerChanges: 1, cacheLost: 10_000, cacheLostEvents: 1 })
     const m2 = report.rows.find((row) => row.modelID === "m2")!
-    expect(m2).toMatchObject({ steps: 2, pairs: 2, changes: 2, modelChanges: 1, endpointChanges: 1, cacheLost: 0 })
-    expect(report.transitions).toContainEqual({ dimension: "endpoint", from: "r1", to: "r2", count: 1 })
-    expect(report.transitions).toContainEqual({ dimension: "model", from: "m1", to: "m2", count: 1 })
-    expect(report.transitions).toContainEqual({ dimension: "endpoint", from: "r2", to: "r3", count: 1 })
+    expect(m2).toMatchObject({ steps: 2, pairs: 2, changes: 2, modelChanges: 1, providerChanges: 1, cacheLost: 0 })
+    // No transition list: the rows are the whole report.
+    expect(Object.keys(report).sort()).toEqual(["rows", "totals"])
     db.close()
   })
 })
@@ -184,6 +196,7 @@ describe("cache survival", () => {
       (pair) =>
         pair.previous.modelID !== undefined &&
         pair.current.modelID !== undefined &&
+        pair.previous.providerID === pair.current.providerID &&
         modelKey(pair.previous.modelID, pair.previous.variant) === modelKey(pair.current.modelID, pair.current.variant) &&
         pair.gap !== undefined,
     )
@@ -194,30 +207,31 @@ describe("cache survival", () => {
       expect({ label, samples: bucket.samples, drops: bucket.drops }).toEqual({
         label,
         samples: inBucket.length,
-        drops: inBucket.filter((pair) => pair.lost !== undefined).length,
+        drops: inBucket.filter((pair) => pair.lostProvider !== undefined).length,
       })
     }
     db.close()
   })
 
-  test("summarises reuse per endpoint", () => {
+  test("summarises reuse per provider", () => {
     const db = seed()
     const comparable = pairs().filter(
       (pair) =>
         pair.previous.modelID !== undefined &&
         pair.current.modelID !== undefined &&
+        pair.previous.providerID === pair.current.providerID &&
         modelKey(pair.previous.modelID, pair.previous.variant) === modelKey(pair.current.modelID, pair.current.variant) &&
         pair.gap !== undefined,
     )
-    const rows = gapReportOf(cachePairs(db)).endpoints
+    const rows = gapReportOf(cachePairs(db)).providers
     for (const row of rows) {
-      const endpoint = row.endpoint
-      const inEndpoint = comparable.filter((pair) => (pair.current.router ?? pair.previous.router ?? "(unknown)") === endpoint)
-      expect({ endpoint, samples: row.samples, retained: row.retained, drops: row.drops }).toEqual({
-        endpoint,
-        samples: inEndpoint.length,
-        retained: inEndpoint.filter((pair) => pair.lost === undefined).length,
-        drops: inEndpoint.filter((pair) => pair.lost !== undefined).length,
+      const provider = row.provider
+      const inProvider = comparable.filter((pair) => (pair.current.providerID ?? pair.previous.providerID ?? "(unknown)") === provider)
+      expect({ provider, samples: row.samples, retained: row.retained, drops: row.drops }).toEqual({
+        provider,
+        samples: inProvider.length,
+        retained: inProvider.filter((pair) => pair.lostProvider === undefined).length,
+        drops: inProvider.filter((pair) => pair.lostProvider !== undefined).length,
       })
     }
     db.close()
@@ -240,7 +254,7 @@ describe("cache survival", () => {
       modelID: "m1",
       samples: comparable.length,
       maxHitGapMs: undefined,
-      minDropGapMs: Math.min(...comparable.filter((pair) => pair.lost !== undefined).map((pair) => pair.gap!)),
+      minDropGapMs: Math.min(...comparable.filter((pair) => pair.lostProvider !== undefined).map((pair) => pair.gap!)),
     })
     db.close()
   })
@@ -285,40 +299,40 @@ describe("cache survival", () => {
   })
 })
 
-describe("endpoints", () => {
-  test("splits a model by the endpoint that served it, with its share", () => {
+describe("providers", () => {
+  test("splits a model by the provider it ran through, with its share", () => {
     const db = seed()
-    const rows = endpointBreakdownOf(stepRows(db))
-    // m1 ran four times: a1, b1 and b2 on r1, a2 on r2.
-    expect(rows.map((row) => [row.modelID, row.endpoint, row.usage.steps, row.share])).toEqual([
-      ["m1", "r1", 3, 0.75],
-      ["m1", "r2", 1, 0.25],
-      ["m2", "r2", 1, 0.5],
-      ["m2", "r3", 1, 0.5],
+    const rows = providerBreakdownOf(stepRows(db))
+    // m1 ran four times: a1, b1 and b2 through opencode, a2 through opencode-go.
+    expect(rows.map((row) => [row.modelID, row.provider, row.usage.steps, row.share])).toEqual([
+      ["m1", "opencode", 3, 0.75],
+      ["m1", "opencode-go", 1, 0.25],
+      ["m2", "opencode-go", 1, 0.5],
+      ["m2", "anthropic", 1, 0.5],
     ])
-    // a1 + b1 + b2 read 199,800 from the cache on r1.
-    expect(rows.find((row) => row.modelID === "m1" && row.endpoint === "r1")!.cache.cached).toBe(199_800)
+    // a1 + b1 + b2 read 199,800 from the cache through opencode.
+    expect(rows.find((row) => row.modelID === "m1" && row.provider === "opencode")!.cache.cached).toBe(199_800)
     db.close()
   })
 
   test("names the model of each row the way the summary does", () => {
     const db = seed()
     recordStep(db, { messageID: "v1", sessionID: "s1", providerID: "opencode", modelID: "m1", variant: "max", createdAt: BASE + 80 * MIN, recordedAt: BASE + 80 * MIN })
-    const rows = endpointBreakdownOf(stepRows(db))
+    const rows = providerBreakdownOf(stepRows(db))
     // A row is one model, named as a label (`m1 max`) and never as its key.
     expect(rows.find((row) => row.variant === "max")!.models).toEqual(["m1 max"])
     expect(rows.every((row) => row.models.length === 1 && !row.models[0]!.includes("#"))).toBe(true)
     db.close()
   })
 
-  test("aggregates every model an endpoint served", () => {
+  test("aggregates every model a provider served", () => {
     const db = seed()
-    const rows = endpointSummaryOf(stepRows(db))
-    const r1 = rows.find((row) => row.endpoint === "r1")!
-    expect(r1.usage.steps).toBe(3)
-    expect(r1.share).toBe(0.5)
-    expect(r1.models).toEqual(["m1"])
-    expect(rows.find((row) => row.endpoint === "r3")!.share).toBeCloseTo(1 / 6, 12)
+    const rows = providerSummaryOf(stepRows(db))
+    const opencode = rows.find((row) => row.provider === "opencode")!
+    expect(opencode.usage.steps).toBe(3)
+    expect(opencode.share).toBe(0.5)
+    expect(opencode.models).toEqual(["m1"])
+    expect(rows.find((row) => row.provider === "anthropic")!.share).toBeCloseTo(1 / 6, 12)
     db.close()
   })
 })
@@ -355,15 +369,14 @@ describe("periods", () => {
 })
 
 describe("latency", () => {
-  test("groups percentiles by model, provider or endpoint", () => {
+  test("groups percentiles by model or provider", () => {
     const db = seed()
     const byModel = latencyGroupsOf(stepRows(db), "model")
     const m1 = byModel.find((row) => row.label === "m1")!
     expect(m1.count).toBe(4)
     expect(m1.wall.count).toBe(4)
     expect(m1.wall.p50).toBe(1_000)
-    expect(latencyGroupsOf(stepRows(db), "endpoint").map((row) => row.key).sort()).toEqual(["r1", "r2", "r3"])
-    expect(latencyGroupsOf(stepRows(db), "provider").map((row) => row.key).sort()).toEqual(["anthropic", "opencode"])
+    expect(latencyGroupsOf(stepRows(db), "provider").map((row) => row.key).sort()).toEqual(["anthropic", "opencode", "opencode-go"])
     const overall = latencyOf(stepRows(db))
     expect(overall.wall.count).toBe(6)
     expect(overall.wall.p50).toBe(1_000)
@@ -379,7 +392,7 @@ describe("filters", () => {
       { value: "m1", steps: 4 },
       { value: "m2", steps: 2 },
     ])
-    expect(filterOptions(db).endpoints.map((option) => option.value)).toEqual(["r1", "r2", "r3"])
+    expect(filterOptions(db).providers.map((option) => option.value)).toEqual(["opencode", "opencode-go", "anthropic"])
     db.close()
   })
 })

@@ -70,7 +70,6 @@ function model(overrides: Partial<ModelUsage> & { modelID: string }): ModelUsage
     providers: [
       {
         providerID: "opencode",
-        routers: [],
         steps: 4,
         input: 12_000,
         cached: 340_000,
@@ -307,7 +306,6 @@ describe("overviewLines", () => {
 describe("modelsLines", () => {
   const providerRow = (overrides: Partial<ModelUsage["providers"][number]> = {}): ModelUsage["providers"][number] => ({
     providerID: "opencode",
-    routers: [],
     steps: 4,
     input: 12_000,
     cached: 340_000,
@@ -320,12 +318,12 @@ describe("modelsLines", () => {
     ...overrides,
   })
 
-  test("lists each model once, with its cache and where it was served", () => {
+  test("lists each model once, with its cache and the providers it ran through", () => {
     const rows = [
       model({
-        modelID: "deepseek-v4.1-flash-free",
+        modelID: "deepseek-v4.1-flash",
         providers: [
-          providerRow({ routers: ["orcarouter-dsv4.1flash"] }),
+          providerRow({ providerID: "opencode-go" }),
           providerRow({ providerID: "deepseek", steps: 1, input: 10, cached: 0, cacheWrite: 0, output: 20, cost: 0.01 }),
         ],
       }),
@@ -335,28 +333,45 @@ describe("modelsLines", () => {
     expect(lines[0]!.text).toContain("prompt")
     expect(lines[0]!.text).toContain("cached")
     expect(lines[0]!.text).toContain("cost")
-    expect(lines[0]!.text).toContain("served by")
-    // The endpoint is the identity that served the request; the reported
-    // operator is not what this view leads with any more.
-    expect(text(lines)).toContain("orcarouter-dsv4.1flash")
-    expect(text(lines)).not.toContain("via fireworks")
+    expect(lines[0]!.text).toContain("providers")
+    // The same model through two providers is named as both, not as one.
+    expect(lines[1]!.text).toContain("opencode-go, deepseek")
     expect(text(lines)).toContain("$0.42")
   })
 
-  test("adds the p50 hit and the identity changes the facts provide", () => {
+  test("adds the p50 hit and the switches the facts provide", () => {
     const rows = [model({ modelID: "glm-5.3-flash" })]
     const lines = modelsLines(
       rows,
       120,
       {
         cache: new Map([["glm-5.3-flash#", { steps: 4, input: 12_000, cached: 340_000, cacheWrite: 5_000, prompt: 357_000, hit: 340_000 / 357_000, hitP50: 0.9 }]]),
-        changes: new Map([["glm-5.3-flash#", 2]]),
+        switches: new Map([
+          [
+            "glm-5.3-flash#",
+            { modelID: "glm-5.3-flash", variant: undefined, steps: 4, pairs: 3, changes: 3, modelChanges: 3, providerChanges: 1, cacheLost: 12_400, cacheLostEvents: 1 },
+          ],
+        ]),
       },
     )
     expect(text(lines)).toContain("95.2%")
     expect(text(lines)).toContain("p50 hit 90.0%")
-    expect(text(lines)).toContain("no routing endpoint observed")
-    expect(text(lines)).toContain("2 identity changes")
+    // The provider count is the part of the total that can cost a cache.
+    expect(text(lines)).toContain("3 switches (1 provider)")
+    expect(text(lines)).toContain("12.4k lost on a switch")
+  })
+
+  test("says nothing about switches when a model never switched", () => {
+    const rows = [model({ modelID: "glm-5.3-flash" })]
+    const lines = modelsLines(rows, 120, {
+      switches: new Map([
+        [
+          "glm-5.3-flash#",
+          { modelID: "glm-5.3-flash", variant: undefined, steps: 4, pairs: 3, changes: 0, modelChanges: 0, providerChanges: 0, cacheLost: 0, cacheLostEvents: 0 },
+        ],
+      ]),
+    })
+    expect(text(lines)).not.toContain("switch")
   })
 
   test("drops the cost column on narrow panels and notes hidden models", () => {
@@ -539,10 +554,11 @@ describe("sessionSummaryLines", () => {
 
 describe("panel chrome", () => {
   test("the view bar brackets the active view and numbers every view", () => {
-    const bar = viewBar("endpoints")
-    expect(bar.text).toContain("[3 endpoints]")
+    const bar = viewBar("providers")
+    expect(bar.text).toContain("[3 providers]")
     expect(bar.text).toContain("1 overview")
-    expect(bar.text).toContain("9 turns")
+    expect(bar.text).toContain("8 turns")
+    expect(bar.text).toContain("9 db")
     expect(bar.tone).toBe("muted")
   })
 
@@ -550,12 +566,13 @@ describe("panel chrome", () => {
     expect(keysFor("periods")).toContain("b bucket")
     expect(keysFor("turns")).toContain("a scope")
     expect(keysFor("models")).toContain("enter drill")
+    expect(keysFor("models")).toContain("m/p filter")
     expect(keysFor("models")).toContain("? help")
   })
 
   test("summarises the active filters, and nothing when they are empty", () => {
-    expect(filterSummary({ modelID: "m", routerID: "orcarouter-dsv4.1flash" })).toBe("model=m · endpoint=orcarouter-dsv4.1flash")
-    expect(filterSummary({ modelID: "", routerID: "" })).toBeUndefined()
+    expect(filterSummary({ modelID: "m", providerID: "opencode-go" })).toBe("model=m · provider=opencode-go")
+    expect(filterSummary({ modelID: "", providerID: "" })).toBeUndefined()
     expect(filterSummary({})).toBeUndefined()
   })
 
@@ -568,9 +585,9 @@ describe("panel chrome", () => {
     expect(body).toContain("hit p50   median")
     expect(body).toContain("prompt    everything the provider saw")
     expect(body).toContain("out       everything generated")
-    expect(body).toContain("endpoint  where the request was actually sent")
-    expect(body).toContain("The endpoint is the inference provider")
-    expect(body).toContain("the OpenCode provider is kept in the database as evidence")
+    expect(body).toContain("provider  the provider the model ran through")
+    expect(body).toContain("the provider is the identity every view shows")
+    expect(body).toContain("cost      money, not tokens")
     expect(body).toContain("escape close")
   })
 
@@ -612,8 +629,6 @@ describe("turnsLines", () => {
     providerID: "opencode-go",
     modelID: "deepseek-v4.1-flash",
     variant: "max",
-    router: "orcarouter-dsv4.1flash",
-    routerChanged: false,
     providerChanged: false,
     modelChanged: false,
     steps: 1,
@@ -629,15 +644,16 @@ describe("turnsLines", () => {
     const lines = turnsLines([turn()], 160)
     expect(lines[0]!.text).toBe("1 turn · newest first")
     expect(lines[1]!.text).toBe(
-      `${formatClock(1_500)} · Δ 1s · orcarouter-dsv4.1flash · in 1.62k (427.3k), cached 425.7k, out 1.06k`,
+      `${formatClock(1_500)} · Δ 1s · opencode-go/deepseek-v4.1-flash max · in 1.62k (427.3k), cached 425.7k, out 1.06k, cost $0.0100`,
     )
     expect(lines[1]!.text).not.toContain("sess")
     expect(lines[1]!.tone).toBe("base")
   })
 
-  test("counts the steps of a tool-call loop and flags a changed endpoint", () => {
-    const lines = turnsLines([turn({ steps: 3, routerChanged: true })], 160)
-    expect(lines[1]!.text).toContain("orcarouter-dsv4.1flash · changed · 3 steps ·")
+  test("counts the steps of a tool-call loop and flags a changed provider", () => {
+    const lines = turnsLines([turn({ steps: 3, providerChanged: true })], 160)
+    expect(lines[1]!.text).toContain("opencode-go/deepseek-v4.1-flash max · changed · 3 steps ·")
+    expect(lines[1]!.tone).toBe("warning")
   })
 
   test("highlights a turn that lost cache reuse", () => {
@@ -646,9 +662,10 @@ describe("turnsLines", () => {
     expect(lines[1]!.tone).toBe("warning")
   })
 
-  test("falls back to provider/model when no endpoint was recorded", () => {
-    const lines = turnsLines([turn({ router: undefined })], 160)
-    expect(lines[1]!.text).toContain("opencode-go/deepseek-v4.1-flash max")
+  test("marks a model change inside one provider in the muted tone", () => {
+    const lines = turnsLines([turn({ modelChanged: true })], 160)
+    expect(lines[1]!.text).toContain("model changed")
+    expect(lines[1]!.tone).toBe("base")
   })
 
   test("says so when there is no finished turn", () => {
@@ -656,37 +673,72 @@ describe("turnsLines", () => {
     expect(text(lines)).toContain("no finished turns for this range")
   })
 
-  test("sidebarLines gives each turn three compact lines", () => {
-    const lines = sidebarLines([turn({ steps: 2 }), turn({ endAt: 1_500, router: "orcarouter-glm-5.3" })], { budget: 34 })
-    expect(lines).toHaveLength(6)
-    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} orcarouter-dsv4.1flash`)
-    // The volumes, then what the turn cost in tokens per second and money.
-    expect(lines[1]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
-    expect(lines[2]!.text).toBe("  hit 99.6% · 50/s · $0.0100")
+  test("sidebarLines gives each turn a compact block", () => {
+    const lines = sidebarLines([turn({ steps: 2 }), turn({ steps: 2 })], { budget: 34 })
+    // Both ends of the block name the model: the newest turn is the state now,
+    // the oldest anchors the window.
+    expect(lines).toHaveLength(8)
+    expect(lines.map((line) => line.text)).toEqual([
+      `${formatClock(1_500).slice(0, 5)} opencode-go`,
+      "  deepseek-v4.1-flash max",
+      "  in 1.62k (427.3k) · out 1.06k",
+      "  hit 99.6% · 50/s · $0.0100",
+      `${formatClock(1_500).slice(0, 5)} opencode-go`,
+      "  deepseek-v4.1-flash max",
+      "  in 1.62k (427.3k) · out 1.06k",
+      "  hit 99.6% · 50/s · $0.0100",
+    ])
     for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(34)
     expect(sidebarLines([], {})).toEqual([{ text: "no finished turns yet", tone: "muted" }])
   })
 
-  test("sidebarLines drops the volumes that do not fit, never the rate", () => {
-    const lines = sidebarLines([turn({ steps: 2 })], { budget: 20 })
-    expect(lines[2]!.text).toBe("  hit 99.6% · 50/s")
+  test("sidebarLines names the model at both ends of the block", () => {
+    const lines = sidebarLines(
+      [turn({ steps: 2 }), turn({ modelID: "glm-5.3-flash", variant: undefined }), turn({ modelID: "glm-5.3-flash", variant: undefined })],
+      { budget: 34 },
+    )
+    // Three turns, none of them flagged as changed, so the model lines are the
+    // two edges alone — and each one is read against the turn below it.
+    const modelLines = lines.filter((line) => line.text.startsWith("  ") && !line.text.startsWith("  in") && !line.text.startsWith("  hit"))
+    expect(modelLines.map((line) => line.text)).toEqual(["  deepseek-v4.1-flash max", "  glm-5.3-flash"])
+    // The line belongs to the turn it was opened for: the volumes of that same
+    // turn follow it.
+    expect(lines[1]!.text).toBe("  deepseek-v4.1-flash max")
+    expect(lines[2]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
+    // The middle turn is neither an edge nor a change: three lines only.
+    expect(lines).toHaveLength(11)
+    expect(lines[4]!.text).toBe(`${formatClock(1_500).slice(0, 5)} opencode-go`)
+    expect(lines[5]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
+    expect(lines[8]!.text).toBe("  glm-5.3-flash")
   })
 
-  test("sidebarLines falls back to provider/model when no endpoint was observed", () => {
-    const lines = sidebarLines([turn({ router: undefined })], { budget: 40 })
-    // A gateway is not an endpoint: without one, the turn names the model it ran.
-    expect(lines[0]!.text).toContain("opencode-go/deepseek-v4.1-flash")
+  test("sidebarLines names the model once for a block of one turn", () => {
+    const lines = sidebarLines([turn({ steps: 2 })], { budget: 34 })
+    expect(lines).toHaveLength(4)
+    expect(lines[1]!.text).toBe("  deepseek-v4.1-flash max")
+  })
+
+  test("sidebarLines drops the volumes that do not fit, never the rate", () => {
+    const lines = sidebarLines([turn({ steps: 2 })], { budget: 20 })
+    expect(lines[3]!.text).toBe("  hit 99.6% · 50/s")
+  })
+
+  test("sidebarLines warns when the provider changed", () => {
+    const lines = sidebarLines([turn({ providerChanged: true, providerID: "deepseek", modelID: "deepseek-flash", variant: undefined })], { budget: 34 })
+    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} deepseek`)
+    expect(lines[0]!.tone).toBe("warning")
+    expect(lines[1]!.text).toBe("  deepseek-flash")
   })
 
   test("sidebarLines leaves the rate out when the step never streamed", () => {
     const lines = sidebarLines([turn({ steps: 1, tps: undefined })], { budget: 34 })
-    expect(lines[2]!.text).toBe("  hit 99.6% · $0.0100")
+    expect(lines[3]!.text).toBe("  hit 99.6% · $0.0100")
   })
 
   test("sidebarLines flags a lost cache on the facts line", () => {
     const lines = sidebarLines([turn({ steps: 2, drops: [{ messageID: "m", tokens: 1_000, gapMs: 60_000 }] })], { budget: 34 })
-    expect(lines[2]!.text).toContain("hit 99.6%")
-    expect(lines[2]!.text).toContain("⚠")
-    expect(lines[2]!.tone).toBe("warning")
+    expect(lines[3]!.text).toContain("hit 99.6%")
+    expect(lines[3]!.text).toContain("⚠")
+    expect(lines[3]!.tone).toBe("warning")
   })
 })

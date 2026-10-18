@@ -73,7 +73,6 @@ export type StepRow = {
   providerID: string | undefined
   modelID: string | undefined
   variant: string | undefined
-  router: string | undefined
   input: number
   cached: number
   cacheWrite: number
@@ -90,12 +89,12 @@ export type StepRow = {
 }
 
 const STEP_COLUMNS = `message_id AS messageID, session_id AS sessionID, provider_id AS providerID,
-       model_id AS modelID, variant, router,
+       model_id AS modelID, variant,
        COALESCE(input_tokens, 0) AS input, COALESCE(cache_read, 0) AS cached, COALESCE(cache_write, 0) AS cacheWrite,
        COALESCE(output_tokens, 0) AS output, COALESCE(reasoning_tokens, 0) AS reasoning, COALESCE(cost, 0) AS cost,
        created_at AS createdAt, streamed_at AS streamedAt, completed_at AS completedAt, ${STEP_AT} AS at`
 
-const STEP_OPTIONAL = ["providerID", "modelID", "variant", "router", "createdAt", "streamedAt", "completedAt"] as const
+const STEP_OPTIONAL = ["providerID", "modelID", "variant", "createdAt", "streamedAt", "completedAt"] as const
 
 /**
  * A step as the pair reports read it. Their projection leaves the generated
@@ -206,9 +205,9 @@ function usageOf(steps: readonly Counted[]): Usage {
 export type CoverageReport = {
   steps: number
   models: number
-  endpoints: number
+  /** Providers the steps ran through. A step whose provider is unknown is counted nowhere. */
+  providers: number
   missingModel: number
-  missingEndpoint: number
   unsettled: number
   missingTps: number
   firstAt: number | undefined
@@ -216,9 +215,9 @@ export type CoverageReport = {
 }
 
 /**
- * What the panel cannot answer honestly: how many steps lack a model or an
- * observed endpoint, and how many never settled. A zero in the affinity view
- * means "never changed" only when this coverage is complete.
+ * What the panel cannot answer honestly: how many steps lack a model, and how
+ * many never settled. A zero in the switch counts means "never switched" only
+ * when this coverage is complete.
  */
 export function coverageOf(db: Database, options?: Options): CoverageReport {
   const filter = buildWhere(options?.range, options?.filters)
@@ -226,9 +225,8 @@ export function coverageOf(db: Database, options?: Options): CoverageReport {
     .query(
       `SELECT COUNT(*) AS steps,
               COUNT(DISTINCT CASE WHEN model_id IS NOT NULL THEN model_id || '#' || COALESCE(variant, '') END) AS models,
-              COUNT(DISTINCT router) AS endpoints,
+              COUNT(DISTINCT provider_id) AS providers,
               COALESCE(SUM(CASE WHEN model_id IS NULL THEN 1 ELSE 0 END), 0) AS missingModel,
-              COALESCE(SUM(CASE WHEN router IS NULL THEN 1 ELSE 0 END), 0) AS missingEndpoint,
               COALESCE(SUM(CASE WHEN completed_at IS NOT NULL OR finish IS NOT NULL THEN 0 ELSE 1 END), 0) AS unsettled,
               COALESCE(SUM(CASE WHEN (output_tokens + reasoning_tokens) > 0 AND created_at IS NOT NULL AND streamed_at IS NOT NULL AND streamed_at > created_at THEN 0 ELSE 1 END), 0) AS missingTps,
               MIN(${STEP_AT}) AS firstAt,
@@ -238,9 +236,8 @@ export function coverageOf(db: Database, options?: Options): CoverageReport {
     .get(...filter.params) as {
     steps: number
     models: number
-    endpoints: number
+    providers: number
     missingModel: number
-    missingEndpoint: number
     unsettled: number
     missingTps: number
     firstAt: number | null
@@ -249,9 +246,8 @@ export function coverageOf(db: Database, options?: Options): CoverageReport {
   return {
     steps: row.steps,
     models: row.models,
-    endpoints: row.endpoints,
+    providers: row.providers,
     missingModel: row.missingModel,
-    missingEndpoint: row.missingEndpoint,
     unsettled: row.unsettled,
     missingTps: row.missingTps,
     firstAt: row.firstAt ?? undefined,
@@ -315,11 +311,11 @@ export type LatencyGroupRow = {
   tps: LatencyStats
 }
 
-export type Dimension = "model" | "provider" | "endpoint"
+export type Dimension = "model" | "provider"
 
 /** Wall, streaming window and throughput percentiles per group. */
 export function latencyGroupsOf(rows: readonly StepRow[], by: Dimension): LatencyGroupRow[] {
-  const key = (step: StepRow) => (by === "model" ? modelKey(step.modelID ?? "(unknown)", step.variant) : by === "provider" ? step.providerID ?? "(unknown)" : step.router ?? "(unknown)")
+  const key = (step: StepRow) => (by === "model" ? modelKey(step.modelID ?? "(unknown)", step.variant) : step.providerID ?? "(unknown)")
   const groups: LatencyGroupRow[] = []
   for (const [group, steps] of groupBy(rows, key)) {
     const wall: number[] = []
@@ -407,50 +403,43 @@ export function cacheStatsByModel(rows: readonly PairRow[]): CacheModelRow[] {
 }
 
 // ---------------------------------------------------------------------------
-// Pairs: affinity, cache survival, TTL, losses
+// Pairs: switches, cache survival, TTL, losses
 // ---------------------------------------------------------------------------
 
-export type AffinityRow = {
+export type SwitchRow = {
   modelID: string
   variant: string | undefined
   steps: number
   pairs: number
+  /** Steps whose model, variant or provider differed from the step before. */
   changes: number
+  /** Of those, the ones whose model (or variant) differed. */
   modelChanges: number
-  endpointChanges: number
+  /** Of those, the ones whose provider differed. */
+  providerChanges: number
+  /** Cache the changes cost: only a provider switch can forfeit a reusable cache. */
   cacheLost: number
   cacheLostEvents: number
 }
 
-export type AffinityTransition = {
-  dimension: "model" | "endpoint"
-  from: string
-  to: string
-  count: number
-}
-
-export type AffinityReport = {
-  rows: AffinityRow[]
-  transitions: AffinityTransition[]
+export type SwitchReport = {
+  rows: SwitchRow[]
   totals: { pairs: number; changes: number; cacheLost: number; cacheLostEvents: number }
 }
 
-function noteTransition(map: Map<string, AffinityTransition>, dimension: "model" | "endpoint", from: string, to: string): void {
-  const key = `${dimension}\u0000${from}\u0000${to}`
-  const entry = map.get(key)
-  if (entry !== undefined) entry.count += 1
-  else map.set(key, { dimension, from, to, count: 1 })
-}
-
 /**
- * Identity changes between consecutive steps of a session, by the two
- * dimensions that decide where the work ran: the model and the routing
- * endpoint. A change is not by itself a fault — a gateway may re-route
- * deliberately — so the report pairs the count with the cache it actually cost.
+ * Switches between consecutive steps of a session, by the two dimensions that
+ * decide which cache holds the work: the model (with its variant) and the
+ * provider.
+ *
+ * A switch is not by itself a fault — it is usually the user choosing another
+ * model — so the report only names a cost where one is measurable: a provider
+ * switch that leaves the model intact forfeits the cache the previous provider
+ * held. A model switch has no measurable cost by definition, because two models
+ * never share a cache to lose.
  */
-export function affinityOf(rows: readonly PairRow[]): AffinityReport {
-  const perModel = new Map<string, AffinityRow>()
-  const transitions = new Map<string, AffinityTransition>()
+export function switchesOf(rows: readonly PairRow[]): SwitchReport {
+  const perModel = new Map<string, SwitchRow>()
   const totals = { pairs: 0, changes: 0, cacheLost: 0, cacheLostEvents: 0 }
 
   for (const { previous, current } of pairsOf(rows)) {
@@ -463,7 +452,7 @@ export function affinityOf(rows: readonly PairRow[]): AffinityReport {
       pairs: 0,
       changes: 0,
       modelChanges: 0,
-      endpointChanges: 0,
+      providerChanges: 0,
       cacheLost: 0,
       cacheLostEvents: 0,
     }
@@ -472,19 +461,15 @@ export function affinityOf(rows: readonly PairRow[]): AffinityReport {
     totals.pairs += 1
 
     const modelChanged = key !== modelKey(previous.modelID, previous.variant)
-    const endpointChanged = previous.router !== undefined && current.router !== undefined && previous.router !== current.router
-    if (modelChanged) {
-      row.modelChanges += 1
-      noteTransition(transitions, "model", modelLabel(previous.modelID, previous.variant), modelLabel(current.modelID, current.variant))
-    }
-    if (endpointChanged) {
-      row.endpointChanges += 1
-      noteTransition(transitions, "endpoint", previous.router!, current.router!)
-    }
-    if (modelChanged || endpointChanged) {
+    const providerChanged = previous.providerID !== undefined && current.providerID !== undefined && previous.providerID !== current.providerID
+    if (modelChanged) row.modelChanges += 1
+    if (providerChanged) row.providerChanges += 1
+    if (modelChanged || providerChanged) {
       row.changes += 1
       totals.changes += 1
-      const lost = cacheDrop(message(previous), message(current))
+      // The scope is the model alone: a provider switch forfeits the cache the
+      // previous provider held, and that is the cost this report names.
+      const lost = cacheDrop(message(previous), message(current), "model")
       if (lost !== undefined) {
         row.cacheLost += lost
         row.cacheLostEvents += 1
@@ -497,7 +482,6 @@ export function affinityOf(rows: readonly PairRow[]): AffinityReport {
 
   return {
     rows: [...perModel.values()].sort((left, right) => right.changes - left.changes || right.steps - left.steps || left.modelID.localeCompare(right.modelID)),
-    transitions: [...transitions.values()].sort((left, right) => right.count - left.count || left.dimension.localeCompare(right.dimension)),
     totals,
   }
 }
@@ -512,9 +496,9 @@ export type GapBucket = {
   retainedRatio: number | undefined
 }
 
-export type EndpointReuseRow = {
-  /** The routing endpoint, or `(unknown)` when it was never observed. */
-  endpoint: string
+export type ProviderReuseRow = {
+  /** The provider, or `(unknown)` when a step ran without one. */
+  provider: string
   samples: number
   retained: number
   drops: number
@@ -524,7 +508,7 @@ export type EndpointReuseRow = {
 
 export type GapReport = {
   buckets: GapBucket[]
-  endpoints: EndpointReuseRow[]
+  providers: ProviderReuseRow[]
   samples: number
 }
 
@@ -545,17 +529,20 @@ function bucketFor(gapMs: number): number {
 
 /**
  * How long an idle gap the prompt cache survives, per gap bucket and per
- * endpoint. Only pairs of the same model are comparable, which is exactly the
+ * provider. Only pairs of the same model are comparable, which is exactly the
  * set the cache rule already uses.
  */
 export function gapReportOf(rows: readonly PairRow[]): GapReport {
   const buckets: GapBucket[] = GAP_BUCKETS.map(([label]) => ({ label, samples: 0, retained: 0, drops: 0, lostTokens: 0, retainedRatio: undefined }))
-  const endpoints = new Map<string, EndpointReuseRow>()
+  const providers = new Map<string, ProviderReuseRow>()
   let samples = 0
 
   for (const { previous, current } of pairsOf(rows)) {
     if (previous.modelID === undefined || current.modelID === undefined) continue
     if (modelKey(previous.modelID, previous.variant) !== modelKey(current.modelID, current.variant)) continue
+    // A pair that switched provider is not a survival sample: the switch
+    // tally owns that case, and a switch is not an idle gap.
+    if ((previous.providerID ?? "") !== (current.providerID ?? "")) continue
     const gap = stepGap(message(previous), message(current))
     if (gap === undefined) continue
     const lost = cacheDrop(message(previous), message(current))
@@ -568,22 +555,22 @@ export function gapReportOf(rows: readonly PairRow[]): GapReport {
       bucket.lostTokens += lost
     }
 
-    const endpoint = current.router ?? previous.router ?? "(unknown)"
-    const row = endpoints.get(endpoint) ?? { endpoint, samples: 0, retained: 0, drops: 0, lostTokens: 0, retainedRatio: undefined }
+    const provider = current.providerID ?? previous.providerID ?? "(unknown)"
+    const row = providers.get(provider) ?? { provider, samples: 0, retained: 0, drops: 0, lostTokens: 0, retainedRatio: undefined }
     row.samples += 1
     if (lost === undefined) row.retained += 1
     else {
       row.drops += 1
       row.lostTokens += lost
     }
-    endpoints.set(endpoint, row)
+    providers.set(provider, row)
   }
 
   for (const bucket of buckets) bucket.retainedRatio = bucket.samples > 0 ? bucket.retained / bucket.samples : undefined
-  for (const row of endpoints.values()) row.retainedRatio = row.samples > 0 ? row.retained / row.samples : undefined
+  for (const row of providers.values()) row.retainedRatio = row.samples > 0 ? row.retained / row.samples : undefined
   return {
     buckets,
-    endpoints: [...endpoints.values()].sort((left, right) => right.samples - left.samples || left.endpoint.localeCompare(right.endpoint)),
+    providers: [...providers.values()].sort((left, right) => right.samples - left.samples || left.provider.localeCompare(right.provider)),
     samples,
   }
 }
@@ -660,7 +647,9 @@ export function cacheDropsOf(db: Database, rows: readonly PairRow[], options?: {
   const ttlHint = options?.ttlHintMs ?? DEFAULT_TTL_HINT_MS
   const losses: Array<{ previous: PairRow; current: PairRow; tokens: number; gapMs: number | undefined }> = []
   for (const { previous, current } of pairsOf(rows)) {
-    const tokens = cacheDrop(message(previous), message(current))
+    // The model scope: a provider switch forfeits the cache the previous
+    // provider held, which is a loss like any other.
+    const tokens = cacheDrop(message(previous), message(current), "model")
     if (tokens === undefined) continue
     losses.push({ previous, current, tokens, gapMs: stepGap(message(previous), message(current)) })
   }
@@ -703,13 +692,13 @@ export function cacheDropsOf(db: Database, rows: readonly PairRow[], options?: {
 }
 
 // ---------------------------------------------------------------------------
-// Endpoints
+// Providers
 // ---------------------------------------------------------------------------
 
-export type EndpointSummary = {
-  /** The routing endpoint, or undefined for requests whose destination was never observed. */
-  endpoint: string | undefined
-  /** Models this endpoint served. */
+export type ProviderSummary = {
+  /** The provider, or undefined for steps recorded without one. */
+  provider: string | undefined
+  /** Models this provider served. */
   models: string[]
   share: number
   usage: Usage
@@ -720,13 +709,13 @@ export type EndpointSummary = {
   lastAt: number | undefined
 }
 
-export type EndpointRow = EndpointSummary & {
+export type ProviderRow = ProviderSummary & {
   modelID: string
   variant: string | undefined
 }
 
 /** The numbers of one group of steps. */
-function endpointValues(steps: readonly StepRow[]): { cache: CacheStats; tps: number | undefined; wall: number | undefined } {
+function groupValues(steps: readonly StepRow[]): { cache: CacheStats; tps: number | undefined; wall: number | undefined } {
   const wall: number[] = []
   const tps: number[] = []
   for (const step of steps) {
@@ -737,11 +726,11 @@ function endpointValues(steps: readonly StepRow[]): { cache: CacheStats; tps: nu
   return { cache: cacheStatsOfSteps(steps), tps: latencyStats(tps).p50, wall: latencyStats(wall).p50 }
 }
 
-function endpointOf(steps: readonly StepRow[], models: string): Omit<EndpointSummary, "endpoint"> & { endpoint: string | undefined } {
-  const values = endpointValues(steps)
+function providerOf(steps: readonly StepRow[], models: string): Omit<ProviderSummary, "provider"> & { provider: string | undefined } {
+  const values = groupValues(steps)
   const times = steps.map((step) => step.at)
   return {
-    endpoint: steps[0]!.router,
+    provider: steps[0]!.providerID,
     models: models.split("\u0000"),
     share: 0,
     usage: usageOf(steps),
@@ -756,26 +745,26 @@ function endpointOf(steps: readonly StepRow[], models: string): Omit<EndpointSum
 const modelNames = (steps: readonly StepRow[]): string =>
   [...new Set(steps.map((step) => modelKey(step.modelID ?? "(unknown)", step.variant)))].map((key) => modelLabel(key.slice(0, key.indexOf("#")), key.slice(key.indexOf("#") + 1) || undefined)).join("\u0000")
 
-/** One row per endpoint, over every model it served. */
-export function endpointSummaryOf(rows: readonly StepRow[]): EndpointSummary[] {
-  const out: EndpointSummary[] = []
-  for (const steps of groupBy(rows, (step) => step.router ?? "").values()) {
-    const summary = endpointOf(steps, modelNames(steps))
+/** One row per provider, over every model it served. */
+export function providerSummaryOf(rows: readonly StepRow[]): ProviderSummary[] {
+  const out: ProviderSummary[] = []
+  for (const steps of groupBy(rows, (step) => step.providerID ?? "").values()) {
+    const summary = providerOf(steps, modelNames(steps))
     out.push({ ...summary, share: rows.length === 0 ? 0 : steps.length / rows.length })
   }
-  return out.sort((left, right) => right.usage.steps - left.usage.steps || (left.endpoint ?? "").localeCompare(right.endpoint ?? ""))
+  return out.sort((left, right) => right.usage.steps - left.usage.steps || (left.provider ?? "").localeCompare(right.provider ?? ""))
 }
 
-/** One row per model × endpoint: where each model was served, and how much. */
-export function endpointBreakdownOf(rows: readonly StepRow[]): EndpointRow[] {
-  const out: EndpointRow[] = []
+/** One row per model × provider: through which provider each model ran, and how much. */
+export function providerBreakdownOf(rows: readonly StepRow[]): ProviderRow[] {
+  const out: ProviderRow[] = []
   for (const [model, modelRows] of groupBy(rows, (step) => modelKey(step.modelID ?? "(unknown)", step.variant))) {
-    for (const steps of groupBy(modelRows, (step) => step.router ?? "").values()) {
+    for (const steps of groupBy(modelRows, (step) => step.providerID ?? "").values()) {
       const [modelID, variant] = [model.slice(0, model.indexOf("#")), model.slice(model.indexOf("#") + 1)]
       out.push({
         // One row per model, so its `models` field names that one model — in the
-        // same label form the endpoint summary uses.
-        ...endpointOf(steps, modelNames(steps)),
+        // same label form the provider summary uses.
+        ...providerOf(steps, modelNames(steps)),
         modelID,
         variant: variant === "" ? undefined : variant,
         share: steps.length / modelRows.length,

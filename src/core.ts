@@ -75,15 +75,6 @@ export type TurnStats = {
   providerID: string | undefined
   modelID: string | undefined
   variant: string | undefined
-  /** Gateway routing endpoint that served the turn, when a source identifies it. */
-  router: string | undefined
-  /**
-   * The displayed identity differs from the previous turn's. The TUI fills it
-   * in (the transcript carries no routing information); the line warns with the
-   * same `changed` marker it uses for a provider switch.
-   */
-  identityChanged: boolean
-  affinityKey: string | undefined
   /** Provider ID differs from the previous turn in the same transcript. */
   providerChanged: boolean
   /** Provider is the same but the model or variant differs. */
@@ -102,13 +93,6 @@ export type TurnStats = {
   cacheExpired: boolean
   /** Assistant steps in the turn. */
   steps: number
-  /**
-   * Message ids of the settled steps of the turn, oldest first. The TUI looks
-   * up the endpoint the recorder stored for these steps, so the line reports
-   * who served *this* turn: a lookup by provider and model alone would tag a
-   * turn with the endpoint of an older one.
-   */
-  stepIDs: string[]
 }
 
 export type TurnSegment = {
@@ -199,7 +183,12 @@ export function totalize(steps: readonly AssistantMessage[]): Totals {
   return totals
 }
 
-export function affinityKey(model: ModelRefLike | undefined): string | undefined {
+/**
+ * The identity of a model reference: the provider it runs through, the model
+ * and its variant. Two steps with the same key ran the same thing the same way,
+ * which is what `modelChanged` compares.
+ */
+export function identityKey(model: ModelRefLike | undefined): string | undefined {
   if (!model) return undefined
   return `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
 }
@@ -219,16 +208,26 @@ export function stepEnd(message: AssistantMessage | undefined): number | undefin
 }
 
 /**
+ * Which identity the two steps must share for a reuse loss to be measurable.
+ * `provider` is the strict one: two providers are two caches, so a switch
+ * between them is not a loss but a different cache. `model` drops that test,
+ * for the reports that measure what an identity change costs: forfeiting the
+ * previous provider's cache is exactly the cost they report.
+ */
+export type CacheDropScope = "provider" | "model"
+
+/**
  * Cache reuse loss against a reference step, mirroring OpenCode's own
  * `turn-usage` heuristic: only comparable when the model is identical, and
- * OpenAI's endpoint reports small reads that are not worth flagging.
+ * OpenAI's API reports small reads that are not worth flagging.
  */
-export function cacheDrop(reference: AssistantMessage | undefined, current: AssistantMessage): number | undefined {
+export function cacheDrop(reference: AssistantMessage | undefined, current: AssistantMessage, scope: CacheDropScope = "provider"): number | undefined {
   if (!reference) return undefined
   const before = reference.model
   const after = current.model
   if (!before || !after) return undefined
-  if (before.providerID !== after.providerID || before.id !== after.id || (before.variant ?? "") !== (after.variant ?? "")) {
+  if (scope === "provider" && before.providerID !== after.providerID) return undefined
+  if (before.id !== after.id || (before.variant ?? "") !== (after.variant ?? "")) {
     return undefined
   }
   const drop = cacheRead(reference) - cacheRead(current)
@@ -292,7 +291,8 @@ export function isSettledStep(message: AssistantMessage): boolean {
 
 /**
  * Compute the stats of the most recent turn in a transcript, including the
- * comparison against the previous turn (affinity and cache reuse).
+ * comparison against the previous turn (a provider or model switch, and cache
+ * reuse).
  *
  * Returns undefined while the newest turn is still being generated: the line
  * appears when a turn ends, never with the zeroes of an in-flight response.
@@ -327,8 +327,8 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
 
   const provider = lastStep.model?.providerID
   const previousProvider = previousStep?.model?.providerID
-  const key = affinityKey(lastStep.model)
-  const previousKey = affinityKey(previousStep?.model)
+  const key = identityKey(lastStep.model)
+  const previousKey = identityKey(previousStep?.model)
 
   return {
     endAt: stepEnd(lastStep),
@@ -338,9 +338,6 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
     providerID: provider,
     modelID: lastStep.model?.id,
     variant: lastStep.model?.variant,
-    router: undefined,
-    identityChanged: false,
-    affinityKey: key,
     providerChanged: previousProvider !== undefined && provider !== undefined && previousProvider !== provider,
     modelChanged: previousKey !== undefined && key !== undefined && previousKey !== key && previousProvider === provider,
     totals: totalize(settled),
@@ -350,7 +347,6 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
     cacheDropTokens: drops.reduce((sum, drop) => sum + drop.tokens, 0),
     cacheExpired: drops.length > 0,
     steps: settled.length,
-    stepIDs: settled.map((step) => step.id),
   }
 }
 
@@ -361,7 +357,7 @@ function promptGap(current: TranscriptMessage | undefined, previous: TranscriptM
   return Math.max(0, now - before)
 }
 
-/** True when a cache drop is small enough to be endpoint noise. */
+/** True when a cache drop is small enough to be provider noise. */
 export function isNoiseDrop(providerID: string | undefined, drop: number): boolean {
   if (providerID === undefined) return false
   return DROP_EXEMPT_PROVIDERS.has(providerID) && drop >= 1024 && drop <= 2048
@@ -398,15 +394,6 @@ export type LineLabels = {
  * tool-call loop re-sends (and re-reads) the same context once per step.
  */
 export type TurnTotalsView = "latest" | "sum"
-
-/**
- * Which identity the line leads with. `endpoint` shows the gateway endpoint
- * that served the turn (`orcarouter-dsv4.1flash`) when a recorder learned one,
- * falling back to `provider/model`; `model` always shows `provider/model`.
- * The same provider and model can be routed to different endpoints per request,
- * so the endpoint is the identity a change is measured against.
- */
-export type LineIdentity = "endpoint" | "model"
 
 export type LineFields = {
   clock: boolean
@@ -446,7 +433,10 @@ export const DEFAULT_FIELDS: LineFields = {
   turn: true,
   session: true,
   reasoning: false,
-  cost: false,
+  // The turn's and the session's cost are on by default: what a session costs
+  // is the question the tokens only half answer. A zero is left out, so a free
+  // model reads as free instead of repeating `$0` on every line.
+  cost: true,
   cacheExpiry: true,
 }
 
@@ -520,7 +510,13 @@ export function displayTotals(totals: Totals): DisplayTotals {
   }
 }
 
-function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: LineFields, stepCount = 0): string {
+/**
+ * The numbers of one totals group. `cost` is passed explicitly because the two
+ * callers mean different money: a turn's cost is the sum over its steps
+ * whatever view its tokens follow, and money never comes from a "latest" step.
+ * A zero cost is left out of the line.
+ */
+function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: LineFields, stepCount = 0, cost = totals.cost): string {
   const display = displayTotals(totals)
   // The parenthesised value is the whole prompt, shown only when it differs
   // from the uncached part the label leads with.
@@ -534,7 +530,7 @@ function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: 
     `${labels.output} ${formatTokens(display.output)}`,
   ]
   if (fields.reasoning) parts.push(`${labels.reasoning} ${formatTokens(display.reasoning)}`)
-  if (fields.cost) parts.push(`${labels.cost} ${formatCost(display.cost)}`)
+  if (fields.cost && cost > 0) parts.push(`${labels.cost} ${formatCost(cost)}`)
   // An empty label (the default for the turn) leaves the numbers unlabelled; a
   // multi-step turn still says how many requests it took.
   const steps = stepCount > 1 ? `${stepCount} ${stepCount === 1 ? labels.step : labels.steps}` : ""
@@ -550,12 +546,11 @@ function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: 
  */
 export function formatLineSegments(
   stats: TurnStats,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; identity?: LineIdentity },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
 ): LineSegment[] {
   const labels = { ...DEFAULT_LABELS, ...options?.labels }
   const fields = { ...DEFAULT_FIELDS, ...options?.fields }
   const turnTotals = options?.turnTotals ?? "latest"
-  const identity = options?.identity ?? "endpoint"
   const segments: LineSegment[] = []
 
   if (fields.clock && stats.endAt !== undefined) {
@@ -564,13 +559,10 @@ export function formatLineSegments(
   if (fields.delta && stats.promptGapMs !== undefined) {
     segments.push({ text: `${labels.delta} ${formatDuration(stats.promptGapMs)}`, tone: "muted" })
   }
-  if (identity === "endpoint" && stats.router !== undefined) {
-    // The gateway endpoint is the identity: the same provider and model can be
-    // routed to a different endpoint per request, so that is what `changed`
-    // reports.
-    segments.push({ text: stats.router, tone: stats.identityChanged ? "warning" : "base" })
-    if (stats.identityChanged) segments.push({ text: labels.providerChanged, tone: "warning" })
-  } else if (stats.providerID !== undefined) {
+  // The turn's identity is the provider the model ran through and the model
+  // itself: the same model can come from different providers, so both are
+  // shown, and a provider switch is the change the line warns about.
+  if (stats.providerID !== undefined) {
     let text = stats.providerID
     if (fields.model && stats.modelID !== undefined) text += `/${stats.modelID}`
     if (fields.variant && stats.variant) text += ` ${stats.variant}`
@@ -580,10 +572,16 @@ export function formatLineSegments(
   }
   if (fields.turn && stats.totals.steps > 0) {
     const totals = turnTotals === "sum" ? stats.totals : stats.latest
-    segments.push({ text: totalsText(labels.turn, totals, labels, fields, turnTotals === "sum" ? stats.totals.steps : stats.steps), tone: "base" })
+    // The tokens follow the view — `latest` is the context the turn ended with
+    // — but money is paid per step: the turn's cost is the sum over its steps,
+    // never the last step's share of it.
+    segments.push({
+      text: totalsText(labels.turn, totals, labels, fields, turnTotals === "sum" ? stats.totals.steps : stats.steps, stats.totals.cost),
+      tone: "base",
+    })
   }
   if (fields.session && stats.session) {
-    segments.push({ text: totalsText(labels.session, stats.session, labels, fields), tone: "muted" })
+    segments.push({ text: totalsText(labels.session, stats.session, labels, fields, 0, stats.session.cost), tone: "muted" })
   }
   if (fields.cacheExpiry && stats.cacheExpired) {
     const count = stats.drops.length > 1 ? `×${stats.drops.length}` : ""
@@ -594,7 +592,7 @@ export function formatLineSegments(
 
 export function formatLine(
   stats: TurnStats,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; identity?: LineIdentity },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
 ): string {
   return formatLineSegments(stats, options)
     .map((segment) => segment.text)

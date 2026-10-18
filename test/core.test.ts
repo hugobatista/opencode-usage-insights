@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  affinityKey,
+  identityKey,
   cacheDrop,
   computeTurn,
   displayTotals,
@@ -183,10 +183,10 @@ describe("token accounting", () => {
     expect(totals).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, steps: 1 })
   })
 
-  test("affinityKey includes the variant when present", () => {
-    expect(affinityKey({ providerID: "opencode", id: "m" })).toBe("opencode/m")
-    expect(affinityKey({ providerID: "opencode", id: "m", variant: "max" })).toBe("opencode/m#max")
-    expect(affinityKey(undefined)).toBeUndefined()
+  test("identityKey includes the variant when present", () => {
+    expect(identityKey({ providerID: "opencode", id: "m" })).toBe("opencode/m")
+    expect(identityKey({ providerID: "opencode", id: "m", variant: "max" })).toBe("opencode/m#max")
+    expect(identityKey(undefined)).toBeUndefined()
   })
 })
 
@@ -203,13 +203,26 @@ describe("cacheDrop", () => {
     ).toBeUndefined()
   })
 
+  test("measures a drop across a provider switch only when asked to", () => {
+    const before = step("a0", 1, { provider: "opencode-go", read: 500_000 })
+    const after = step("a1", 2, { provider: "deepseek", read: 10_000 })
+    // The strict rule: two providers are two caches, and a switch between them
+    // is not a loss but a different cache.
+    expect(cacheDrop(before, after)).toBeUndefined()
+    // The reports that measure what an identity change costs ask for the model
+    // scope: forfeiting the previous provider's cache is exactly that cost.
+    expect(cacheDrop(before, after, "model")).toBe(490_000)
+    // The model must still be the same for either scope to apply.
+    expect(cacheDrop(before, step("a1", 2, { provider: "deepseek", read: 10_000, model: "other" }), "model")).toBeUndefined()
+  })
+
   test("ignores reads that merely grew or stayed equal", () => {
     expect(cacheDrop(step("a0", 1, { read: 100 }), step("a1", 2, { read: 100 }))).toBeUndefined()
     expect(cacheDrop(step("a0", 1, { read: 100 }), step("a1", 2, { read: 200 }))).toBeUndefined()
     expect(cacheDrop(undefined, step("a1", 2, { read: 100 }))).toBeUndefined()
   })
 
-  test("ignores OpenAI endpoint noise between 1024 and 2048 tokens", () => {
+  test("ignores small OpenAI cache reads as provider noise between 1024 and 2048 tokens", () => {
     const before = step("a0", 1, { provider: "openai", read: 500_000 })
     expect(cacheDrop(before, step("a1", 2, { provider: "openai", read: 498_500 }))).toBeUndefined()
     expect(cacheDrop(before, step("a1", 2, { provider: "openai", read: 495_000 }))).toBe(5_000)
@@ -255,7 +268,6 @@ describe("computeTurn", () => {
     expect(stats!.providerChanged).toBe(false)
     expect(stats!.modelChanged).toBe(false)
     expect(stats!.cacheExpired).toBe(false)
-    expect(stats!.stepIDs).toEqual(["a1"])
     expect(stats!.totals).toEqual({
       input: 100,
       cached: 900,
@@ -277,7 +289,7 @@ describe("computeTurn", () => {
     expect(stats!.promptGapMs).toBe(192_000)
   })
 
-  test("lists the settled steps of the turn being measured", () => {
+  test("counts only the steps that settled", () => {
     const stats = computeTurn([
       prompt("u1", 1_000),
       step("a1", 2_000, { completed: 2_600 }),
@@ -286,10 +298,8 @@ describe("computeTurn", () => {
       step("a3", 5_000),
       step("a4", 6_000, { completed: 6_600 }),
     ])
-    // The ids are how the TUI asks the recorder who served these steps: an
-    // older turn's endpoint must not be attributed to this one, and a step that
-    // never settled has no recorded outcome to attribute.
-    expect(stats!.stepIDs).toEqual(["a2", "a4"])
+    // A step that never settled has no final numbers: it is neither counted nor
+    // a cache reference.
     expect(stats!.steps).toBe(2)
   })
 
@@ -399,23 +409,23 @@ describe("line identity", () => {
   const transcript = (): TranscriptMessage[] => [prompt("u1", 1_000), step("a1", 2_000, { input: 100, output: 10, completed: 2_600 })]
   const plain = { fields: { clock: false, delta: false, session: false } }
 
-  test("leads with the routing endpoint when a recorder learned one", () => {
-    const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash" }
-    expect(formatLine(stats, plain)).toBe("orcarouter-dsv4.1flash · in 100, cached 0, out 10")
-  })
-
-  test("falls back to provider/model without an endpoint", () => {
+  test("leads with the provider and the model that ran the turn", () => {
     expect(formatLine(computeTurn(transcript())!, plain)).toBe("opencode/deepseek-v4.1-flash-free · in 100, cached 0, out 10")
   })
 
-  test("marks a changed endpoint with the same warning", () => {
-    const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash", identityChanged: true }
-    expect(formatLine(stats, plain)).toBe("orcarouter-dsv4.1flash · changed · in 100, cached 0, out 10")
+  test("marks a changed provider with the same warning", () => {
+    const stats: TurnStats = { ...computeTurn(transcript())!, providerChanged: true }
+    expect(formatLine(stats, plain)).toBe("opencode/deepseek-v4.1-flash-free · changed · in 100, cached 0, out 10")
   })
 
-  test("identity: model keeps the provider view", () => {
-    const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash" }
-    expect(formatLine(stats, { ...plain, identity: "model" })).toBe("opencode/deepseek-v4.1-flash-free · in 100, cached 0, out 10")
+  test("marks a model change inside one provider separately", () => {
+    const stats: TurnStats = { ...computeTurn(transcript())!, modelChanged: true }
+    expect(formatLine(stats, plain)).toBe("opencode/deepseek-v4.1-flash-free · model changed · in 100, cached 0, out 10")
+  })
+
+  test("keeps the variant of the model when it has one", () => {
+    const stats: TurnStats = { ...computeTurn(transcript())!, variant: "max" }
+    expect(formatLine(stats, plain)).toBe("opencode/deepseek-v4.1-flash-free max · in 100, cached 0, out 10")
   })
 })
 
@@ -525,7 +535,7 @@ describe("formatLineSegments", () => {
     expect(segments.find((s) => s.text === "model changed")!.tone).toBe("muted")
   })
 
-  test("never mentions a reported operator: the endpoint is the identity", () => {
+  test("never mentions an operator the model did not run through", () => {
     const stats = computeTurn(lineTranscript(), session)!
     expect(formatLineSegments(stats).find((s) => s.text.includes("via"))).toBeUndefined()
     expect(formatLineSegments(stats, { fields: { upstream: true } } as never).find((s) => s.text.includes("via"))).toBeUndefined()
@@ -540,13 +550,33 @@ describe("formatLineSegments", () => {
     expect(line).toBe("opencode · turno in 85.4k (1.62M), cache 1.53M, saida 3.7k · ⚠ cache expirada (−11.7k)")
   })
 
-  test("adds reasoning and cost on request", () => {
+  test("adds reasoning on request, with the cost already there", () => {
     const stats = computeTurn([
       prompt("u1", 1_000),
       step("a1", 2_000, { input: 1_000, output: 2_000, reasoning: 3_000, cost: 0.0123, completed: 2_600 }),
     ])!
-    const line = formatLine(stats, { fields: { clock: false, delta: false, model: false, session: false, reasoning: true, cost: true } })
+    const line = formatLine(stats, { fields: { clock: false, delta: false, model: false, session: false, reasoning: true } })
     expect(line).toBe("opencode · in 1k, cached 0, out 5k, reason 3k, cost $0.0123")
+  })
+
+  test("leaves the cost out when nothing was paid", () => {
+    const stats = computeTurn([prompt("u1", 1_000), step("a1", 2_000, { input: 100, output: 10, completed: 2_600 })], session)!
+    const line = formatLine(stats, { fields: { clock: false, delta: false } })
+    expect(line).not.toContain("cost")
+    // The session's own cost is left out the same way.
+    expect(line).toContain("sess in 2.1M (14.5M), cached 12.4M, out 88k")
+  })
+
+  test("counts the whole turn's cost, not the last step's", () => {
+    const stats = computeTurn([
+      prompt("u1", 1_000),
+      step("a1", 2_000, { input: 100, output: 10, cost: 0.0103, completed: 2_600 }),
+      step("a2", 4_000, { input: 200, output: 20, cost: 0.0011, completed: 4_600 }),
+    ])!
+    // `latest` shows the context the turn ended with (200 in, 20 out), but money
+    // is paid per step: the cost is the two steps together.
+    const line = formatLine(stats, { fields: { clock: false, delta: false, model: false, session: false } })
+    expect(line).toBe("opencode · 2 steps · in 200, cached 0, out 20, cost $0.0114")
   })
 
   test("omits the cache warning when reuse held", () => {

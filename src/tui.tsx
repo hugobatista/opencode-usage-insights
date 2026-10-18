@@ -4,27 +4,27 @@ import type { Context } from "@opencode/plugin/tui/context"
 import { StyledText, fg, type ColorInput } from "@opentui/core"
 import type { Database } from "bun:sqlite"
 import { Show, createMemo, createRenderEffect, createSignal } from "solid-js"
-import { computeTurn, type LineFields, type LineIdentity, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
+import { computeTurn, type LineFields, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
 import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
 import { TurnsSidebar } from "./sidebar"
 import { openStatsDbReadOnly, openStatsDbWrite } from "./stats/db"
 import { resolveDbPath } from "./stats/paths"
-import { routerBefore, routerForSteps } from "./stats/queries"
 
 /**
  * TUI side of the plugin. Two contributions:
  *
  * - `session.composer.top`: one telemetry line after every turn with the end
- *   time, the delta since the previous prompt, the endpoint that served it,
- *   turn and session token totals, and cache warnings.
+ *   time, the delta since the previous prompt, the provider and model that ran
+ *   it, turn and session token totals, and cache warnings.
  * - `session.panel` + the `/stats` slash command: the statistics panel over
  *   the database written by the server entry.
  *
- * The database is opened lazily and read-only in spirit: the TUI never
- * writes usage. When the database cannot be opened, the line falls back to
- * host data only and the panel explains itself.
+ * The line is computed from the host's transcript alone; the database is opened
+ * lazily for the panel and the sidebar, read-only in spirit: the TUI never
+ * writes usage. When the database cannot be opened, the line still works and
+ * the panel explains itself.
  */
 
 export type Options = {
@@ -32,12 +32,6 @@ export type Options = {
   enabled?: boolean | undefined
   /** SQLite database path override; must match the server entry. */
   db?: string | undefined
-  /**
-   * Which identity the line leads with: `endpoint` (default) shows the gateway
-   * endpoint that served the turn (`orcarouter-dsv4.1flash`) and warns when it
-   * changes; `model` shows `provider/model#variant` as before.
-   */
-  identity?: LineIdentity | undefined
   /**
    * How the turn segment counts prompt usage: `latest` (default) shows the
    * prompt size the turn ended with, `sum` adds every step of the turn.
@@ -57,11 +51,6 @@ export type Options = {
    */
   panel?: boolean | undefined
 }
-
-const ROUTER_CACHE_MS = 5_000
-
-/** Ceiling on the endpoint lookups kept, one per rendered turn. */
-const MAX_ROUTER_CACHE = 512
 
 /**
  * Shortest interval between two panel rebuilds. A tool-call loop ends several
@@ -101,7 +90,6 @@ export default Plugin.define({
     // Bumped when a step or an execution ends: the panel and the sidebar read
     // the database, which is not reactive by itself.
     const [refresh, setRefresh] = createSignal(0)
-    const routerCache = new Map<string, { value: string | undefined; at: number }>()
     let database: Database | undefined
     let databaseFailed = false
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
@@ -170,39 +158,6 @@ export default Plugin.define({
     }
 
     /**
-     * Endpoint of the turn that is being rendered, keyed by the turn's steps:
-     * a turn whose requests the gateway did not name stays unknown instead of
-     * borrowing the endpoint of an older turn of the same provider and model.
-     */
-    function lookupRouter(sessionID: string, stepIDs: readonly string[]): string | undefined {
-      if (stepIDs.length === 0) return undefined
-      // The turn's last id identifies the turn; the count keeps a growing turn
-      // (steps appended while it streams) from reusing a shorter answer.
-      const key = `${sessionID}#${stepIDs[stepIDs.length - 1]}#${stepIDs.length}`
-      const now = Date.now()
-      const cached = routerCache.get(key)
-      if (cached !== undefined && now - cached.at < ROUTER_CACHE_MS) return cached.value
-      let value: string | undefined
-      const handle = db()
-      if (handle !== undefined) {
-        try {
-          value = routerForSteps(handle, sessionID, stepIDs)
-        } catch {
-          value = undefined
-        }
-      }
-      routerCache.set(key, { value, at: now })
-      // Same ceiling as the recorder's maps: a TUI that runs for weeks sees
-      // thousands of sessions, and its oldest entries are the least useful.
-      while (routerCache.size > MAX_ROUTER_CACHE) {
-        const oldest = routerCache.keys().next()
-        if (oldest.done === true) break
-        routerCache.delete(oldest.value)
-      }
-      return value
-    }
-
-    /**
      * True while the session is running a turn. The host publishes that state
      * from its execution events, so the line only appears when the turn is
      * over — not between the steps of a tool-call loop. A host without the
@@ -225,26 +180,7 @@ export default Plugin.define({
       if (!sessionIdle(sessionID)) return undefined
       const messages = ctx.data.session.message.list(sessionID) as unknown as RuntimeMessage[]
       const info = ctx.data.session.get(sessionID) as unknown as RuntimeSessionInfo | undefined
-      const stats = computeTurn(toTranscriptTail(messages, 2), sessionTotals(info))
-      if (stats !== undefined) {
-        const router = lookupRouter(sessionID, stats.stepIDs)
-        if (router !== undefined) {
-          stats.router = router
-          // The transcript carries no routing history, so the previous endpoint
-          // comes from the database: the line warns when the turn was served by
-          // a different endpoint than the turn before it.
-          const handle = db()
-          if (handle !== undefined) {
-            try {
-              const previous = routerBefore(handle, sessionID, stats.startAt)
-              stats.identityChanged = previous !== undefined && previous !== stats.router
-            } catch {
-              stats.identityChanged = false
-            }
-          }
-        }
-      }
-      return stats
+      return computeTurn(toTranscriptTail(messages, 2), sessionTotals(info))
     }
 
     function toneColor(tone: LinePart["tone"]): ColorInput {
@@ -262,7 +198,6 @@ export default Plugin.define({
           labels: options.labels,
           fields: options.fields,
           turnTotals: options.turnTotals,
-          identity: options.identity,
         }),
       )
       return (
@@ -303,7 +238,7 @@ export default Plugin.define({
                 deps={{ db, dbPath: () => resolveDbPath(options.db), withWrite, now: () => Date.now(), sessionStart, refresh }}
                 settings={settings}
                 update={patchSettings}
-                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, identity: options.identity }}
+                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals }}
               />
             ) : null,
         })
@@ -317,7 +252,7 @@ export default Plugin.define({
             sessionID={input.sessionID}
             ctx={ctx}
             deps={{ db, refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 5)) }}
-            options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, identity: options.identity }}
+            options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals }}
           />
         ),
     })
@@ -384,12 +319,9 @@ export default Plugin.define({
     }
 
     const disposeEvents = [
-      // A finished step may carry a fresh endpoint; drop the cache and let the
-      // history views re-read the database.
-      ctx.data.on("session.step.ended", () => {
-        routerCache.clear()
-        bumpRefresh()
-      }),
+      // A finished step means the history views have one more row: let them
+      // re-read the database.
+      ctx.data.on("session.step.ended", () => bumpRefresh()),
       ctx.data.on("session.execution.succeeded", () => bumpRefresh()),
       ctx.data.on("session.execution.failed", () => bumpRefresh()),
       ctx.data.on("session.execution.interrupted", () => bumpRefresh()),

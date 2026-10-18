@@ -191,7 +191,7 @@ describe("telemetry line", () => {
   test("reports end time, gap, provider, turn and session totals", () => {
     const harness = init({ sessions: [session({ id: "ses_line" })] })
     expect(harness.lineText("ses_line")).toBe(
-      `${formatClock(at(205))} · Δ 3m20s · opencode/deepseek-v4.1-flash-free · in 1k (1.53M), cached 1.53M, out 50 · sess in 132k (2.13M), cached 2M, out 5k`,
+      `${formatClock(at(205))} · Δ 3m20s · opencode/deepseek-v4.1-flash-free · in 1k (1.53M), cached 1.53M, out 50, cost $0.0200 · sess in 132k (2.13M), cached 2M, out 5k, cost $0.5000`,
     )
     expect(harness.state()).toEqual({ view: "overview", range: "all" })
   })
@@ -226,7 +226,7 @@ describe("telemetry line", () => {
       options: { fields: { clock: false, delta: false, session: false }, labels: { turn: "step" } },
       sessions: [session({ id: "ses_options" })],
     })
-    expect(harness.lineText("ses_options")).toBe("opencode/deepseek-v4.1-flash-free · step in 1k (1.53M), cached 1.53M, out 50")
+    expect(harness.lineText("ses_options")).toBe("opencode/deepseek-v4.1-flash-free · step in 1k (1.53M), cached 1.53M, out 50, cost $0.0200")
   })
 
   test("never shows a reported operator on the line", () => {
@@ -390,100 +390,50 @@ describe("rendering", () => {
     }
   })
 
-  test("leads with the routing endpoint the recorder learned, and warns when it changed", async () => {
-    const db = openStatsDb(resolveDbPath())
-    // The endpoint is read back by the ids of the steps of the rendered turn,
-    // which is what the recorder keys its rows by.
-    recordStep(db, {
-      messageID: "msg_1",
-      sessionID: "ses_render_router",
-      providerID: MODEL.providerID,
-      modelID: MODEL.id,
-      createdAt: at(1),
-      completedAt: at(11),
-      router: "router-a",
-      recordedAt: at(11),
+  test("warns when the provider changed against the previous turn", async () => {
+    const harness = init({
+      sessions: [
+        session({
+          id: "ses_render_provider",
+          messages: [
+            ...FIRST_TURN,
+            { id: "prt_msg_2", type: "user", time: { created: at(200) } },
+            {
+              id: "msg_2",
+              type: "assistant",
+              time: { created: at(201), streamed: at(202), completed: at(205) },
+              model: { providerID: "deepseek", id: "deepseek-flash" },
+              tokens: { input: 1_000, output: 50, reasoning: 0, cache: { read: 1_534_000, write: 0 } },
+              cost: 0.02,
+            },
+          ],
+        }),
+      ],
     })
-    recordStep(db, {
-      messageID: "msg_2",
-      sessionID: "ses_render_router",
-      providerID: MODEL.providerID,
-      modelID: MODEL.id,
-      createdAt: at(201),
-      completedAt: at(205),
-      router: "router-b",
-      recordedAt: at(210),
-    })
-    db.close()
-
-    const harness = init({ sessions: [session({ id: "ses_render_router" })] })
     const claim = harness.claim("session.composer.top")!
-    const setup = await testRender(() => claim.render({ sessionID: "ses_render_router" } as never) as never, { width: 140, height: 8 })
+    const setup = await testRender(() => claim.render({ sessionID: "ses_render_provider" } as never) as never, { width: 140, height: 8 })
     try {
       await setup.renderOnce()
       const text = treeText(setup)
-      expect(countOccurrences(text, "router-b")).toBe(1)
+      // The identity is the provider and the model that ran the newest turn.
+      expect(countOccurrences(text, "deepseek/deepseek-flash")).toBe(1)
       expect(text).toContain("changed")
-      // The endpoint replaces the provider/model identity on the line.
-      expect(text).not.toContain(MODEL.id)
     } finally {
       await setup.dispose()
     }
   })
 
-  test("keeps a turn unknown when only an older turn of the same model had an endpoint", async () => {
-    const db = openStatsDb(resolveDbPath())
-    recordStep(db, {
-      messageID: "msg_gap_prev",
-      sessionID: "ses_render_router_gap",
-      providerID: MODEL.providerID,
-      modelID: MODEL.id,
-      createdAt: at(1),
-      completedAt: at(11),
-      router: "orcarouter-dsv4.1flash",
-      recordedAt: at(11),
-    })
-    // The newest turn ran on the same provider and model, and no source named
-    // its endpoint: the line must not report the older turn's one.
-    recordStep(db, {
-      messageID: "msg_gap",
-      sessionID: "ses_render_router_gap",
-      providerID: MODEL.providerID,
-      modelID: MODEL.id,
-      createdAt: at(201),
-      completedAt: at(205),
-      recordedAt: at(205),
-    })
-    db.close()
-
-    const messages: RuntimeMessage[] = [
-      { id: "prt_gap_1", type: "user", time: { created: at(0) } },
-      {
-        id: "msg_gap_prev",
-        type: "assistant",
-        time: { created: at(1), streamed: at(2), completed: at(11) },
-        model: MODEL,
-        tokens: { input: 1_000, output: 50, reasoning: 0, cache: { read: 1_000, write: 0 } },
-        cost: 0.01,
-      },
-      { id: "prt_gap_2", type: "user", time: { created: at(200) } },
-      {
-        id: "msg_gap",
-        type: "assistant",
-        time: { created: at(201), streamed: at(202), completed: at(205) },
-        model: MODEL,
-        tokens: { input: 2_000, output: 60, reasoning: 0, cache: { read: 1_540_000, write: 0 } },
-        cost: 0.03,
-      },
-    ]
-    const harness = init({ sessions: [session({ id: "ses_render_router_gap", messages })] })
+  test("renders the line from the transcript alone, without the database", async () => {
+    // The database path points nowhere: the line never reads it, so it renders
+    // all the same.
+    const harness = init({ sessions: [session({ id: "ses_render_nodb" })], options: { db: join(stateDir, "missing.db") } })
     const claim = harness.claim("session.composer.top")!
-    const setup = await testRender(() => claim.render({ sessionID: "ses_render_router_gap" } as never) as never, { width: 140, height: 8 })
+    const setup = await testRender(() => claim.render({ sessionID: "ses_render_nodb" } as never) as never, { width: 140, height: 8 })
     try {
       await setup.renderOnce()
       const text = treeText(setup)
-      expect(text).not.toContain("orcarouter-dsv4.1flash")
-      expect(text).toContain(MODEL.id)
+      expect(text).toContain(`${MODEL.providerID}/${MODEL.id}`)
+      expect(text).toContain("in 1k (1.53M)")
     } finally {
       await setup.dispose()
     }
@@ -769,7 +719,6 @@ describe("history", () => {
       cacheRead: 425_728,
       output: 434,
       reasoning: 631,
-      router: "orcarouter-dsv4.1flash",
       recordedAt: at(20),
     })
     db.close()
@@ -789,7 +738,10 @@ describe("history", () => {
       expect(text).toContain("1 step")
       expect(text).toContain("hit")
       expect(text).toContain("turns")
-      expect(text).toContain("orcarouter-dsv4.1flash")
+      expect(text).toContain(MODEL.providerID)
+      // The model is named at the ends of the block, so the history reads
+      // without any scroll.
+      expect(text).toContain(MODEL.id)
       // Three lines per turn: volumes, then the rate, the hit and the cost.
       expect(text).toContain("in 1.62k (427.3k) · out 1.06k")
       // 1,065 produced tokens over a one-second stream, on both the turn and the session.
@@ -815,8 +767,8 @@ describe("history", () => {
       harness.command("usage-insights.stats")!.run("turns")
       await setup.renderOnce()
       const text = treeText(setup)
-      expect(text).toContain("[9 turns]")
-      expect(text).toContain("orcarouter-dsv4.1flash · in 1.62k (427.3k), cached 425.7k, out 1.06k")
+      expect(text).toContain("[8 turns]")
+      expect(text).toContain(`${MODEL.providerID}/${MODEL.id} · in 1.62k (427.3k), cached 425.7k, out 1.06k`)
     } finally {
       await setup.dispose()
     }

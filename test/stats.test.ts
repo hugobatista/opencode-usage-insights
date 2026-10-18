@@ -11,18 +11,16 @@ import {
   recordEvent,
   recordPrompt,
   recordStep,
-  setStepRouter,
   upsertSession,
   type StepRecord,
 } from "../src/stats/db"
 import { cacheDropsOf, cachePairs, latencyOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
 import {
   cacheHitRatio,
+  filterOptions,
   models,
   overview,
   percentile,
-  routerBefore,
-  routerForSteps,
   sessions,
   timeline,
   turns,
@@ -94,26 +92,18 @@ describe("stats db", () => {
     expect(rows).toEqual([{ message_id: "a1", input_tokens: 20, output_tokens: 2, created_at: 6 }])
   })
 
-  test("recordStep keeps the endpoint when re-recorded empty", () => {
+  test("recordStep keeps the provider and the model when re-recorded empty", () => {
     const db = freshDb()
-    recordStep(db, { messageID: "a1", sessionID: "s1", router: "orcarouter-dsv4.1flash" })
+    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "opencode-go", modelID: "m1" })
     recordStep(db, { messageID: "a1", sessionID: "s1", input: 5 })
-    const row = db.query("SELECT input_tokens, router FROM steps").get() as Record<string, unknown>
-    expect(row).toEqual({ input_tokens: 5, router: "orcarouter-dsv4.1flash" })
-  })
-
-  test("setStepRouter attaches the endpoint after the fact", () => {
-    const db = freshDb()
-    recordStep(db, { messageID: "a1", sessionID: "s1" })
-    setStepRouter(db, "a1", { router: "opencode", source: "endpoint:opencode.ai" })
-    const row = db.query("SELECT router FROM steps").get() as Record<string, unknown>
-    expect(row).toEqual({ router: "opencode" })
+    const row = db.query("SELECT input_tokens, provider_id, model_id FROM steps").get() as Record<string, unknown>
+    expect(row).toEqual({ input_tokens: 5, provider_id: "opencode-go", model_id: "m1" })
   })
 
   test("drops the columns and tables no view reads", () => {
     const db = freshDb()
     const columns = (db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
-    for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"]) {
+    for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps", "router"]) {
       expect(columns).not.toContain(gone)
     }
     const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name)
@@ -223,11 +213,14 @@ describe("stats queries", () => {
     expect(second!.totals.steps).toBe(3)
   })
 
-  test("models reports the endpoints grouped per provider", () => {
+  test("models groups the same model under every provider that ran it", () => {
     const db = seed()
-    setStepRouter(db, "a1", { router: "orcarouter-dsv4.1flash", source: "header:x-opencode-endpoint-id" })
+    recordStep(db, { messageID: "a5", sessionID: "s1", providerID: "opencode-go", modelID: "m1", createdAt: 3_000_000, input: 10, output: 5, recordedAt: 3_000_000 })
     const rows = models(db)
-    expect(rows[0]!.providers[0]!.routers).toEqual(["orcarouter-dsv4.1flash"])
+    const m1 = rows.find((row) => row.modelID === "m1")!
+    expect(m1.providers.map((provider) => provider.providerID).sort()).toEqual(["opencode", "opencode-go"])
+    // The family stays one row: the providers are the split the view keeps.
+    expect(rows.filter((row) => row.modelID === "m1")).toHaveLength(1)
   })
 
   test("timeline buckets usage by fixed windows", () => {
@@ -321,41 +314,11 @@ describe("stats queries", () => {
     expect(rows[0]!.steps).toBe(3)
   })
 
-  test("routerBefore finds the endpoint of the turn before this one", () => {
-    const db = freshDb()
-    recordStep(db, { messageID: "r1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_000, router: "router-a", recordedAt: 1_000 })
-    recordStep(db, { messageID: "r2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 3_000, router: "router-b", recordedAt: 3_000 })
-    expect(routerBefore(db, "s1", 2_000)).toBe("router-a")
-    expect(routerBefore(db, "s1", 4_000)).toBe("router-b")
-    expect(routerBefore(db, "s1", 500)).toBeUndefined()
-    expect(routerBefore(db, "s1", undefined)).toBeUndefined()
-    expect(routerBefore(db, "s2", 4_000)).toBeUndefined()
-  })
-
-  test("routerForSteps reports the endpoint of the turn's own steps", () => {
-    const db = freshDb()
-    recordStep(db, {
-      messageID: "t1a",
-      sessionID: "s1",
-      providerID: "opencode",
-      modelID: "m1",
-      createdAt: 1_000,
-      router: "orcarouter-dsv4.1flash",
-      recordedAt: 1_000,
-    })
-    recordStep(db, { messageID: "t1b", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, router: "siliconflow", recordedAt: 1_100 })
-    // The next turn of the same provider and model was not named by a gateway.
-    recordStep(db, { messageID: "t2a", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 2_000, recordedAt: 2_000 })
-
-    // Newest endpoint among the steps of one turn.
-    expect(routerForSteps(db, "s1", ["t1a", "t1b"])).toBe("siliconflow")
-    expect(routerForSteps(db, "s1", ["t1a"])).toBe("orcarouter-dsv4.1flash")
-    // A turn the gateway did not name stays unknown instead of borrowing the
-    // endpoint of an older turn of the same session and model.
-    expect(routerForSteps(db, "s1", ["t2a"])).toBeUndefined()
-    expect(routerForSteps(db, "s1", [])).toBeUndefined()
-    expect(routerForSteps(db, "s1", ["missing"])).toBeUndefined()
-    expect(routerForSteps(db, "s2", ["t1a"])).toBeUndefined()
+  test("filterOptions lists the models and the providers actually observed", () => {
+    const options = filterOptions(seed())
+    expect(options.providers.map((entry) => entry.value).sort()).toEqual(["github-copilot", "opencode"])
+    expect(options.models.map((entry) => entry.value).sort()).toEqual(["m1", "m2"])
+    expect(options.providers.find((entry) => entry.value === "opencode")!.steps).toBe(4)
   })
 })
 
@@ -367,10 +330,10 @@ describe("turns", () => {
     recordPrompt(db, { sessionID: "s1", messageID: "p2", createdAt: 5_000 })
     recordPrompt(db, { sessionID: "s1", messageID: "p3", createdAt: 9_000 })
     // Turn 1: a tool call and the final answer.
-    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, completedAt: 1_200, finish: "tool-calls", cacheRead: 1_000, input: 20, output: 10, router: "router-a", recordedAt: 1_200 })
-    recordStep(db, { messageID: "a2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_500, completedAt: 1_600, finish: "stop", cacheRead: 900, input: 100, output: 50, router: "router-a", recordedAt: 1_600 })
-    // Turn 2: a single step, served by another endpoint.
-    recordStep(db, { messageID: "a3", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 5_100, completedAt: 5_200, finish: "stop", cacheRead: 200, input: 300, output: 60, router: "router-b", recordedAt: 5_200 })
+    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, completedAt: 1_200, finish: "tool-calls", cacheRead: 1_000, input: 20, output: 10, recordedAt: 1_200 })
+    recordStep(db, { messageID: "a2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_500, completedAt: 1_600, finish: "stop", cacheRead: 900, input: 100, output: 50, recordedAt: 1_600 })
+    // Turn 2: a single step, through another provider.
+    recordStep(db, { messageID: "a3", sessionID: "s1", providerID: "opencode-go", modelID: "m1", createdAt: 5_100, completedAt: 5_200, finish: "stop", cacheRead: 200, input: 300, output: 60, recordedAt: 5_200 })
     // Turn 3: still running (asked for tools), so it is not history yet.
     recordStep(db, { messageID: "a4", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 9_100, completedAt: 9_200, finish: "tool-calls", cacheRead: 100, recordedAt: 9_200 })
     // Another session, to prove the session filter.
@@ -413,15 +376,16 @@ describe("turns", () => {
     expect(turns(seedTurns())[0]!.tps).toBeUndefined()
   })
 
-  test("marks where the routing endpoint or the provider changed", () => {
+  test("marks where the provider or the model changed against the turn before", () => {
     const rows = turns(seedTurns())
     const single = rows.find((row) => row.promptAt === 5_000)!
-    expect(single.router).toBe("router-b")
-    expect(single.routerChanged).toBe(true)
-    expect(single.providerChanged).toBe(false)
+    expect(single.providerID).toBe("opencode-go")
+    expect(single.providerChanged).toBe(true)
+    expect(single.modelChanged).toBe(false)
     const loop = rows.find((row) => row.promptAt === 1_000)!
-    expect(loop.router).toBe("router-a")
-    expect(loop.routerChanged).toBe(false)
+    expect(loop.providerID).toBe("opencode")
+    expect(loop.providerChanged).toBe(false)
+    expect(loop.modelChanged).toBe(false)
   })
 
   test("filters by session, range and limit", () => {
@@ -472,13 +436,16 @@ describe("stats db migrations", () => {
       const db = openStatsDb(path)
 
       const columns = (db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
-      for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"]) expect(columns).not.toContain(gone)
+      for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps", "router"]) expect(columns).not.toContain(gone)
       const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name)
       expect(tables).not.toContain("http_responses")
+      const indexes = (db.query("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map((row) => row.name)
+      expect(indexes).not.toContain("steps_upstream")
+      expect(indexes).not.toContain("steps_router")
 
-      // The step survives with everything the views read, endpoint included.
-      const row = db.query("SELECT message_id, output_tokens, router FROM steps").get() as Record<string, unknown>
-      expect(row).toEqual({ message_id: "old_1", output_tokens: 100, router: "orcarouter-dsv4.1flash" })
+      // The step survives with everything the views read.
+      const row = db.query("SELECT message_id, output_tokens FROM steps").get() as Record<string, unknown>
+      expect(row).toEqual({ message_id: "old_1", output_tokens: 100 })
 
       // Only the compaction event is kept: it is the one the cache view reads.
       const kinds = (db.query("SELECT kind FROM events").all() as { kind: string }[]).map((event) => event.kind)

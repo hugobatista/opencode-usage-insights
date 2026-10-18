@@ -14,19 +14,19 @@ import { existsSync, readFileSync } from "node:fs"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
 import { DEFAULT_SETTINGS, GRANULARITIES, PANEL_VIEWS, RANGE_KEYS, count, type Granularity, type PanelLine, type PanelView, type RangeKey } from "../src/panel-data"
 import {
-  affinityOf,
   cacheDropsOf,
-  cacheStatsByModel,
   cachePairs,
-  stepRows,
+  cacheStatsByModel,
   cacheStatsOf,
   coverageOf,
-  endpointBreakdownOf,
-  endpointSummaryOf,
   gapReportOf,
   latencyGroupsOf,
   latencyOf,
   periodsOf,
+  providerBreakdownOf,
+  providerSummaryOf,
+  stepRows,
+  switchesOf,
   ttlEvidenceOf,
 } from "../src/stats/aggregates"
 import { exportNdjson, importNdjson, openStatsDb } from "../src/stats/db"
@@ -41,7 +41,7 @@ type Args = {
   width: number
   granularity: Granularity
   model?: string | undefined
-  endpoint?: string | undefined
+  provider?: string | undefined
   sort?: string | undefined
   sortDesc: boolean
   json: boolean
@@ -59,7 +59,7 @@ flags  --db <path>          database override (default: ${defaultDbPath()})
        --width <n>          column budget (default: 100)
        --granularity <g>    periods bucket: ${GRANULARITIES.join(", ")} (default: day)
        --model <id>         only steps of this model
-       --endpoint <name>    only steps served by this routing endpoint
+       --provider <name>    only steps that ran through this provider
        --sort <key>         sort key of the view (models: steps cached out cost, …)
        --asc                sort ascending (default: descending)
        --json               print the raw query rows as JSON
@@ -82,7 +82,7 @@ function parse(argv: readonly string[]): Args {
     else if (token === "--width") parsed.width = Number(argv[++index] ?? 100)
     else if (token === "--granularity") parsed.granularity = (argv[++index] ?? "day") as Granularity
     else if (token === "--model") parsed.model = argv[++index]
-    else if (token === "--endpoint") parsed.endpoint = argv[++index]
+    else if (token === "--provider") parsed.provider = argv[++index]
     else if (token === "--sort") parsed.sort = argv[++index]
     else if (token === "-h" || token === "--help") {
       console.log(USAGE)
@@ -169,7 +169,7 @@ if (args.range === "session") console.error("note: no session context here, so \
 
 const filters = {
   ...(args.model !== undefined ? { modelID: args.model } : {}),
-  ...(args.endpoint !== undefined ? { router: args.endpoint } : {}),
+  ...(args.provider !== undefined ? { provider: args.provider } : {}),
 }
 
 if (args.json) {
@@ -180,9 +180,9 @@ if (args.json) {
   const data = {
     overview: overview(db, range, filters),
     models: models(db, range, filters),
-    endpoints: endpointSummaryOf(steps),
-    endpointModels: endpointBreakdownOf(steps),
-    affinity: affinityOf(pairs),
+    providers: providerSummaryOf(steps),
+    providerModels: providerBreakdownOf(steps),
+    switches: switchesOf(pairs),
     cache: {
       stats: cacheStatsOf(db, { range, filters }),
       byModel: cacheStatsByModel(steps),
@@ -191,7 +191,7 @@ if (args.json) {
       gap: gapReportOf(pairs),
     },
     periods: periodsOf(steps, args.granularity),
-    latency: { overall: latencyOf(steps), byModel: latencyGroupsOf(steps, "model"), byEndpoint: latencyGroupsOf(steps, "endpoint") },
+    latency: { overall: latencyOf(steps), byModel: latencyGroupsOf(steps, "model"), byProvider: latencyGroupsOf(steps, "provider") },
     sessions: sessions(db, { range, filters, limit: 50 }),
     coverage: coverageOf(db, { range, filters }),
     db: dbInfo(db, path, now),
