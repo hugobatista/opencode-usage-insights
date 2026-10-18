@@ -222,7 +222,17 @@ function main(): void {
       })
     }
   } finally {
-    rmSync(directory, { recursive: true, force: true })
+    // Windows refuses to unlink a file that still has an open handle, where
+    // POSIX would remove the directory regardless. Collecting first releases
+    // any statement the SQLite wrapper has not finalized, and the retries cover
+    // the rest; a directory that survives even so is not a data-layer failure,
+    // and the runner reaps its own temporary directories.
+    Bun.gc(true)
+    try {
+      rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    } catch (error) {
+      process.stdout.write(`  warn the temporary database outlived the checks: ${error instanceof Error ? error.message : String(error)}\n`)
+    }
   }
 
   process.stdout.write(`\n${failures === 0 ? "all checks passed" : `${failures} check(s) failed`} on ${process.platform}\n`)
