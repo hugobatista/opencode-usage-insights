@@ -8,10 +8,10 @@
  *
  *   bun run check:platform
  *
- * It exists because the plugin ships to Linux, macOS and Windows while the
- * test suite's rendering tests need the TUI native stack, which is Linux-only
- * in CI. This script has no rendering dependency, so it runs everywhere and
- * answers the question the matrix asks: does the data layer work here?
+ * It exists because the plugin ships to Linux, macOS and Windows while CI runs
+ * the test suite on Linux. This script has no rendering dependency, so it runs
+ * everywhere and answers the question CI cannot: does the data layer work on
+ * this machine?
  *
  * Nothing touches the user's own database: the checks run in a temporary
  * directory that is removed at the end.

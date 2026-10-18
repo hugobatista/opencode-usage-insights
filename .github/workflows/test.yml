@@ -18,12 +18,8 @@ permissions:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: test
+    runs-on: ubuntu-latest
 
     steps:
       - name: Echo current date and time
@@ -47,37 +43,17 @@ jobs:
       - name: Type check
         run: bun run typecheck
 
-      # The plugin runs wherever OpenCode runs: the data layer (paths, database,
-      # recorder, queries, panel assembly, dump round-trip, file permissions)
-      # is exercised on every OS, against a throwaway database.
+      # The data layer (paths, database, recorder, queries, panel assembly, dump
+      # round-trip, file permissions) against a throwaway database. The script
+      # is also the cross-platform check: it has no rendering dependency, so it
+      # runs on the machine the plugin actually runs on.
       - name: Platform check
         run: bun run check:platform
 
-      # The rendering tests drive the TUI's native stack (OpenTUI), which CI
-      # only has on Linux; every other test file is platform-independent and
-      # runs everywhere. Ubuntu runs the whole suite.
-      - name: Run tests (full, Linux)
-        if: runner.os == 'Linux'
+      # The whole suite, rendering tests included: the TUI's native stack
+      # (OpenTUI) is here.
+      - name: Run tests
         run: bun test
 
-      - name: Run tests (data layer, other systems)
-        if: runner.os != 'Linux'
-        shell: bash
-        run: |
-          bun test \
-            test/core.test.ts \
-            test/db.test.ts \
-            test/endpoint.test.ts \
-            test/line.test.ts \
-            test/maintenance.test.ts \
-            test/panel-build.test.ts \
-            test/panel-data.test.ts \
-            test/paths.test.ts \
-            test/recorder.test.ts \
-            test/reports.test.ts \
-            test/stats.test.ts \
-            test/text.test.ts
-
       - name: Bench the read paths
-        if: runner.os == 'Linux'
         run: bun run bench --budget
