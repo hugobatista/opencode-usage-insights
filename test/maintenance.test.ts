@@ -45,7 +45,7 @@ describe("dbInfo", () => {
 
   test("reports the size of the file and its write-ahead log", () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-insights-db-"))
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       const db = openStatsDb(path)
       recordStep(db, { messageID: "a1", sessionID: "s1", input: 10, createdAt: NOW, completedAt: NOW + 1 })
@@ -99,7 +99,7 @@ describe("pruneOlderThan", () => {
 describe("vacuum", () => {
   test("gives the space a prune freed back to the filesystem", () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-insights-vacuum-"))
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       const db = openStatsDb(path)
       for (let index = 0; index < 400; index += 1) {

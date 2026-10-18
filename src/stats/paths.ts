@@ -6,15 +6,19 @@ import { statSync } from "node:fs"
  * SQLite database used when no `db` option is configured: the per-user state
  * directory of the current OS, never a shared temp directory.
  *
- * - Windows: `%LOCALAPPDATA%\opencode\stats\stats.db`
- * - macOS: `~/Library/Application Support/opencode/stats/stats.db`
- * - Linux/other: `$XDG_STATE_HOME/opencode/stats/stats.db`, falling back to
- *   `~/.local/state/opencode/stats/stats.db`
+ * The subdirectory is the plugin's package name, never a generic one: the
+ * `opencode` tree is shared with OpenCode itself and with every other plugin,
+ * so a `stats/` of our own would be a collision waiting to happen.
+ *
+ * - Windows: `%LOCALAPPDATA%\opencode\opencode-usage-insights\usage.db`
+ * - macOS: `~/Library/Application Support/opencode/opencode-usage-insights/usage.db`
+ * - Linux/other: `$XDG_STATE_HOME/opencode/opencode-usage-insights/usage.db`,
+ *   falling back to `~/.local/state/opencode/opencode-usage-insights/usage.db`
  *
  * Pure by design so every OS can be asserted from any machine.
  */
 export function defaultDbPath(env: Record<string, string | undefined> = process.env, platform: string = process.platform): string {
-  const name = join("opencode", "stats", "stats.db")
+  const name = join("opencode", "opencode-usage-insights", "usage.db")
   if (platform === "win32") {
     return join(env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), name)
   }

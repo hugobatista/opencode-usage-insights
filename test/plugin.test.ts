@@ -12,7 +12,7 @@ import { createHarness, pluginModule as mod, type RuntimeMessage, type RuntimeMo
 // Isolate the stats database: the plugin resolves its path on first use, so
 // the escape hatch must be set before any harness reads the line.
 const stateDir = mkdtempSync(join(tmpdir(), "usage-insights-"))
-process.env.OPENCODE_USAGE_INSIGHTS_DB = join(stateDir, "stats.db")
+process.env.OPENCODE_USAGE_INSIGHTS_DB = join(stateDir, "usage.db")
 
 const at = (seconds: number) => 1_800_000_000_000 + seconds * 1_000
 

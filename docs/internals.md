@@ -11,11 +11,11 @@ The recorder writes to the per-user state directory of the current OS:
 
 | OS | Path |
 | --- | --- |
-| Linux / other | `$XDG_STATE_HOME/opencode/stats/stats.db` (default `~/.local/state/opencode/stats/stats.db`) |
-| macOS | `~/Library/Application Support/opencode/stats/stats.db` |
-| Windows | `%LOCALAPPDATA%\opencode\stats\stats.db` |
+| Linux / other | `$XDG_STATE_HOME/opencode/opencode-usage-insights/usage.db` (default `~/.local/state/opencode/opencode-usage-insights/usage.db`) |
+| macOS | `~/Library/Application Support/opencode/opencode-usage-insights/usage.db` |
+| Windows | `%LOCALAPPDATA%\opencode\opencode-usage-insights\usage.db` |
 
-`OPENCODE_USAGE_INSIGHTS_DB=/path/to/stats.db` overrides the path, and the
+`OPENCODE_USAGE_INSIGHTS_DB=/path/to/usage.db` overrides the path, and the
 `db` option overrides both. The database is opened with `journal_mode = WAL`, so
 the TUI process (reader) and the server process (writer) never block each other.
 Every write is an upsert keyed by message id, which makes recording idempotent:

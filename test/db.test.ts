@@ -44,7 +44,7 @@ describe("schema", () => {
 
   test("folds endpoint spellings recorded before the rule into lowercase", () => {
     const directory = tempDir("router-case")
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       // A database from before the normalization: version 6, mixed-case router.
       const first = openStatsDb(path)
@@ -68,7 +68,7 @@ describe("schema", () => {
 describe("opening modes", () => {
   test("the reader never creates the file", () => {
     const directory = tempDir("readonly-missing")
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       expect(() => openStatsDbReadOnly(path)).toThrow()
       expect(() => statSync(path)).toThrow()
@@ -92,7 +92,7 @@ describe("opening modes", () => {
 
   test("the reader reads what the recorder wrote, without writing anything", () => {
     const directory = tempDir("readonly")
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       const writer = openStatsDb(path)
       recordStep(writer, { messageID: "r1", sessionID: "ses", modelID: "m", input: 10, recordedAt: BASE })
@@ -110,7 +110,7 @@ describe("opening modes", () => {
 
   test("the maintenance connection fails fast and does not build the schema", () => {
     const directory = tempDir("write")
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       const handle = openStatsDbWrite(path)
       expect((handle.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(250)
@@ -124,7 +124,7 @@ describe("opening modes", () => {
 
   test("writes take the lock with a short wait, not five seconds", () => {
     const directory = tempDir("busy")
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       const writer = openStatsDb(path)
       const blocker = openStatsDb(path)
@@ -145,12 +145,12 @@ describe("opening modes", () => {
 
   test.skipIf(!POSIX)("the database and its directory are private to the user", () => {
     const directory = tempDir("permissions")
-    const path = join(directory, "stats", "stats.db")
+    const path = join(directory, "opencode-usage-insights", "usage.db")
     try {
       const db = openStatsDb(path)
       recordStep(db, { messageID: "p1", sessionID: "ses", recordedAt: BASE })
       expect(statSync(path).mode & 0o777).toBe(0o600)
-      expect(statSync(join(directory, "stats")).mode & 0o777).toBe(0o700)
+      expect(statSync(join(directory, "opencode-usage-insights")).mode & 0o777).toBe(0o700)
       db.close()
       // A database left readable by a previous version is tightened on open.
       chmodSync(path, 0o644)

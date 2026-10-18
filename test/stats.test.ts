@@ -466,7 +466,7 @@ describe("stats db migrations", () => {
 
   test("an older database loses the columns, the table and the events no view reads", () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-insights-legacy-"))
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     try {
       legacyDb(path)
       const db = openStatsDb(path)

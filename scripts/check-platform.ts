@@ -52,7 +52,7 @@ function assert(condition: boolean, message: string): void {
 
 function main(): void {
   const directory = mkdtempSync(join(tmpdir(), "usage-insights-check-"))
-  const path = join(directory, "stats.db")
+  const path = join(directory, "usage.db")
   process.stdout.write(`opencode-usage-insights · platform check\n  ${process.platform} ${process.arch} · bun ${Bun.version} · home ${homedir()}\n\n`)
 
   try {

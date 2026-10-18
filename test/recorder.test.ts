@@ -196,7 +196,7 @@ describe("recorder endpoint discovery", () => {
 describe("recorder under a locked database", () => {
   test("defers the write instead of waiting for the lock", () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-insights-recorder-"))
-    const path = join(directory, "stats.db")
+    const path = join(directory, "usage.db")
     const db = openStatsDb(path)
     // The recorder's connection waits a moment and then gives up: the test
     // should not have to wait five seconds to prove the point.

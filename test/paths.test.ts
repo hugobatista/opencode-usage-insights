@@ -15,23 +15,23 @@ describe("defaultDbPath", () => {
   test("linux honours XDG_STATE_HOME", () => {
     // The branch is Linux, the separator is the host's (`path.join` does the
     // joining), so the expectation joins too and holds wherever the suite runs.
-    expect(defaultDbPath({ XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "stats", "stats.db"))
+    expect(defaultDbPath({ XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "opencode-usage-insights", "usage.db"))
   })
 
   test("linux falls back to ~/.local/state", () => {
-    expect(defaultDbPath({}, "linux")).toBe(join(homedir(), ".local", "state", "opencode", "stats", "stats.db"))
+    expect(defaultDbPath({}, "linux")).toBe(join(homedir(), ".local", "state", "opencode", "opencode-usage-insights", "usage.db"))
   })
 
   test("macOS uses Application Support", () => {
-    expect(defaultDbPath({}, "darwin")).toBe(join(homedir(), "Library", "Application Support", "opencode", "stats", "stats.db"))
+    expect(defaultDbPath({}, "darwin")).toBe(join(homedir(), "Library", "Application Support", "opencode", "opencode-usage-insights", "usage.db"))
   })
 
   test("windows uses LOCALAPPDATA", () => {
-    expect(defaultDbPath({ LOCALAPPDATA: "C:/AppData" }, "win32")).toBe(join("C:/AppData", "opencode", "stats", "stats.db"))
+    expect(defaultDbPath({ LOCALAPPDATA: "C:/AppData" }, "win32")).toBe(join("C:/AppData", "opencode", "opencode-usage-insights", "usage.db"))
   })
 
   test("windows falls back to the home directory", () => {
-    expect(defaultDbPath({}, "win32")).toBe(join(homedir(), "AppData", "Local", "opencode", "stats", "stats.db"))
+    expect(defaultDbPath({}, "win32")).toBe(join(homedir(), "AppData", "Local", "opencode", "opencode-usage-insights", "usage.db"))
   })
 })
 
@@ -39,21 +39,21 @@ describe("resolveDbPath", () => {
   test("precedence: option, env, default", () => {
     expect(resolveDbPath("/custom.db", { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/custom.db")
     expect(resolveDbPath(undefined, { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/env.db")
-    expect(resolveDbPath(undefined, { XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "stats", "stats.db"))
+    expect(resolveDbPath(undefined, { XDG_STATE_HOME: "/x" }, "linux")).toBe(join("/x", "opencode", "opencode-usage-insights", "usage.db"))
   })
 
   test("expands a leading ~ in every source", () => {
     const home = join(sep, "home", "someone")
-    expect(resolveDbPath("~/stats.db", { HOME: home }, "linux")).toBe(join(home, "stats.db"))
+    expect(resolveDbPath("~/usage.db", { HOME: home }, "linux")).toBe(join(home, "usage.db"))
     expect(resolveDbPath(undefined, { HOME: home, OPENCODE_USAGE_INSIGHTS_DB: "~/env.db" }, "linux")).toBe(join(home, "env.db"))
     // A Windows configuration uses the backslash form.
-    expect(resolveDbPath("~\\stats.db", { HOME: home }, "linux")).toBe(join(home, "stats.db"))
+    expect(resolveDbPath("~\\usage.db", { HOME: home }, "linux")).toBe(join(home, "usage.db"))
     // A `~` in the middle of a path is a literal character, not a home.
-    expect(resolveDbPath("/tmp/~stats.db", { HOME: home }, "linux")).toBe("/tmp/~stats.db")
+    expect(resolveDbPath("/tmp/~usage.db", { HOME: home }, "linux")).toBe("/tmp/~usage.db")
   })
 
   test("uses USERPROFILE when HOME is unset", () => {
-    expect(resolveDbPath("~/stats.db", { USERPROFILE: "C:/Users/dev" }, "win32")).toBe(join("C:/Users/dev", "stats.db"))
+    expect(resolveDbPath("~/usage.db", { USERPROFILE: "C:/Users/dev" }, "win32")).toBe(join("C:/Users/dev", "usage.db"))
   })
 })
 
@@ -75,7 +75,7 @@ describe("ensureRegularFile", () => {
   })
 
   test("accepts a regular file, and a symlink to one", () => {
-    const file = join(directory, "stats.db")
+    const file = join(directory, "usage.db")
     writeFileSync(file, "")
     expect(() => ensureRegularFile(file)).not.toThrow()
     // Creating a symlink needs a privilege Windows only grants with developer

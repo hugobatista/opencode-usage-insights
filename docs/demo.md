@@ -198,7 +198,7 @@ Docs pass  07:20:31 · Δ 20m00s · orcarouter-dsv4.1-flash-free · in 8.6k (410
 
 /usage db
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-/tmp/usage-insights-demo-3RPeI8/stats.db
+/tmp/usage-insights-demo-3RPeI8/usage.db
 0.0 MB + 0.5 MB wal · schema v8
 
 what it holds

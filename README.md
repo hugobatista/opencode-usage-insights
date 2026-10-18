@@ -250,11 +250,11 @@ The recorder writes to the per-user state directory:
 
 | OS | Path |
 | --- | --- |
-| Linux / other | `$XDG_STATE_HOME/opencode/stats/stats.db` (default `~/.local/state/opencode/stats/stats.db`) |
-| macOS | `~/Library/Application Support/opencode/stats/stats.db` |
-| Windows | `%LOCALAPPDATA%\opencode\stats\stats.db` |
+| Linux / other | `$XDG_STATE_HOME/opencode/opencode-usage-insights/usage.db` (default `~/.local/state/opencode/opencode-usage-insights/usage.db`) |
+| macOS | `~/Library/Application Support/opencode/opencode-usage-insights/usage.db` |
+| Windows | `%LOCALAPPDATA%\opencode\opencode-usage-insights\usage.db` |
 
-`OPENCODE_USAGE_INSIGHTS_DB=/path/to/stats.db` overrides the path, and the `db`
+`OPENCODE_USAGE_INSIGHTS_DB=/path/to/usage.db` overrides the path, and the `db`
 option overrides both. The file is private to the user: its directory is created
 `0700` and the file `0600` (POSIX), re-applied on every open. The TUI reads
 through a read-only connection, so it can never write, migrate or take the

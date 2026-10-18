@@ -31,7 +31,7 @@ export type DemoDatabase = { db: Database; root: string; path: string; now: numb
 /** Open a throwaway database with the sessions, prompts and steps of the demo. */
 export function openDemoDatabase(): DemoDatabase {
   const root = mkdtempSync(join(tmpdir(), "usage-insights-demo-"))
-  const path = join(root, "stats.db")
+  const path = join(root, "usage.db")
   const db = openStatsDb(path)
   const at = demoAt
 
