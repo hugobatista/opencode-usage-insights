@@ -60,6 +60,18 @@ jobs:
       run: |
         ls -R dist/
 
+    - name: Package the release assets
+      run: |
+        version="${{ steps.get_version.outputs.version }}"
+        mkdir -p release-assets
+        # The tarball is what the npm registry serves: the package's own "files"
+        # list, packed by the same toolchain, with dist/stats/ in place.
+        bun pm pack --ignore-scripts --destination release-assets
+        # The zip is the hand-download form.
+        zip -r "release-assets/dist-v$version.zip" dist
+        (cd release-assets && sha256sum opencode-usage-insights-*.tgz dist-v*.zip > "v$version.sha256")
+        ls -l release-assets
+
     - name: Archive all artifacts in dist/
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
@@ -89,7 +101,6 @@ jobs:
           echo "release $tag is already published" >&2
           exit 1
         fi
-        # Files only: `dist/*` handed gh the `dist/stats/` directory, which it
-        # tried to read as an asset. Nested declarations upload under their
-        # basename, and no two files in dist/ share one.
-        find dist -type f -print0 | xargs -0 gh release upload "$tag" --clobber
+        # The archives only: a loose file per module made the release page a
+        # list of twenty downloads, and gh refuses a directory anyway.
+        find release-assets -maxdepth 1 -type f -print0 | xargs -0 gh release upload "$tag" --clobber
