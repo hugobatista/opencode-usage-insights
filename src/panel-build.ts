@@ -1,27 +1,36 @@
 import type { Database } from "bun:sqlite"
 import { formatTokens } from "./core"
 import {
-  affinityReport,
-  cacheStats,
-  coverageReport,
-  gapReport,
-  groupBy,
-  latencyGroups,
-  modelKey,
-  periodReport,
-  periodStart,
-  endpointBreakdown,
-  endpointSummary,
-  stepFacts,
+  affinityOf,
+  cacheDropsOf,
+  cachePairs,
+  cacheStatsByModel,
+  cacheStatsOf,
+  coverageOf,
+  endpointBreakdownOf,
+  endpointSummaryOf,
+  gapReportOf,
+  latencyGroupsOf,
+  latencyOf,
+  periodsOf,
+  stepRows,
+  timingRows,
+  ttlEvidenceOf,
+  type AffinityReport,
   type CacheStats,
-  type Filters,
-  type StepFact,
-} from "./stats/insights"
-import { cacheDrops, cacheTtlEvidence, latency, models, overview, sessions, turns } from "./stats/queries"
-import { STEP_TIME } from "./stats/insights"
+  type EndpointRow,
+  type StepRow,
+  type EndpointSummary,
+  type Dimension,
+  type LatencyGroupRow,
+} from "./stats/aggregates"
+import { childSessionIDs, modelKey, models, overview, sessionUsageOf, sessions, STEP_TIME, turns, type Filters } from "./stats/queries"
+import type { DbInfo } from "./stats/maintenance"
 import {
   affinityLines,
   cacheLines,
+  dbLines,
+  formatCount,
   latencyLines,
   modelsLines,
   overviewLines,
@@ -64,6 +73,10 @@ export type PanelRequest = {
   format?: LineFormatOptions | undefined
   /** Drill-down target: when set, the panel shows this detail instead. */
   detail?: PanelRow | undefined
+  /** The database view's own state: where the file is and what it holds. */
+  database?: DbInfo | undefined
+  /** Set when the last vacuum could not take the write lock. */
+  busy?: boolean | undefined
   width: number
 }
 
@@ -102,10 +115,12 @@ export function detailLabel(row: PanelRow): string {
       return `session ${row.value}`
     case "period":
       return `period ${row.value}`
-    case "operator":
+    case "endpoint":
       return `endpoint ${row.value}`
     case "provider":
       return `provider ${row.value}`
+    case "prune":
+      return `prune older than ${row.value} days`
   }
 }
 
@@ -126,8 +141,7 @@ function build(request: PanelRequest): PanelLine[] {
   const scoped = request.range === "session" && request.sessionID !== ""
   const range = scoped ? undefined : request.range === "session" ? (sessionStart === undefined ? undefined : { from: sessionStart }) : rangeForRequest(request.range, now)
   const filters: Filters = scoped ? { ...request.filters, sessionID: request.sessionID } : request.filters
-  const facts = stepFacts(db, { range, filters, withPredecessor: true })
-  if (request.detail !== undefined) return buildDetail(request, facts, range)
+  if (request.detail !== undefined) return buildDetail(request, range, filters)
 
   switch (view) {
     case "overview": {
@@ -136,8 +150,8 @@ function build(request: PanelRequest): PanelLine[] {
         request.sessionID === "" ? undefined : overview(db, undefined, { ...request.filters, sessionID: request.sessionID })
       // Subagents are their own sessions; showing them apart explains why the
       // line's `sess` segment (one session) is smaller than the whole family.
-      const children =
-        request.sessionID === "" ? [] : sessions(db, { limit: 500 }).filter((row) => row.parentID === request.sessionID)
+      const childIDs = request.sessionID === "" ? [] : childSessionIDs(db, request.sessionID)
+      const children = childIDs.length === 0 ? [] : sessionUsageOf(db, childIDs)
       return overviewLines(
         {
           usage,
@@ -145,43 +159,51 @@ function build(request: PanelRequest): PanelLine[] {
           ...(children.length > 0 ? { subagents: children } : {}),
           range: request.range,
           activity: activityOf(db, range, now),
-          coverage: coverageReport(facts),
+          coverage: coverageOf(db, { range, filters }),
         },
         width,
       )
     }
     case "models": {
       const rows = sortModels(models(db, range, filters), request.sort, request.sortDesc)
-      const affinity = affinityReport(facts)
+      // One read of the pairs serves the reuse table and the change counts.
+      const pairs = cachePairs(db, { range, filters })
+      const affinity = affinityOf(pairs)
       return modelsLines(
         rows,
         width,
         {
-          cache: cacheByModel(facts),
+          cache: cacheByModel(pairs),
           changes: new Map(affinity.rows.map((row) => [modelKey(row.modelID, row.variant), row.changes])),
         },
         40,
       )
     }
     case "endpoints":
-      return endpointSummaryLines(sortEndpoints(endpointSummary(facts), request.sort, request.sortDesc), width, 40)
+      return endpointSummaryLines(sortEndpoints(endpointSummaryOf(stepRows(db, { range, filters })), request.sort, request.sortDesc), width, 40)
     case "affinity":
-      return affinityLines(sortAffinity(affinityReport(facts), request.sort, request.sortDesc), width, 40)
-    case "cache":
+      return affinityLines(sortAffinity(affinityOf(cachePairs(db, { range, filters })), request.sort, request.sortDesc), width, 40)
+    case "cache": {
+      // One read of the pairs serves the losses, the TTL bounds and the
+      // survival buckets: they are three views of the same comparison.
+      const pairs = cachePairs(db, { range, filters })
       return cacheLines(
         {
-          drops: cacheDrops(db, { range, filters }),
-          evidence: cacheTtlEvidence(db, { range, filters }),
-          gap: gapReport(facts),
-          models: topCacheModels(facts),
+          drops: cacheDropsOf(db, pairs),
+          evidence: ttlEvidenceOf(pairs),
+          gap: gapReportOf(pairs),
+          models: topCacheModels(pairs),
         },
         width,
       )
+    }
     case "periods":
-      return periodLines(periodReport(facts, request.granularity), width, request.granularity, 40)
+      return periodLines(periodsOf(stepRows(db, { range, filters }), request.granularity), width, request.granularity, 40)
     case "latency": {
-      const by = filters.modelID !== undefined ? "operator" : "model"
-      return latencyLines(latency(db, range, filters), width, sortLatency(latencyGroups(facts, by), request.sort, request.sortDesc), 14)
+      // One read of the timings serves the overall block and the group table.
+      const timings = timingRows(db, { range, filters })
+      const by: Dimension = filters.modelID !== undefined ? "endpoint" : "model"
+      return latencyLines(latencyOf(timings), width, sortLatency(latencyGroupsOf(timings, by), request.sort, request.sortDesc), 14)
     }
     case "sessions": {
       const rows = sortSessions(sessions(db, { range, filters, limit: 200 }), request.sort, request.sortDesc)
@@ -191,6 +213,12 @@ function build(request: PanelRequest): PanelLine[] {
         rollup: { subagentSteps: child.reduce((sum, row) => sum + row.steps, 0), subagentCost: child.reduce((sum, row) => sum + row.cost, 0) },
       })
     }
+    case "db":
+      // The path and the file's size are the panel's, not the database's: a
+      // builder without them says so instead of inventing a location.
+      return request.database === undefined
+        ? [{ text: "the database location is unavailable to this panel", tone: "warning" }]
+        : dbLines({ info: request.database, busy: request.busy }, width)
     case "turns": {
       const sessionID = request.turnsScope === "session" ? request.sessionID : undefined
       const rows = sortTurns(turns(db, { sessionID, range, filters, limit: 300 }), request.sort, request.sortDesc)
@@ -223,61 +251,78 @@ function rangeForRequest(key: RangeKey, now: number): { from?: number | undefine
 // Detail screens
 // ---------------------------------------------------------------------------
 
-function buildDetail(request: PanelRequest, facts: StepFact[], range: { from?: number | undefined; to?: number | undefined } | undefined): PanelLine[] {
+function buildDetail(
+  request: PanelRequest,
+  range: { from?: number | undefined; to?: number | undefined } | undefined,
+  filters: Filters,
+): PanelLine[] {
   const row = request.detail!
+  const db = request.db
   const width = request.width
   const head: PanelLine = { text: detailLabel(row), tone: "accent" }
   const back: PanelLine = { text: "backspace returns · the header shows where you came from", tone: "muted" }
 
   if (row.kind === "model") {
-    const key = modelKey(row.value, row.variant)
-    const scoped = facts.filter((fact) => modelKey(fact.modelID ?? "(unknown)", fact.variant) === key)
-    const stats = cacheStats(scoped)
+    // The identity is the model *and* its variant: the variant is a different
+    // model for the provider, so it gets its own detail.
+    const scoped: Filters = { ...filters, modelKey: modelKey(row.value, row.variant) }
+    const stats = cacheStatsOf(db, { range, filters: scoped })
     return [
       head,
       {
         // The same buckets as the line and the views: `in` is uncached (fresh +
         // writes) and `prompt` is everything the provider saw.
-        text: `steps ${scoped.length} · in ${formatTokens(stats.prompt - stats.cached)} · prompt ${formatTokens(stats.prompt)} · cached ${formatTokens(
+        text: `steps ${stats.steps} · in ${formatTokens(stats.prompt - stats.cached)} · prompt ${formatTokens(stats.prompt)} · cached ${formatTokens(
           stats.cached,
         )} · write ${formatTokens(stats.cacheWrite)} · hit ${percent(stats.hit)} · p50 ${percent(stats.hitP50)}`,
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...endpointsLines(endpointBreakdown(scoped), width, 40),
+      ...endpointsLines(endpointBreakdownOf(stepRows(db, { range, filters: scoped })), width, 40),
       { text: "", tone: "muted" },
-      ...affinityLines(affinityReport(scoped), width, 10),
+      ...affinityLines(affinityOf(cachePairs(db, { range, filters: scoped })), width, 10),
       { text: "", tone: "muted" },
       back,
     ]
   }
   if (row.kind === "session" || row.kind === "turn") {
-    const rows = turns(request.db, { sessionID: row.value, limit: 80 })
+    const rows = turns(db, { sessionID: row.value, limit: 80 })
     return [head, { text: "", tone: "muted" }, ...turnsLines(rows, width, request.format), { text: "", tone: "muted" }, back]
   }
-  if (row.kind === "operator") {
+  if (row.kind === "endpoint") {
     // An endpoint detail: every model that endpoint served, then its latency.
-    const scoped = facts.filter((fact) => fact.router === row.value)
-    const stats = cacheStats(scoped)
+    const scoped: Filters = { ...filters, router: row.value }
+    // One read of the steps serves the reuse line and the latency block.
+    const steps = stepRows(db, { range, filters: scoped })
+    const stats = cacheStatsOf(db, { range, filters: scoped })
     return [
       head,
       {
-        text: `steps ${scoped.length} · in ${formatTokens(stats.prompt - stats.cached)} · prompt ${formatTokens(stats.prompt)} · cached ${formatTokens(
+        text: `steps ${stats.steps} · in ${formatTokens(stats.prompt - stats.cached)} · prompt ${formatTokens(stats.prompt)} · cached ${formatTokens(
           stats.cached,
         )} · hit ${percent(stats.hit)} · p50 ${percent(stats.hitP50)}`,
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...endpointsLines(endpointBreakdown(scoped), width, 40),
+      ...endpointsLines(endpointBreakdownOf(steps), width, 40),
       { text: "", tone: "muted" },
-      ...latencyLines(latency(request.db, range, { ...request.filters, router: row.value }), width, latencyGroups(scoped, "model"), 14),
+      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "model"), 14),
       { text: "", tone: "muted" },
       back,
     ]
   }
   if (row.kind === "period") {
-    const bucket = facts.filter((fact) => periodStart(fact.at, request.granularity).key === row.value)
-    return [head, { text: `${bucket.length} steps`, tone: "muted" }, { text: "", tone: "muted" }, ...endpointSummaryLines(endpointSummary(bucket), width, 40), { text: "", tone: "muted" }, back]
+    // The bucket is one row of the period report: the same query, one row kept.
+    const periods = periodsOf(stepRows(db, { range, filters }), request.granularity)
+    const period = periods.find((entry) => entry.key === row.value)
+    return [
+      head,
+      { text: `${formatCount(period?.steps ?? 0)} steps`, tone: "muted" },
+      { text: "", tone: "muted" },
+      ...endpointSummaryLines(endpointSummaryOf(stepRows(db, { range, filters })), width, 40),
+      { text: "", tone: "muted" },
+      back,
+    ]
   }
   return [head, back]
 }
@@ -301,7 +346,7 @@ function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortEndpoints(rows: ReturnType<typeof endpointSummary>, sort: string, desc: boolean): ReturnType<typeof endpointSummary> {
+function sortEndpoints(rows: readonly EndpointSummary[], sort: string, desc: boolean): EndpointSummary[] {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "cached") return row.cache.cached
@@ -314,7 +359,7 @@ function sortEndpoints(rows: ReturnType<typeof endpointSummary>, sort: string, d
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortAffinity(report: ReturnType<typeof affinityReport>, sort: string, desc: boolean): ReturnType<typeof affinityReport> {
+function sortAffinity(report: AffinityReport, sort: string, desc: boolean): AffinityReport {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof report.rows)[number]): number => {
     if (sort === "lost") return row.cacheLost
@@ -324,7 +369,7 @@ function sortAffinity(report: ReturnType<typeof affinityReport>, sort: string, d
   return { ...report, rows: [...report.rows].sort((left, right) => sign * (pick(right) - pick(left))) }
 }
 
-function sortLatency(rows: ReturnType<typeof latencyGroups>, sort: string, desc: boolean): ReturnType<typeof latencyGroups> {
+function sortLatency(rows: readonly LatencyGroupRow[], sort: string, desc: boolean): LatencyGroupRow[] {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "tps") return row.tps.p50 ?? -1
@@ -360,20 +405,19 @@ function sortTurns(rows: ReturnType<typeof turns>, sort: string, desc: boolean):
 // ---------------------------------------------------------------------------
 
 /** Token reuse per model, for the models view and the cache view. */
-export function cacheByModel(facts: readonly StepFact[]): Map<string, CacheStats> {
-  const groups = groupBy(facts, (fact) => modelKey(fact.modelID ?? "(unknown)", fact.variant))
+export function cacheByModel(pairs: readonly StepRow[]): Map<string, CacheStats> {
   const map = new Map<string, CacheStats>()
-  for (const [key, group] of groups) map.set(key, cacheStats(group))
+  for (const row of cacheStatsByModel(pairs)) {
+    map.set(modelKey(row.modelID, row.variant), row.cache)
+  }
   return map
 }
 
-function topCacheModels(facts: readonly StepFact[]): CacheModelRow[] {
-  const groups = groupBy(facts, (fact) => modelKey(fact.modelID ?? "(unknown)", fact.variant))
-  const rows: CacheModelRow[] = [...groups.values()].map((group) => {
-    const first = group[0]!
-    return { usage: { modelID: first.modelID ?? "(unknown)", variant: first.variant }, cache: cacheStats(group) }
-  })
-  return rows.sort((left, right) => right.cache.cached - left.cache.cached).slice(0, 10)
+/** The cache table of the cache view: the models holding the most cache. */
+function topCacheModels(pairs: readonly StepRow[]): CacheModelRow[] {
+  return cacheStatsByModel(pairs)
+    .slice(0, 10)
+    .map((row) => ({ usage: { modelID: row.modelID, variant: row.variant }, cache: row.cache }))
 }
 
 /**

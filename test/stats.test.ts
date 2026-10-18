@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { homedir, tmpdir } from "node:os"
+import { tmpdir } from "node:os"
 import {
   SCHEMA_VERSION,
   exportNdjson,
@@ -11,17 +11,14 @@ import {
   recordEvent,
   recordPrompt,
   recordStep,
-  setUpstream,
+  setStepRouter,
   upsertSession,
   type StepRecord,
 } from "../src/stats/db"
-import { defaultDbPath, resolveDbPath } from "../src/stats/paths"
+import { cacheDropsOf, cachePairs, latencyOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
 import {
-  cacheDrops,
   cacheHitRatio,
-  cacheTtlEvidence,
-  latency,
-  latestUpstream,
+  latestRouter,
   models,
   overview,
   percentile,
@@ -80,31 +77,13 @@ function seed(): Database {
   return db
 }
 
-describe("stats paths", () => {
-  test("linux honours XDG_STATE_HOME", () => {
-    expect(defaultDbPath({ XDG_STATE_HOME: "/x" }, "linux")).toBe("/x/opencode/stats/stats.db")
-  })
-  test("linux falls back to ~/.local/state", () => {
-    expect(defaultDbPath({}, "linux")).toBe(join(homedir(), ".local", "state", "opencode", "stats", "stats.db"))
-  })
-  test("macOS uses Application Support", () => {
-    expect(defaultDbPath({}, "darwin")).toBe(join(homedir(), "Library", "Application Support", "opencode", "stats", "stats.db"))
-  })
-  test("windows uses LOCALAPPDATA", () => {
-    expect(defaultDbPath({ LOCALAPPDATA: "C:/AppData" }, "win32")).toBe(join("C:/AppData", "opencode", "stats", "stats.db"))
-  })
-  test("resolveDbPath precedence: option, env, default", () => {
-    expect(resolveDbPath("/custom.db", { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/custom.db")
-    expect(resolveDbPath(undefined, { OPENCODE_USAGE_INSIGHTS_DB: "/env.db", XDG_STATE_HOME: "/x" }, "linux")).toBe("/env.db")
-    expect(resolveDbPath(undefined, { XDG_STATE_HOME: "/x" }, "linux")).toBe("/x/opencode/stats/stats.db")
-  })
-})
-
 describe("stats db", () => {
   test("creates the schema in memory", () => {
     const db = freshDb()
     const tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[]
-    expect(tables.map((t) => t.name)).toEqual(expect.arrayContaining(["events", "http_responses", "meta", "prompts", "sessions", "steps"]))
+    expect(tables.map((t) => t.name)).toEqual(expect.arrayContaining(["events", "meta", "prompts", "sessions", "steps"]))
+    // Only what a view reads is created.
+    expect(tables.map((t) => t.name)).not.toContain("http_responses")
   })
 
   test("recordStep is idempotent by message id", () => {
@@ -115,23 +94,31 @@ describe("stats db", () => {
     expect(rows).toEqual([{ message_id: "a1", input_tokens: 20, output_tokens: 2, created_at: 6 }])
   })
 
-  test("recordStep keeps previously discovered fields when re-recorded empty", () => {
+  test("recordStep keeps the endpoint when re-recorded empty", () => {
     const db = freshDb()
-    recordStep(db, { messageID: "a1", sessionID: "s1", upstream: "DeepInfra", upstreamSource: "header:x-served-by", providerState: { route: "go" } })
+    recordStep(db, { messageID: "a1", sessionID: "s1", router: "orcarouter-dsv4.1flash" })
     recordStep(db, { messageID: "a1", sessionID: "s1", input: 5 })
-    const row = db.query("SELECT input_tokens, upstream, upstream_source, provider_state FROM steps").get() as Record<string, unknown>
-    expect(row.input_tokens).toBe(5)
-    expect(row.upstream).toBe("DeepInfra")
-    expect(row.upstream_source).toBe("header:x-served-by")
-    expect(row.provider_state).toBe('{"route":"go"}')
+    const row = db.query("SELECT input_tokens, router FROM steps").get() as Record<string, unknown>
+    expect(row).toEqual({ input_tokens: 5, router: "orcarouter-dsv4.1flash" })
   })
 
-  test("setUpstream attaches the operator after the fact", () => {
+  test("setStepRouter attaches the endpoint after the fact", () => {
     const db = freshDb()
     recordStep(db, { messageID: "a1", sessionID: "s1" })
-    setUpstream(db, "a1", { operator: "Together", source: "header:x-served-by", model: "together/llama", router: "opencode" })
-    const row = db.query("SELECT upstream, upstream_source, upstream_model, router FROM steps").get() as Record<string, unknown>
-    expect(row).toEqual({ upstream: "Together", upstream_source: "header:x-served-by", upstream_model: "together/llama", router: "opencode" })
+    setStepRouter(db, "a1", { router: "opencode", source: "endpoint:opencode.ai" })
+    const row = db.query("SELECT router FROM steps").get() as Record<string, unknown>
+    expect(row).toEqual({ router: "opencode" })
+  })
+
+  test("drops the columns and tables no view reads", () => {
+    const db = freshDb()
+    const columns = (db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
+    for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"]) {
+      expect(columns).not.toContain(gone)
+    }
+    const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name)
+    expect(tables).not.toContain("http_responses")
+    db.close()
   })
 
   test("recordPrompt is idempotent per session", () => {
@@ -218,11 +205,11 @@ describe("stats queries", () => {
     expect(second!.totals.steps).toBe(3)
   })
 
-  test("models reports upstream operators grouped per provider", () => {
+  test("models reports the endpoints grouped per provider", () => {
     const db = seed()
-    setUpstream(db, "a1", { operator: "DeepInfra", source: "header:x-served-by" })
+    setStepRouter(db, "a1", { router: "orcarouter-dsv4.1flash", source: "header:x-opencode-endpoint-id" })
     const rows = models(db)
-    expect(rows[0]!.providers[0]!.upstreams).toEqual(["DeepInfra"])
+    expect(rows[0]!.providers[0]!.routers).toEqual(["orcarouter-dsv4.1flash"])
   })
 
   test("timeline buckets usage by fixed windows", () => {
@@ -234,7 +221,8 @@ describe("stats queries", () => {
   })
 
   test("cacheDrops classifies reuse loss", () => {
-    const drops = cacheDrops(seed())
+    const db = seed()
+    const drops = cacheDropsOf(db, cachePairs(db))
     expect(drops).toHaveLength(4)
     expect(drops.map((d) => d.messageID)).toEqual(["a2", "b2", "a3", "a4"])
 
@@ -245,19 +233,22 @@ describe("stats queries", () => {
   })
 
   test("cacheDrops calls a loss after a compaction a compaction", () => {
-    const drops = cacheDrops(seed(), { ttlHintMs: 600_000 })
+    const db = seed()
+    const drops = cacheDropsOf(db, cachePairs(db), { ttlHintMs: 600_000 })
     const a4 = drops.find((d) => d.messageID === "a4")!
     expect(a4).toMatchObject({ tokens: 50_000, gapMs: 599_000, reason: "compaction" })
   })
 
   test("cacheDrops respects the range on the loss itself", () => {
+    const db = seed()
     const range: Range = { from: 500_000, to: 1_600_000 }
-    const drops = cacheDrops(seed(), { range })
+    const drops = cacheDropsOf(db, cachePairs(db, { range }))
     expect(drops.map((d) => d.messageID)).toEqual(["a2", "b2"])
   })
 
   test("cacheTtlEvidence bounds the provider cache TTL", () => {
-    const evidence = cacheTtlEvidence(seed())
+    const db = seed()
+    const evidence = ttlEvidenceOf(cachePairs(db))
     const m1 = evidence.find((row) => row.modelID === "m1")!
     expect(m1).toMatchObject({ providerID: "opencode", samples: 3, minDropGapMs: 8_800 })
     expect(m1.maxHitGapMs).toBeUndefined()
@@ -267,12 +258,15 @@ describe("stats queries", () => {
   })
 
   test("latency percentiles", () => {
-    const report = latency(seed())
+    const db = seed()
+    const report = latencyOf(stepRows(db))
     expect(report.wall).toEqual({ count: 7, p50: 1_000, p90: 10_000, p99: 10_000 })
     expect(report.stream).toEqual({ count: 7, p50: 300, p90: 400, p99: 400 })
     expect(report.tps.count).toBe(7)
-    expect(report.tps.p50!).toBeCloseTo(125, 6)
-    expect(report.tps.p90!).toBeCloseTo(250, 6)
+    // Throughput is measured over the streaming window (request to last
+    // chunk), not over the tool calls a step made after it.
+    expect(report.tps.p50!).toBeCloseTo(500, 6)
+    expect(report.tps.p90!).toBeCloseTo(4_500, 6)
   })
 
   test("percentile uses nearest rank", () => {
@@ -328,22 +322,16 @@ describe("stats queries", () => {
       providerID: "opencode",
       modelID: "m1",
       createdAt: 1_000,
-      upstream: "Fireworks",
-      upstreamSource: "header:x-served-by",
-      upstreamModel: "fireworks/deepseek-v4.1-flash",
       router: "orcarouter-dsv4.1flash",
       recordedAt: 1_000,
     })
-    recordStep(db, { messageID: "u2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 2_000, upstream: "DeepSeek", upstreamSource: "header:x-opencode-upstream-model-id", upstreamModel: "deepseek/deepseek-v4.1-flash", recordedAt: 2_000 })
+    recordStep(db, { messageID: "u2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 2_000, router: "siliconflow", recordedAt: 2_000 })
     recordStep(db, { messageID: "u3", sessionID: "s1", providerID: "opencode", modelID: "m2", createdAt: 3_000, recordedAt: 3_000 })
 
-    expect(latestUpstream(db, "s1", "m1")).toEqual({
-      operator: "DeepSeek",
-      model: "deepseek/deepseek-v4.1-flash",
-      router: "orcarouter-dsv4.1flash",
-    })
-    expect(latestUpstream(db, "s1", "m2")).toBeUndefined()
-    expect(latestUpstream(db, "s9", "m1")).toBeUndefined()
+    // The newest endpoint for the pair, which is what the line reports.
+    expect(latestRouter(db, "s1", "m1")).toBe("siliconflow")
+    expect(latestRouter(db, "s1", "m2")).toBeUndefined()
+    expect(latestRouter(db, "s9", "m1")).toBeUndefined()
   })
 })
 
@@ -355,7 +343,7 @@ describe("turns", () => {
     recordPrompt(db, { sessionID: "s1", messageID: "p2", createdAt: 5_000 })
     recordPrompt(db, { sessionID: "s1", messageID: "p3", createdAt: 9_000 })
     // Turn 1: a tool call and the final answer.
-    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, completedAt: 1_200, finish: "tool-calls", cacheRead: 1_000, input: 20, output: 10, router: "router-a", upstream: "Fireworks", recordedAt: 1_200 })
+    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_100, completedAt: 1_200, finish: "tool-calls", cacheRead: 1_000, input: 20, output: 10, router: "router-a", recordedAt: 1_200 })
     recordStep(db, { messageID: "a2", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 1_500, completedAt: 1_600, finish: "stop", cacheRead: 900, input: 100, output: 50, router: "router-a", recordedAt: 1_600 })
     // Turn 2: a single step, served by another endpoint.
     recordStep(db, { messageID: "a3", sessionID: "s1", providerID: "opencode", modelID: "m1", createdAt: 5_100, completedAt: 5_200, finish: "stop", cacheRead: 200, input: 300, output: 60, router: "router-b", recordedAt: 5_200 })
@@ -395,7 +383,6 @@ describe("turns", () => {
     expect(single.providerChanged).toBe(false)
     const loop = rows.find((row) => row.promptAt === 1_000)!
     expect(loop.router).toBe("router-a")
-    expect(loop.upstream).toBe("Fireworks")
     expect(loop.routerChanged).toBe(false)
   })
 
@@ -409,7 +396,7 @@ describe("turns", () => {
 })
 
 describe("stats db migrations", () => {
-  /** A database shaped like the release before `tps` existed. */
+  /** A database shaped like the release that still wrote the unused columns. */
   function legacyDb(path: string): void {
     const db = new Database(path)
     db.exec(`
@@ -423,72 +410,59 @@ describe("stats db migrations", () => {
         input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
         cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0,
         created_at INTEGER, streamed_at INTEGER, completed_at INTEGER, finish TEXT, provider_state TEXT,
-        upstream TEXT, upstream_source TEXT, upstream_model TEXT, router TEXT, recorded_at INTEGER NOT NULL
+        upstream TEXT, upstream_source TEXT, upstream_model TEXT, router TEXT, tps REAL, recorded_at INTEGER NOT NULL
       );
+      CREATE INDEX steps_upstream ON steps(upstream);
     `)
-    db.query("INSERT INTO meta (key, value) VALUES ('schema_version', '2')").run()
+    db.query("INSERT INTO meta (key, value) VALUES ('schema_version', '4')").run()
     db.query(
-      "INSERT INTO steps (message_id, session_id, output_tokens, reasoning_tokens, created_at, streamed_at, completed_at, recorded_at) VALUES ($id, 's1', 100, 50, 500, 1000, 1500, 1500)",
-    ).run({ $id: "old_1" })
+      `INSERT INTO steps (message_id, session_id, output_tokens, reasoning_tokens, created_at, streamed_at, completed_at, provider_state, upstream, upstream_source, upstream_model, tps, router, recorded_at)
+       VALUES ('old_1', 's1', 100, 50, 500, 1000, 1500, '{"route":"go"}', 'DeepInfra', 'header:x-served-by', 'deepinfra/x', 300, 'orcarouter-dsv4.1flash', 1500)`,
+    ).run()
+    for (const kind of ["execution", "step-failed", "model-selected", "usage-recorded", "compaction"]) {
+      db.query("INSERT INTO events (session_id, kind, at) VALUES ('s1', $kind, 10)").run({ $kind: kind })
+    }
+    db.query("INSERT INTO http_responses (at, status, headers) VALUES (10, 200, '{\"server\":\"cloudflare\"}')").run()
     db.close()
   }
 
-  test("opens an older database, adds the new columns and backfills tokens per second", () => {
+  test("an older database loses the columns, the table and the events no view reads", () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-insights-legacy-"))
     const path = join(directory, "stats.db")
     try {
       legacyDb(path)
       const db = openStatsDb(path)
+
       const columns = (db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
-      expect(columns).toContain("tps")
-      expect(columns).toContain("upstream_model")
-      const row = db.query("SELECT message_id, tps, router FROM steps").get() as { message_id: string; tps: number | null; router: string | null }
-      expect(row.message_id).toBe("old_1")
-      // (100 + 50) tokens over the 500 ms window between first chunk and end.
-      expect(row.tps).toBe((150 / 500) * 1000)
+      for (const gone of ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"]) expect(columns).not.toContain(gone)
+      const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name)
+      expect(tables).not.toContain("http_responses")
+
+      // The step survives with everything the views read, endpoint included.
+      const row = db.query("SELECT message_id, output_tokens, router FROM steps").get() as Record<string, unknown>
+      expect(row).toEqual({ message_id: "old_1", output_tokens: 100, router: "orcarouter-dsv4.1flash" })
+
+      // Only the compaction event is kept: it is the one the cache view reads.
+      const kinds = (db.query("SELECT kind FROM events").all() as { kind: string }[]).map((event) => event.kind)
+      expect(kinds).toEqual(["compaction"])
+
       const version = (db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value
       expect(version).toBe(String(SCHEMA_VERSION))
-      // And the latency view agrees with the stored value.
-      expect(latency(db).tps.p50).toBe(row.tps ?? undefined)
       db.close()
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }
   })
 
-  test("recomputes rates written with the older window", () => {
-    const directory = mkdtempSync(join(tmpdir(), "usage-insights-v3-"))
-    const path = join(directory, "stats.db")
-    try {
-      const db = openStatsDb(path)
-      // A row as the first release stored it: rate derived over `completed − streamed`.
-      db.query(
-        `INSERT INTO steps (message_id, session_id, output_tokens, reasoning_tokens, created_at, streamed_at, completed_at, tps, recorded_at)
-         VALUES ($id, 's1', 100, 50, 500, 1000, 1007, 21428.6, 1007)`,
-      ).run({ $id: "v3_1" })
-      db.query("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run()
-      db.close()
-
-      const migrated = openStatsDb(path)
-      const row = migrated.query("SELECT tps FROM steps WHERE message_id = 'v3_1'").get() as { tps: number }
-      // 150 tokens over the 500 ms streaming window, not over the 7 ms tail.
-      expect(row.tps).toBe((150 / 500) * 1000)
-      const version = (migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value
-      expect(version).toBe(String(SCHEMA_VERSION))
-      migrated.close()
-    } finally {
-      rmSync(directory, { recursive: true, force: true })
-    }
-  })
-
-  test("records and keeps the rate per step", () => {
+  test("keeps the timing a rate is derived from, without storing the rate", () => {
     const db = freshDb()
-    recordStep(db, { messageID: "t1", sessionID: "s1", output: 300, reasoning: 100, streamedAt: 2_000, completedAt: 3_000, tps: 400 })
-    recordStep(db, { messageID: "t2", sessionID: "s1" })
-    expect(db.query("SELECT tps FROM steps WHERE message_id = 't1'").get()).toEqual({ tps: 400 })
-    expect(db.query("SELECT tps FROM steps WHERE message_id = 't2'").get()).toEqual({ tps: null })
-    // A later re-record without the value does not erase it.
-    recordStep(db, { messageID: "t1", sessionID: "s1", output: 300 })
-    expect(db.query("SELECT tps FROM steps WHERE message_id = 't1'").get()).toEqual({ tps: 400 })
+    recordStep(db, { messageID: "t1", sessionID: "s1", output: 300, reasoning: 100, streamedAt: 2_000, completedAt: 3_000 })
+    const row = db.query("SELECT output_tokens, reasoning_tokens, streamed_at, completed_at FROM steps WHERE message_id = 't1'").get()
+    expect(row).toEqual({ output_tokens: 300, reasoning_tokens: 100, streamed_at: 2_000, completed_at: 3_000 })
+    // The rate is derived where it is shown, from the window above.
+    const cached = db.query("SELECT streamed_at, completed_at FROM steps WHERE message_id = 't1'").get() as { streamed_at: number; completed_at: number }
+    expect(((300 + 100) / (cached.completed_at - cached.streamed_at)) * 1000).toBe(400)
+    db.close()
   })
 })
+

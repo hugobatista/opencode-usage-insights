@@ -9,6 +9,7 @@ import {
   type TurnStats,
   type TurnTotalsView,
 } from "./core"
+import { sanitizeLabel } from "./text"
 
 /**
  * Adapter between the host's session messages and the pure turn accounting in
@@ -110,7 +111,10 @@ export function lineParts(
   const segments = formatLineSegments(stats, options)
   segments.forEach((segment, index) => {
     if (index > 0) parts.push({ text: " · ", tone: "muted" })
-    parts.push({ text: segment.text, tone: segment.tone })
+    // The line leads with identities that came from outside (the endpoint a
+    // gateway named, a model id): one text renderable, one terminal, so no
+    // control character may reach it.
+    parts.push({ text: sanitizeLabel(segment.text), tone: segment.tone })
   })
   return parts
 }

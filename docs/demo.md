@@ -31,9 +31,9 @@ turn · response still streaming (no line until the response ends)
 sidebar history (compact, last 3 turns)
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 09:42 orcarouter-claude
-  in 23.8k (119.8k) · out 3.3k
+  in 23.8k · out 3.3k · $1.42
 09:24 orcarouter-dsv4.1-flash-free
-  in 10.3k (1.62M) · out 1.25k
+  in 10.3k · out 1.25k · $0.2700
 
 /usage overview
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -86,8 +86,8 @@ glm-5.3-flash                      1        0         0         0           – 
 claude-opus-4.6                    1        1         1         1           –         –
 
 top transitions
-  model    deepseek-v4.1-flash-free → claude-opus-4.6  ×1
   endpoint orcarouter-dsv4.1-flash-free → orcarouter-claude  ×1
+  model    deepseek-v4.1-flash-free → claude-opus-4.6  ×1
 
 /usage cache
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ total              7       4       4.87M      4.58M     94%     26.6k     $2.70
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 wall       p50  58.0s     p90  1m28s     p99  1m28s     n 7
 stream     p50  1.2s      p90  2.8s      p99  2.8s
-throughput p50  72.6/s    p90  85.1/s    p99  85.1/s
+throughput p50  2642.9/s  p90  5250.0/s  p99  5250.0/s
 
 wall = request to completed · stream = request to last chunk · throughput = output+reasoning tokens…
 
@@ -166,5 +166,24 @@ Fix the cache reg…  15:03:01 · opencode/glm-5.3-flash · in 49k (669k), cache
 Fix the cache reg…  15:00:58 · Δ 23h58m · opencode/glm-5.3-flash · in 72.7k (85.1k), cached 12.4k,…
 Docs pass  07:01:28 · orcarouter-dsv4.1-flash-free · in 26.5k (336.5k), cached 310k, out 6.3k
 Docs pass  07:20:31 · Δ 20m00s · orcarouter-dsv4.1-flash-free · in 8.6k (410.6k), cached 402k, out…
+
+/usage db
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/usage-insights-demo-NKslxj/stats.db
+0.0 MB + 0.5 MB wal · schema v7
+
+what it holds
+  sessions    3 rows
+  prompts     6 rows
+  events      0 rows
+  steps       7 rows
+  window      12/10/2026 → 15/10/2026
+
+clean up
+  enter prunes the steps older than the row · v gives the space back
+keep           prunes
+30 days       0 steps
+90 days       0 steps
+365 days      0 steps
 
 ```

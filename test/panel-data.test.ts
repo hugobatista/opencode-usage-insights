@@ -38,7 +38,9 @@ import {
   viewBar,
   type PanelLine,
 } from "../src/panel-data"
-import type { CacheDropRow, LatencyReport, ModelUsage, Overview, SessionUsage, TtlEvidenceRow } from "../src/stats/queries"
+import type { LatencyReport, TtlEvidenceRow } from "../src/stats/aggregates"
+import type { CacheDropRow } from "../src/stats/aggregates"
+import type { ModelUsage, Overview, SessionUsage } from "../src/stats/queries"
 
 const text = (lines: readonly PanelLine[]) => lines.map((line) => line.text).join("\n")
 const find = (lines: readonly PanelLine[], needle: string) => lines.find((line) => line.text.includes(needle))
@@ -67,7 +69,7 @@ function model(overrides: Partial<ModelUsage> & { modelID: string }): ModelUsage
     providers: [
       {
         providerID: "opencode",
-        upstreams: [], upstreamModels: [], routers: [],
+        routers: [],
         steps: 4,
         input: 12_000,
         cached: 340_000,
@@ -288,8 +290,6 @@ describe("overviewLines", () => {
 describe("modelsLines", () => {
   const providerRow = (overrides: Partial<ModelUsage["providers"][number]> = {}): ModelUsage["providers"][number] => ({
     providerID: "opencode",
-    upstreams: [],
-    upstreamModels: [],
     routers: [],
     steps: 4,
     input: 12_000,
@@ -308,7 +308,7 @@ describe("modelsLines", () => {
       model({
         modelID: "deepseek-v4.1-flash-free",
         providers: [
-          providerRow({ upstreams: ["fireworks", "deepseek"], routers: ["orcarouter-dsv4.1flash"] }),
+          providerRow({ routers: ["orcarouter-dsv4.1flash"] }),
           providerRow({ providerID: "deepseek", steps: 1, input: 10, cached: 0, cacheWrite: 0, output: 20, cost: 0.01 }),
         ],
       }),
@@ -552,7 +552,7 @@ describe("panel chrome", () => {
     expect(body).toContain("out       everything generated")
     expect(body).toContain("endpoint  where the request was actually sent")
     expect(body).toContain("The endpoint is the inference provider")
-    expect(body).toContain("kept in the database as evidence, not surfaced")
+    expect(body).toContain("the OpenCode provider is kept in the database as evidence")
     expect(body).toContain("escape close")
   })
 
@@ -594,8 +594,6 @@ describe("turnsLines", () => {
     providerID: "opencode-go",
     modelID: "deepseek-v4.1-flash",
     variant: "max",
-    upstream: "DeepSeek",
-    upstreamModel: "deepseek/deepseek-v4.1-flash",
     router: "orcarouter-dsv4.1flash",
     routerChanged: false,
     providerChanged: false,
@@ -643,7 +641,7 @@ describe("turnsLines", () => {
     const lines = sidebarLines([turn({ steps: 2 }), turn({ endAt: 1_500, router: "orcarouter-glm-5.3" })], { budget: 34 })
     expect(lines).toHaveLength(4)
     expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} orcarouter-dsv4.1flash`)
-    expect(lines[1]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
+    expect(lines[1]!.text).toBe("  in 1.62k · out 1.06k · $0.0100")
     for (const line of lines) expect(line.text.length).toBeLessThanOrEqual(34)
     expect(sidebarLines([], {})).toEqual([{ text: "no finished turns yet", tone: "muted" }])
   })

@@ -1,6 +1,5 @@
 import type { Database } from "bun:sqlite"
 import { cacheDrop, stepGap, tokensPerSecond, type AssistantMessage } from "../core"
-import type { UpstreamInfo } from "../upstream"
 
 /**
  * Read side of the stats engine: every function takes an open database and
@@ -25,17 +24,23 @@ export type Range = {
 }
 
 /**
- * Panel filters. They narrow every aggregation to one model, one OpenCode
- * provider or one inference operator, and are applied with the same `WHERE`
- * builder the range uses so a filtered view and a drill-down agree.
+ * Panel filters. They narrow every aggregation to one model, one endpoint or
+ * one session, and are applied with the same `WHERE` builder the range uses so
+ * a filtered view and a drill-down agree.
  */
 export type Filters = {
   /** Model id, variant excluded. */
   modelID?: string | undefined
   /**
+   * One model *and* its variant, as `modelKey` builds it (`m1#max`). A variant
+   * is a different model to the provider, so a drill-down into one variant must
+   * not pick up its family.
+   */
+  modelKey?: string | undefined
+  /**
    * The routing endpoint that served the request (`router`). It is the one
    * identity that answers "who ran this inference": the provider you configured
-   * and the operator a header reported are evidence, not answers.
+   * says where the request came from, which is evidence, not an answer.
    */
   router?: string | undefined
   /**
@@ -66,7 +71,24 @@ type UsageRow = {
   cost: number | null
 }
 
-const STEP_TIME = "COALESCE(created_at, recorded_at)"
+export const STEP_TIME = "COALESCE(created_at, recorded_at)"
+
+/**
+ * The identity of a model *and* its variant, in SQL: `modelKey` says a variant
+ * is a different model to the provider, so a variant never shares a row with
+ * its family. The JS twin is `modelKey` below; both have to agree.
+ */
+export const MODEL_KEY_SQL = "COALESCE(model_id, '(unknown)') || '#' || COALESCE(variant, '')"
+
+/** `modelKey(modelID, variant)`: the family, with the variant as a suffix. */
+export function modelKey(modelID: string, variant: string | undefined): string {
+  return `${modelID}#${variant ?? ""}`
+}
+
+/** Human label of a model key or a model id and variant. */
+export function modelLabel(modelID: string, variant: string | undefined): string {
+  return variant === undefined ? modelID : `${modelID} ${variant}`
+}
 const USAGE_SELECT = `COUNT(*) AS steps,
        COALESCE(SUM(input_tokens), 0) AS input,
        COALESCE(SUM(cache_read), 0) AS cached,
@@ -116,6 +138,10 @@ export function buildWhere(
   if (filters?.modelID !== undefined && filters.modelID !== "") {
     clauses.push("model_id = ?")
     params.push(filters.modelID)
+  }
+  if (filters?.modelKey !== undefined && filters.modelKey !== "") {
+    clauses.push(`${MODEL_KEY_SQL} = ?`)
+    params.push(filters.modelKey)
   }
   if (filters?.router !== undefined && filters.router !== "") {
     clauses.push("router = ?")
@@ -173,10 +199,6 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
 
 export type ProviderUsage = Usage & {
   providerID: string
-  /** Inference operators observed behind this provider. */
-  upstreams: string[]
-  /** Upstream model ids the gateway reported (e.g. `deepseek/deepseek-v4.1-flash`). */
-  upstreamModels: string[]
   /** Gateway routing endpoints that served the requests. */
   routers: string[]
   firstAt: number | undefined
@@ -194,8 +216,6 @@ type ModelRow = UsageRow & {
   provider_id: string | null
   model_id: string | null
   variant: string | null
-  upstream_list: string | null
-  upstream_model_list: string | null
   router_list: string | null
   first_at: number | null
   last_at: number | null
@@ -211,8 +231,6 @@ export function models(db: Database, range?: Range, filters?: Filters): ModelUsa
   const rows = db
     .query(
       `SELECT provider_id, model_id, variant,
-              GROUP_CONCAT(DISTINCT upstream) AS upstream_list,
-              GROUP_CONCAT(DISTINCT upstream_model) AS upstream_model_list,
               GROUP_CONCAT(DISTINCT router) AS router_list,
               ${USAGE_SELECT},
               MIN(${STEP_TIME}) AS first_at,
@@ -237,8 +255,6 @@ export function models(db: Database, range?: Range, filters?: Filters): ModelUsa
     model.providers.push({
       ...usage,
       providerID: row.provider_id ?? "(unknown)",
-      upstreams: row.upstream_list ? row.upstream_list.split(",").filter(Boolean) : [],
-      upstreamModels: row.upstream_model_list ? row.upstream_model_list.split(",").filter(Boolean) : [],
       routers: row.router_list ? row.router_list.split(",").filter(Boolean) : [],
       firstAt: row.first_at ?? undefined,
       lastAt: row.last_at ?? undefined,
@@ -307,166 +323,6 @@ export type TtlEvidenceRow = {
   minDropGapMs: number | undefined
 }
 
-type StepRow = {
-  message_id: string
-  session_id: string
-  provider_id: string | null
-  model_id: string | null
-  variant: string | null
-  cache_read: number | null
-  created_at: number | null
-  completed_at: number | null
-  recorded_at: number
-}
-
-function stepLike(row: StepRow): AssistantMessage {
-  const model =
-    row.model_id !== null
-      ? { providerID: row.provider_id ?? "", id: row.model_id, ...(row.variant !== null ? { variant: row.variant } : {}) }
-      : undefined
-  return {
-    type: "assistant",
-    id: row.message_id,
-    model,
-    tokens: { cache: { read: row.cache_read ?? 0 } },
-    time: {
-      ...(row.created_at !== null ? { created: row.created_at } : {}),
-      ...(row.completed_at !== null ? { completed: row.completed_at } : {}),
-    },
-  }
-}
-
-type StepSequences = {
-  bySession: Map<string, StepRow[]>
-  compactions: Map<string, number[]>
-}
-
-/**
- * Fetch every step belonging to the sessions that were active in the range,
- * plus their compaction times. The predecessor of the range's first step is
- * needed to judge reuse, so the fetch deliberately ignores the range bounds
- * once a session is selected.
- */
-function loadSequences(db: Database, range?: Range, filters?: Filters): StepSequences {
-  const filter = buildWhere(range, filters)
-  const sessionRows = db.query(`SELECT DISTINCT session_id FROM steps ${filter.where}`).all(...filter.params) as { session_id: string }[]
-  const sessionIDs = sessionRows.map((row) => row.session_id)
-  const bySession = new Map<string, StepRow[]>()
-  const compactions = new Map<string, number[]>()
-  if (sessionIDs.length === 0) return { bySession, compactions }
-
-  const placeholders = sessionIDs.map(() => "?").join(", ")
-  const rows = db
-    .query(
-      `SELECT message_id, session_id, provider_id, model_id, variant, cache_read, created_at, completed_at, recorded_at
-       FROM steps WHERE session_id IN (${placeholders})
-       ORDER BY session_id, ${STEP_TIME}, message_id`,
-    )
-    .all(...sessionIDs) as StepRow[]
-  for (const row of rows) {
-    const list = bySession.get(row.session_id)
-    if (list) list.push(row)
-    else bySession.set(row.session_id, [row])
-  }
-
-  const compactionRows = db
-    .query(`SELECT session_id, at FROM events WHERE kind = ? AND session_id IN (${placeholders}) ORDER BY at`)
-    .all(COMPACTION_KIND, ...sessionIDs) as { session_id: string; at: number | null }[]
-  for (const row of compactionRows) {
-    if (row.at === null) continue
-    const list = compactions.get(row.session_id)
-    if (list) list.push(row.at)
-    else compactions.set(row.session_id, [row.at])
-  }
-
-  return { bySession, compactions }
-}
-
-/**
- * Cache reuse losses with a best-effort reason: a compaction in between,
- * an idle gap long enough to be provider-side expiry, or unknown.
- */
-export function cacheDrops(db: Database, options?: { range?: Range; filters?: Filters; ttlHintMs?: number }): CacheDropRow[] {
-  const ttlHint = options?.ttlHintMs ?? DEFAULT_TTL_HINT_MS
-  const { bySession, compactions } = loadSequences(db, options?.range, options?.filters)
-  const from = options?.range?.from
-  const to = options?.range?.to
-  const drops: CacheDropRow[] = []
-
-  for (const [sessionID, steps] of bySession) {
-    for (let index = 1; index < steps.length; index += 1) {
-      const previous = steps[index - 1]!
-      const current = steps[index]!
-      const lost = cacheDrop(stepLike(previous), stepLike(current))
-      if (lost === undefined) continue
-      const at = current.created_at ?? current.recorded_at
-      if (from !== undefined && at < from) continue
-      if (to !== undefined && at >= to) continue
-
-      const gapMs = stepGap(stepLike(previous), stepLike(current))
-      const endOfPrevious = previous.completed_at ?? previous.created_at ?? previous.recorded_at
-      const compacted = (compactions.get(sessionID) ?? []).some((time) => time >= endOfPrevious && time <= at)
-      const reason: DropReason = compacted ? "compaction" : gapMs !== undefined && gapMs >= ttlHint ? "expired" : "unknown"
-
-      drops.push({
-        sessionID,
-        messageID: current.message_id,
-        providerID: current.provider_id ?? undefined,
-        modelID: current.model_id ?? undefined,
-        variant: current.variant ?? undefined,
-        at,
-        tokens: lost,
-        gapMs,
-        prevCached: previous.cache_read ?? 0,
-        reason,
-      })
-    }
-  }
-  return drops.sort((a, b) => a.at - b.at)
-}
-
-/**
- * Empirical bounds on the provider cache TTL: the longest idle gap that
- * still reused the cache, and the shortest gap that lost it. Comparing the
- * two per provider turns TTL guesses into observations.
- */
-export function cacheTtlEvidence(db: Database, options?: { range?: Range; filters?: Filters }): TtlEvidenceRow[] {
-  const { bySession } = loadSequences(db, options?.range, options?.filters)
-  const evidence = new Map<string, TtlEvidenceRow>()
-
-  for (const steps of bySession.values()) {
-    for (let index = 1; index < steps.length; index += 1) {
-      const previous = steps[index - 1]!
-      const current = steps[index]!
-      if (previous.model_id === null || current.model_id === null) continue
-      const key = `${current.provider_id ?? ""}/${current.model_id}`
-      const before = `${previous.provider_id ?? ""}/${previous.model_id}#${previous.variant ?? ""}`
-      const after = `${current.provider_id ?? ""}/${current.model_id}#${current.variant ?? ""}`
-      if (before !== after) continue
-
-      const row = evidence.get(key) ?? {
-        providerID: current.provider_id ?? "(unknown)",
-        modelID: current.model_id,
-        samples: 0,
-        maxHitGapMs: undefined,
-        minDropGapMs: undefined,
-      }
-      row.samples += 1
-      const gapMs = stepGap(stepLike(previous), stepLike(current))
-      if (gapMs !== undefined) {
-        const lost = cacheDrop(stepLike(previous), stepLike(current))
-        if (lost === undefined) {
-          row.maxHitGapMs = row.maxHitGapMs === undefined ? gapMs : Math.max(row.maxHitGapMs, gapMs)
-        } else {
-          row.minDropGapMs = row.minDropGapMs === undefined ? gapMs : Math.min(row.minDropGapMs, gapMs)
-        }
-      }
-      evidence.set(key, row)
-    }
-  }
-  return [...evidence.values()].sort((a, b) => b.samples - a.samples)
-}
-
 export type LatencyStats = {
   count: number
   p50: number | undefined
@@ -503,25 +359,6 @@ export function latencyStats(values: number[]): LatencyStats {
 
 const statsFor = latencyStats
 
-export function latency(db: Database, range?: Range, filters?: Filters): LatencyReport {
-  const filter = buildWhere(range, filters)
-  const rows = db
-    .query(`SELECT created_at, streamed_at, completed_at, output_tokens, reasoning_tokens FROM steps ${filter.where}`)
-    .all(...filter.params) as { created_at: number | null; streamed_at: number | null; completed_at: number | null; output_tokens: number | null; reasoning_tokens: number | null }[]
-
-  const wall: number[] = []
-  const stream: number[] = []
-  const tps: number[] = []
-  for (const row of rows) {
-    if (row.created_at !== null && row.completed_at !== null) wall.push(row.completed_at - row.created_at)
-    if (row.created_at !== null && row.streamed_at !== null && row.streamed_at > row.created_at) stream.push(row.streamed_at - row.created_at)
-    const produced = (row.output_tokens ?? 0) + (row.reasoning_tokens ?? 0)
-    const rate = tokensPerSecond(produced, row.streamed_at ?? undefined, row.completed_at ?? undefined)
-    if (rate !== undefined) tps.push(rate)
-  }
-  return { wall: statsFor(wall), stream: statsFor(stream), tps: statsFor(tps) }
-}
-
 export type SessionUsage = Usage & {
   sessionID: string
   parentID: string | undefined
@@ -535,9 +372,23 @@ export type SessionUsage = Usage & {
   cacheHitRatio: number | undefined
 }
 
-export function sessions(db: Database, options?: { range?: Range; filters?: Filters; limit?: number }): SessionUsage[] {
-  const filter = buildWhere(options?.range, options?.filters, "COALESCE(st.created_at, st.recorded_at)")
+export function sessions(
+  db: Database,
+  options?: { range?: Range; filters?: Filters; limit?: number; sessionIDs?: readonly string[] },
+): SessionUsage[] {
+  if (options?.sessionIDs !== undefined && options.sessionIDs.length === 0) return []
+  const range = options?.range
+  const filter = buildWhere(range, options?.filters, "COALESCE(st.created_at, st.recorded_at)")
   const limit = options?.limit ?? 20
+  const clauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
+  const params: (number | string)[] = [...filter.params]
+  if (options?.sessionIDs !== undefined) {
+    // A specific set of sessions (the subagents of one session): the group by
+    // then reads one index range per session instead of every step recorded.
+    const ids = options.sessionIDs.slice(0, 500)
+    clauses.push(`st.session_id IN (${ids.map(() => "?").join(", ")})`)
+    params.push(...ids)
+  }
   const rows = db
     .query(
       `SELECT st.session_id, s.title, s.directory, s.parent_id,
@@ -555,13 +406,13 @@ export function sessions(db: Database, options?: { range?: Range; filters?: Filt
               MAX(COALESCE(st.completed_at, st.created_at, st.recorded_at)) AS last_at
        FROM steps st
        LEFT JOIN sessions s ON s.session_id = st.session_id
-       ${filter.where}
+       ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
        GROUP BY st.session_id
        ORDER BY last_at DESC
        LIMIT ?`,
     )
     .all(
-      ...filter.params,
+      ...params,
       limit,
     ) as (UsageRow & {
     session_id: string
@@ -593,6 +444,18 @@ export function sessions(db: Database, options?: { range?: Range; filters?: Filt
   })
 }
 
+/** Sessions whose parent is `parentID`: the subagents of one session. */
+export function childSessionIDs(db: Database, parentID: string): string[] {
+  return (db.query("SELECT session_id FROM sessions WHERE parent_id = ? ORDER BY session_id").all(parentID) as { session_id: string }[]).map(
+    (row) => row.session_id,
+  )
+}
+
+/** Session usage rows for a specific set of sessions (subagent rollups). */
+export function sessionUsageOf(db: Database, sessionIDs: readonly string[]): SessionUsage[] {
+  return sessions(db, { sessionIDs, limit: sessionIDs.length })
+}
+
 export type TurnDrop = {
   messageID: string
   tokens: number
@@ -614,8 +477,6 @@ export type TurnUsage = {
   providerID: string | undefined
   modelID: string | undefined
   variant: string | undefined
-  upstream: string | undefined
-  upstreamModel: string | undefined
   router: string | undefined
   /** The displayed identity differs from the previous turn of the session. */
   routerChanged: boolean
@@ -647,8 +508,6 @@ type TurnStepRow = {
   recorded_at: number
   completed_at: number | null
   finish: string | null
-  upstream: string | null
-  upstream_model: string | null
   router: string | null
 }
 
@@ -693,11 +552,17 @@ function stepMessage(row: TurnStepRow): AssistantMessage {
  * Finished turns, newest first. Steps belong to the newest prompt recorded at or
  * before them; a turn whose last step asked for tools is dropped, because it is
  * still running — the same rule the telemetry line follows.
+ *
+ * For one session the read is bounded by a window: only the steps at or after
+ * the `limit`-th newest prompt are loaded, so a session with tens of thousands
+ * of steps costs the same as a short one. The extra prompt is kept as the
+ * reference the oldest returned turn measures its gap against.
  */
 export function turns(
   db: Database,
   options?: { sessionID?: string | undefined; range?: Range | undefined; filters?: Filters | undefined; limit?: number | undefined },
 ): TurnUsage[] {
+  const limit = options?.limit ?? 50
   const filter = buildWhere(options?.range, options?.filters)
   const clauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
   const params: (number | string)[] = [...filter.params]
@@ -705,21 +570,26 @@ export function turns(
     clauses.push("session_id = ?")
     params.push(options.sessionID)
   }
+  const floor = options?.sessionID === undefined ? undefined : promptFloor(db, options.sessionID, limit + 1)
+  if (floor !== undefined) {
+    clauses.push(`${STEP_TIME} >= ?`)
+    params.push(floor)
+  }
   const steps = db
     .query(
       `SELECT message_id, session_id, provider_id, model_id, variant,
               input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost,
-              created_at, recorded_at, completed_at, finish, upstream, upstream_model, router
+              created_at, recorded_at, completed_at, finish, router
          FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
         ORDER BY session_id, ${STEP_TIME}`,
     )
     .all(...params) as TurnStepRow[]
 
+  const promptClause = options?.sessionID === undefined ? "" : `WHERE session_id = ?${floor === undefined ? "" : " AND created_at >= ?"}`
+  const promptParams = options?.sessionID === undefined ? [] : floor === undefined ? [options.sessionID] : [options.sessionID, floor]
   const promptRows = db
-    .query(
-      `SELECT session_id, created_at FROM prompts ${options?.sessionID === undefined ? "" : "WHERE session_id = ?"} ORDER BY session_id, created_at`,
-    )
-    .all(...(options?.sessionID === undefined ? [] : [options.sessionID])) as { session_id: string; created_at: number | null }[]
+    .query(`SELECT session_id, created_at FROM prompts ${promptClause} ORDER BY session_id, created_at`)
+    .all(...promptParams) as { session_id: string; created_at: number | null }[]
 
   const promptsBySession = new Map<string, number[]>()
   for (const row of promptRows) {
@@ -774,8 +644,6 @@ export function turns(
       providerID,
       modelID,
       variant,
-      upstream: lastWith((row) => row.upstream),
-      upstreamModel: lastWith((row) => row.upstream_model),
       router,
       routerChanged: previous?.router !== undefined && router !== undefined && previous.router !== router,
       providerChanged: previous?.providerID !== undefined && providerID !== undefined && previous.providerID !== providerID,
@@ -819,7 +687,18 @@ export function turns(
   }
   close()
 
-  return result.reverse().slice(0, options?.limit ?? 50)
+  return result.reverse().slice(0, limit)
+}
+
+/**
+ * Creation time of the `count`-th newest prompt of a session, or undefined
+ * when it has fewer. Used to bound the steps a `turns` read has to load.
+ */
+function promptFloor(db: Database, sessionID: string, count: number): number | undefined {
+  const rows = db
+    .query("SELECT created_at FROM prompts WHERE session_id = ? AND created_at IS NOT NULL ORDER BY created_at DESC LIMIT ?")
+    .all(sessionID, count) as { created_at: number }[]
+  return rows.length === count ? rows[count - 1]!.created_at : undefined
 }
 
 /**
@@ -840,26 +719,35 @@ export function routerBefore(db: Database, sessionID: string, at: number | undef
 }
 
 /**
- * Most recent upstream evidence recorded for a session+model pair. The TUI
- * reads this for the telemetry line because the line renders from the TUI
+ * Routing endpoint of the newest step recorded for a session+model pair. The
+ * TUI reads this for the telemetry line because the line renders from the TUI
  * process while the recorder (the server process) is still writing the step
  * that just finished.
  */
-export function latestUpstream(db: Database, sessionID: string, modelID: string): UpstreamInfo | undefined {
-  // Latest non-null value per field: the operator can change per request while
-  // the router stays the same, and both are worth keeping.
+export function latestRouter(db: Database, sessionID: string, modelID: string): string | undefined {
   const row = db
     .query(
-      `SELECT
-         (SELECT upstream FROM steps WHERE session_id = $sessionID AND model_id = $modelID AND upstream IS NOT NULL ORDER BY recorded_at DESC LIMIT 1) AS operator,
-         (SELECT upstream_model FROM steps WHERE session_id = $sessionID AND model_id = $modelID AND upstream_model IS NOT NULL ORDER BY recorded_at DESC LIMIT 1) AS model,
-         (SELECT router FROM steps WHERE session_id = $sessionID AND model_id = $modelID AND router IS NOT NULL ORDER BY recorded_at DESC LIMIT 1) AS router`,
+      `SELECT router FROM steps
+        WHERE session_id = $sessionID AND model_id = $modelID AND router IS NOT NULL
+        ORDER BY recorded_at DESC LIMIT 1`,
     )
-    .get({ $sessionID: sessionID, $modelID: modelID }) as { operator: string | null; model: string | null; router: string | null } | null
-  if (row === null) return undefined
-  const info: UpstreamInfo = {}
-  if (row.operator !== null) info.operator = row.operator
-  if (row.model !== null) info.model = row.model
-  if (row.router !== null) info.router = row.router
-  return Object.keys(info).length === 0 ? undefined : info
+    .get({ $sessionID: sessionID, $modelID: modelID }) as { router: string | null } | null
+  return row?.router ?? undefined
+}
+
+// ---------------------------------------------------------------------------
+// Filter pickers
+// ---------------------------------------------------------------------------
+
+export type FilterOption = { value: string; steps: number }
+
+/** Distinct models and endpoints, most used first. */
+export function filterOptions(db: Database): { models: FilterOption[]; endpoints: FilterOption[] } {
+  const pick = (column: string): FilterOption[] =>
+    (
+      db
+        .query(`SELECT ${column} AS value, COUNT(*) AS steps FROM steps WHERE ${column} IS NOT NULL GROUP BY ${column} ORDER BY steps DESC`)
+        .all() as { value: string; steps: number }[]
+    ).map((row) => ({ value: row.value, steps: row.steps }))
+  return { models: pick("model_id"), endpoints: pick("router") }
 }

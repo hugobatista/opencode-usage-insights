@@ -168,10 +168,9 @@ describe("lineParts", () => {
     expect(lineText(lineParts(sameProvider))).not.toContain("changed · model changed")
   })
 
-  test("leaves the reported operator out unless it is asked for", () => {
-    const withUpstream = { ...stats, upstream: "fireworks" }
+  test("never shows a reported operator", () => {
+    const withUpstream = { ...stats, upstream: "fireworks" } as never
     expect(lineText(lineParts(withUpstream))).not.toContain("fireworks")
-    expect(lineText(lineParts(withUpstream, { fields: { upstream: true } }))).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
   })
 
   test("shows the cache warning only when a drop was detected", () => {

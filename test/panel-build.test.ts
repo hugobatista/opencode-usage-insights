@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { buildPanel, defaultSort, detailLabel, nextSort, sortKeys, type PanelRequest } from "../src/panel-build"
 import { PANEL_VIEWS, sanitizeSettings, type PanelLine, type PanelView } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
+import { dbInfo, type DbInfo } from "../src/stats/maintenance"
 
 /**
  * Every view, built from a seeded in-memory database. The panel component only
@@ -20,11 +21,11 @@ function seed(): Database {
   upsertSession(db, { sessionID: "s3", title: "Docs pass", directory: "/code/docs", startedAt: BASE + 2 * MIN })
 
   const steps = [
-    { messageID: "m1", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE, streamedAt: BASE + 1_000, completedAt: BASE + 30_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 300, cost: 0.10, upstream: "Fireworks", router: "router-1", finish: "stop" },
-    { messageID: "m2", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 1_000, completedAt: BASE + 5 * MIN + 20_000, input: 1_200, cacheRead: 90_000, output: 200, cost: 0.08, upstream: "Fireworks", router: "router-2", finish: "stop" },
-    { messageID: "m3", sessionID: "s1", providerID: "anthropic", modelID: "model-b", createdAt: BASE + 40 * MIN, streamedAt: BASE + 40 * MIN + 2_000, completedAt: BASE + 41 * MIN, input: 12_000, cacheRead: 0, cacheWrite: 9_000, output: 900, reasoning: 400, cost: 1.20, upstream: "AWS Bedrock", router: "router-3", finish: "stop" },
-    { messageID: "m4", sessionID: "s2", providerID: "opencode", modelID: "model-a", createdAt: BASE + 2 * MIN, streamedAt: BASE + 2 * MIN + 800, completedAt: BASE + 2 * MIN + 8_000, input: 500, cacheRead: 40_000, output: 100, cost: 0.02, upstream: "Fireworks", router: "router-1", finish: "stop" },
-    { messageID: "m5", sessionID: "s3", providerID: "opencode", modelID: "model-a", createdAt: BASE + 70 * MIN, streamedAt: BASE + 70 * MIN + 900, completedAt: BASE + 70 * MIN + 15_000, input: 800, cacheRead: 60_000, cacheWrite: 200, output: 250, cost: 0.05, upstream: "DeepSeek", router: "router-1", finish: "stop" },
+    { messageID: "m1", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE, streamedAt: BASE + 1_000, completedAt: BASE + 30_000, input: 1_000, cacheRead: 100_000, cacheWrite: 500, output: 300, cost: 0.10, router: "router-1", finish: "stop" },
+    { messageID: "m2", sessionID: "s1", providerID: "opencode", modelID: "model-a", createdAt: BASE + 5 * MIN, streamedAt: BASE + 5 * MIN + 1_000, completedAt: BASE + 5 * MIN + 20_000, input: 1_200, cacheRead: 90_000, output: 200, cost: 0.08, router: "router-2", finish: "stop" },
+    { messageID: "m3", sessionID: "s1", providerID: "anthropic", modelID: "model-b", createdAt: BASE + 40 * MIN, streamedAt: BASE + 40 * MIN + 2_000, completedAt: BASE + 41 * MIN, input: 12_000, cacheRead: 0, cacheWrite: 9_000, output: 900, reasoning: 400, cost: 1.20, router: "router-3", finish: "stop" },
+    { messageID: "m4", sessionID: "s2", providerID: "opencode", modelID: "model-a", createdAt: BASE + 2 * MIN, streamedAt: BASE + 2 * MIN + 800, completedAt: BASE + 2 * MIN + 8_000, input: 500, cacheRead: 40_000, output: 100, cost: 0.02, router: "router-1", finish: "stop" },
+    { messageID: "m5", sessionID: "s3", providerID: "opencode", modelID: "model-a", createdAt: BASE + 70 * MIN, streamedAt: BASE + 70 * MIN + 900, completedAt: BASE + 70 * MIN + 15_000, input: 800, cacheRead: 60_000, cacheWrite: 200, output: 250, cost: 0.05, router: "router-1", finish: "stop" },
   ]
   for (const step of steps) recordStep(db, step as never)
   recordPrompt(db, { sessionID: "s1", messageID: "p1", createdAt: BASE - 1_000 })
@@ -41,7 +42,6 @@ function seed(): Database {
     cacheRead: 61_000,
     output: 120,
     cost: 0.04,
-    upstream: "Fireworks",
     router: "router-1",
     finish: "tool-calls",
   })
@@ -67,6 +67,9 @@ function request(db: Database, overrides: Partial<PanelRequest> = {}): PanelRequ
 }
 
 const text = (lines: readonly PanelLine[]): string => lines.map((line) => line.text).join("\n")
+
+/** The db view's payload, as the panel assembles it. */
+const dbInfoOf = (db: Database): DbInfo => dbInfo(db, ":memory:", BASE + 90 * MIN)
 const find = (lines: readonly PanelLine[], needle: string): PanelLine | undefined => lines.find((line) => line.text.includes(needle))
 
 describe("buildPanel", () => {
@@ -135,7 +138,7 @@ describe("buildPanel", () => {
     // The reported operator and the configured provider are not surfaced.
     expect(text(lines)).not.toContain("AWS Bedrock")
     expect(text(lines)).not.toContain("anthropic")
-    expect(lines.filter((line) => line.row?.kind === "operator").length).toBeGreaterThan(0)
+    expect(lines.filter((line) => line.row?.kind === "endpoint").length).toBeGreaterThan(0)
     db.close()
   })
 
@@ -254,7 +257,7 @@ describe("filters and detail", () => {
 
   test("drilling into an endpoint shows its models and its latency", () => {
     const db = seed()
-    const lines = buildPanel(request(db, { view: "endpoints", detail: { kind: "operator", value: "router-1" } }))
+    const lines = buildPanel(request(db, { view: "endpoints", detail: { kind: "endpoint", value: "router-1" } }))
     expect(lines[0]!.text).toBe("endpoint router-1")
     expect(text(lines)).toContain("model-a")
     expect(text(lines)).toContain("by group")
@@ -281,9 +284,36 @@ describe("filters and detail", () => {
   })
 })
 
+describe("the db view", () => {
+  test("shows where the file lives, what it holds and what each prune would remove", () => {
+    const db = seed()
+    const lines = buildPanel(
+      request(db, {
+        view: "db",
+        database: dbInfoOf(db),
+      }),
+    )
+    const body = text(lines)
+    expect(body).toContain("steps")
+    expect(body).toContain("schema v")
+    expect(body).toContain("clean up")
+    expect(lines.filter((line) => line.row?.kind === "prune").length).toBe(3)
+    expect(body).toContain("365 days")
+    db.close()
+  })
+
+  test("without the file behind it, the view says so instead of inventing one", () => {
+    const db = seed()
+    const lines = buildPanel(request(db, { view: "db" }))
+    expect(lines[0]!.tone).toBe("warning")
+    expect(text(lines)).toContain("unavailable")
+    db.close()
+  })
+})
+
 describe("view plumbing", () => {
   test("keeps the documented view order", () => {
-    expect([...PANEL_VIEWS]).toEqual(["overview", "models", "endpoints", "affinity", "cache", "periods", "latency", "sessions", "turns"])
+    expect([...PANEL_VIEWS]).toEqual(["overview", "models", "endpoints", "affinity", "cache", "periods", "latency", "sessions", "turns", "db"])
   })
 
   test("cycles the sort keys of a view", () => {
@@ -298,7 +328,7 @@ describe("view plumbing", () => {
   test("labels a drill-down target", () => {
     expect(detailLabel({ kind: "model", value: "m", variant: "max" })).toBe("model m max")
     expect(detailLabel({ kind: "session", value: "s" })).toBe("session s")
-    expect(detailLabel({ kind: "operator", value: "orcarouter" })).toBe("endpoint orcarouter")
+    expect(detailLabel({ kind: "endpoint", value: "orcarouter" })).toBe("endpoint orcarouter")
   })
 
   test("never throws: an unreadable database becomes a line", () => {
@@ -316,6 +346,88 @@ describe("view plumbing", () => {
     expect(settings.granularity).toBe("day")
     expect(settings.turnsScope).toBe("all")
     expect(settings.modelID).toBe("m")
+  })
+})
+
+describe("what a view pays for", () => {
+  /** The narrow step projection every analysis view reads. */
+  const STEP_QUERY = "message_id AS messageID"
+  /** The step before the range, loaded for the pair-based reports. */
+  const BOUNDARY_QUERY = "ORDER BY COALESCE(created_at, recorded_at) DESC, message_id DESC LIMIT 1"
+  /** What the file holds, read by `dbInfo` for the db view alone. */
+  const DBINFO_QUERY = "FROM meta"
+
+  /** The database, with every prepared statement remembered. */
+  function watched(db: Database): { handle: Database; sql: string[] } {
+    const sql: string[] = []
+    const handle = new Proxy(db, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver)
+        if (property === "query") {
+          return (text: string) => {
+            sql.push(text)
+            return target.query(text)
+          }
+        }
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    }) as Database
+    return { handle, sql }
+  }
+
+  const count = (sql: readonly string[], marker: string) => sql.filter((text) => text.includes(marker)).length
+
+  test("waits for the rows of one view at a time", () => {
+    const db = seed()
+    const { handle, sql } = watched(db)
+    buildPanel(request(handle, { view: "models" }))
+    // Two reads at most: the grouped query and the reuse per model.
+    expect(count(sql, STEP_QUERY)).toBeLessThanOrEqual(2)
+    db.close()
+  })
+
+  test("sessions, turns and db never read the steps themselves", () => {
+    for (const view of ["sessions", "turns", "db"] as PanelView[]) {
+      const db = seed()
+      const { handle, sql } = watched(db)
+      buildPanel(request(handle, { view, ...(view === "db" ? { database: dbInfoOf(db) } : {}) }))
+      expect(count(sql, STEP_QUERY)).toBe(0)
+      db.close()
+    }
+  })
+
+  test("nothing asks SQLite for a window function", () => {
+    const db = seed()
+    const { handle, sql } = watched(db)
+    for (const view of ["overview", "models", "endpoints", "affinity", "cache", "periods", "latency"] as PanelView[]) {
+      buildPanel(request(handle, { view }))
+    }
+    // Percentiles and pair comparisons are folded in JS over narrow rows: a
+    // window function here would cost more than the fold it replaces.
+    expect(sql.filter((text) => text.includes("OVER (")).length).toBe(0)
+    db.close()
+  })
+
+  test("only a ranged pair report loads the step before the range", () => {
+    const db = seed()
+    const { handle, sql } = watched(db)
+    // All time has no boundary to look for.
+    buildPanel(request(handle, { view: "cache" }))
+    expect(count(sql, BOUNDARY_QUERY)).toBe(0)
+    // A range that starts before the seeded steps, so the seek runs.
+    buildPanel(request(handle, { view: "cache", range: "today", now: BASE + 10 * MIN }))
+    expect(count(sql, BOUNDARY_QUERY)).toBeGreaterThan(0)
+    db.close()
+  })
+
+  test("the file's own numbers are asked for by the db view, not by others", () => {
+    const db = seed()
+    const { handle, sql } = watched(db)
+    buildPanel(request(handle, { view: "overview" }))
+    expect(count(sql, DBINFO_QUERY)).toBe(0)
+    // The panel passes the payload it assembled for the db view.
+    expect(text(buildPanel(request(handle, { view: "db", database: dbInfoOf(db) })))).toContain("what it holds")
+    db.close()
   })
 })
 

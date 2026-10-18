@@ -27,10 +27,10 @@ from a seeded database.
 ## What it does
 
 - **Telemetry line** in `session.composer.top` after each response: end time,
-  `Δ` since the previous prompt in the same session, the **gateway endpoint that
-  served the turn** (`orcarouter-dsv4.1flash`) when a recorder learned one —
-  falling back to `provider/model` (with the variant as a trailing word and
-  `(via <operator>)`), and switchable with `identity: "model"` — turn tokens
+  `Δ` since the previous prompt in the same session, the **endpoint that served
+  the turn** (`orcarouter-dsv4.1flash`) when a recorder learned one — falling
+  back to `provider/model` (with the variant as a trailing word), and switchable
+  with `identity: "model"` — turn tokens
   (`in`, `cached`, `out`) — the whole prompt, its cached part, and everything
   generated — plus session totals and warnings. The line belongs to a finished
   turn: while the session is running one it stays hidden — the host publishes
@@ -46,11 +46,14 @@ from a seeded database.
   (1024–2048 token) cache reads are treated as endpoint noise.
 - **Persistent statistics** (server entry): every assistant step is recorded
   with tokens, cost, timings (time to first chunk, wall time, throughput),
-  finish reason, raw `providerState`, session/parent ids and the upstream
-  operator. Prompts, session lifecycle and compaction events are recorded too.
+  finish reason, the provider/model it ran as, the session and parent ids, and
+  the endpoint that served the request. Prompts, session lifecycle and
+  compaction events are recorded too.
 - **`/usage` panel** (TUI entry): nine keyboard-driven views — `overview`,
   `models`, `endpoints`, `affinity`, `cache`, `periods`, `latency`, `sessions`,
-  `turns` — over five ranges — `session`, `today`, `7d`, `30d`, `all`. A cursor
+  `turns` — over five ranges — `session`, `today`, `7d`, `30d`, `all`, plus a
+  `db` view that shows where the file lives and lets a retention be pruned or
+  the file compacted. A cursor
   walks the rows, `enter` drills into one, and view, range, sort, bucket and
   filters are remembered between openings. `/usage models 7d`,
   `/usage affinity`, `/usage endpoints 30d`. The slash name is `usage` on purpose:
@@ -76,6 +79,14 @@ from a seeded database.
 - **OpenCode V2.** The V2 release changed the plugin API (slots, panels, event
   stream); this plugin targets `>=2.0.0`.
 - [Bun](https://bun.sh) to install dependencies (dev only).
+
+### Supported systems
+
+| | |
+| --- | --- |
+| **OS** | Linux, macOS and Windows. The database lives in the per-user state directory of each (table below). CI runs the data layer — paths, database, recorder, queries, panel assembly, dump round-trip, file permissions — on all three, and the whole suite (including the TUI render tests, which need OpenTUI's native stack) on Linux. `bun run check:platform` runs that same cross-platform check by hand. |
+| **Runtime** | Bun, the runtime OpenCode ships with. SQLite comes from `bun:sqlite`: there is no native module to build and nothing to compile on install. |
+| **OpenCode** | V2 (`>=2.0.0`). |
 
 ## Install
 
@@ -111,7 +122,7 @@ To pass [options](#configuration), use the object form:
 ```jsonc
 {
   "plugins": [
-    { "package": "opencode-usage-insights", "options": { "captureHeaders": true } }
+    { "package": "opencode-usage-insights", "options": { "identity": "endpoint" } }
   ]
 }
 ```
@@ -145,8 +156,7 @@ response finishes. Run `/usage` (alias `/insights`) to open the panel.
 | --- | --- |
 | `14:32:07` | When the response ended (`completed`, else `streamed`, else `created`). |
 | `Δ 3m12s` | Time since the previous prompt of the same session. |
-| `orcarouter-dsv4.1flash` | The gateway endpoint that served the turn, when a recorder learned one (`identity: "endpoint"`, the default). Without one the segment falls back to `providerID/modelID`, with the variant as a trailing word (`… flash-free max`) and `(via <operator>)` as before; `identity: "model"` always shows that form. Yellow with `changed` when it differs from the previous prompt. |
-| `(via fireworks)` | The upstream inference operator, when the recorder observed one. Hidden by default (`fields.upstream: true` shows it): it is reported evidence, not who served the turn. |
+| `orcarouter-dsv4.1flash` | The endpoint that served the turn, when the recorder learned one (`identity: "endpoint"`, the default): the gateway names it in a response header, or the host of the request names the operator. Without one the segment falls back to `providerID/modelID`, with the variant as a trailing word (`… flash-free max`); `identity: "model"` always shows that form. Yellow with `changed` when it differs from the previous prompt. |
 | `in 85.4k (1.62M), cached 1.53M, out 3.7k` | `in` is the uncached part of the prompt (fresh input + cache writes), the parenthesised value the whole prompt — shown only when the two differ — `cached` its cached part, and `out` everything the model generated (visible output + reasoning). OpenCode's own debug line reconciles with these: `new = in + out` and `total = (in + cached) + out`. With several steps the segment reads `turn 3 steps · …` and, by default, reports the step the turn ended with (`latest`) instead of adding the same re-sent prompt once per step; `turnTotals: "sum"` gives that billing view. |
 | `sess in 2.1M (14.5M), cached 12.4M, out 88k` | The session totals reported by the host, displayed with the same buckets as the turn. |
 | `⚠ cache expired (−11.7k)` | Yellow. The prompt cache read fell by that many tokens against a comparable previous step. `×N` when several steps in the turn lost cache. |
@@ -202,23 +212,22 @@ durable storage, so the panel reopens where it was left.
 ### Views
 
 ```text
-/usage endpoints 7d
-model                provider     operator       endpoint          steps   share    cached     hit      cost
-deepseek-v4.1-flash… opencode     Fireworks      orcarouter-dsv4…      2     50%     3.14M   96.7%   $0.2700
-                     tps 1388.9/s · wall 20.0s · p50 hit 94.1% · out 4.95k
-deepseek-v4.1-flash… opencode     DeepSeek       orcarouter-dsv4…      2     50%      712k   95.3%   $0.2500
-                     tps 2625.0/s · wall 31.0s · p50 hit 92.1% · out 8.4k
+/usage endpoints
+endpoint                        models  steps  share     prompt     cached     hit  tps p50     wall
+orcarouter-claude                    1      1    14%     119.8k        96k   80.1% 1178.6/s    1m14s
+– (never observed)                   1      2    29%     754.1k     632.4k   83.9% 3000.0/s    58.0s
+orcarouter-dsv4.1-flash…             1      4    57%         4M      3.86M   96.5% 2625.0/s    31.0s
 ```
 
 | View | Answers |
 | --- | --- |
-| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many steps lack a provider, operator, endpoint or completion — a zero elsewhere is only trustworthy when this is complete). |
+| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many steps lack a model, an endpoint or a completion — a zero elsewhere is only trustworthy when this is complete). |
 | `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **endpoints that actually served it** and how often its identity changed. `enter` opens the per-endpoint detail. |
 | `endpoints` | **Who served the work**: one row per routing endpoint, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. A request whose endpoint was never observed is dimmed — the panel does not invent an identity. |
 | `affinity` | How often the step's identity changed against the step before it in the same session — by provider, model and endpoint — the cache those changes cost, and the most frequent transitions. |
-| `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time** (per gap bucket: pairs, kept, drops, tokens lost), reuse kept per operator, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
+| `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time** (per gap bucket: pairs, kept, drops, tokens lost), reuse kept per endpoint, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
 | `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost — with a sparkline per metric and a totals row. `enter` lists the models of a period. |
-| `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per operator when a model is filtered). `n < 5` is dimmed. |
+| `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per endpoint when a model is filtered). `n < 5` is dimmed. |
 | `sessions` | Each session with steps, prompts, tokens, `hit`, cost, its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
 | `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line (end time, Δ, endpoint, `in (prompt)`, cached, out, warnings). `a` widens it to every session, titled. |
 
@@ -238,7 +247,7 @@ the same in the other:
 | `out` | Everything generated: visible output **plus reasoning**. |
 | `reasoning` | Part of `out`. |
 | `tps` / `wall` / `stream` | Produced tokens per streaming second / request to completed step / request to the last chunk, reported as p50 (p90/p99 in `latency`). |
-| `changed` | The step's provider, model or endpoint differs from the step before it in the same session. |
+| `changed` | The step's model or endpoint differs from the step before it in the same session. |
 | `gap` | Time between the previous step's completion and the next request. |
 
 A change of identity is not by itself a fault — a gateway may re-route
@@ -258,19 +267,11 @@ The panel answers "who ran this inference" with one thing: the **endpoint**
 lists the endpoints behind each model, `endpoints` lists the models behind each
 endpoint, and changes in it are what `affinity` counts.
 
-The other two candidates are recorded as evidence and never surfaced:
-
-- **operator** (`upstream`) — what a gateway header, the request URL or the
-  provider package reported. Best effort: often absent, and it can name the
-  wrong party (a gateway in front of a catalogue may report the catalogue's
-  prefix while another operator runs the model). `fields.upstream: true` brings
-  it back onto the live line; it is off by default.
-- **provider** (`providerID`) — the OpenCode provider you configured. It says
-  where the request came from, not who served it.
-
-Both stay in the database (`steps.upstream*`, `steps.provider_id`,
-`steps.provider_state`) and in `bun run report --json`, so nothing is lost —
-they just do not compete with the endpoint on screen.
+The other candidate is recorded as evidence and never surfaced: the
+**provider** (`providerID`) is the OpenCode provider you configured — it says
+where the request came from, not who served it. It stays in the database
+(`steps.provider_id`) and in `bun run report --json`, so nothing is lost, but it
+does not compete with the endpoint on screen.
 
 ### Per-prompt history
 
@@ -302,13 +303,11 @@ Options apply to both entries (each side reads the ones it needs):
 | --- | --- | --- |
 | `enabled` | `true` | `false` disables that side completely — no line, no panel, no recording. |
 | `db` | per-OS state path | SQLite path override. Must match between the server and TUI entries. |
-| `captureHeaders` | `false` | Record the redacted response headers that upstream discovery inspects, as evidence. |
-| `upstream` | `false` | Show the reported upstream operator on the line (`(via …)`). Off by default: it is evidence, not who served the turn. |
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `sidebar` | `true` | Show the session summary and the per-prompt history in the session sidebar (the slot is invisible while the sidebar is hidden). |
 | `sidebarTurns` | `5` | How many turns the sidebar history shows. |
 | `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
-| `identity` | `"endpoint"` | Which identity the line leads with: `endpoint` shows the gateway endpoint that served the turn (falling back to `provider/model`); `model` always shows `provider/model#variant` with the operator. |
+| `identity` | `"endpoint"` | Which identity the line leads with: `endpoint` shows the endpoint that served the turn (falling back to `provider/model`); `model` always shows `provider/model#variant`. |
 | `fields` | see below | Toggle line segments. |
 | `labels` | see below | Override line labels (the plugin is English-only by default). |
 
@@ -317,9 +316,9 @@ Options apply to both entries (each side reads the ones it needs):
 ```jsonc
 {
   "options": {
-    "fields": { "clock": true, "delta": true, "model": true, "variant": true, "turn": true, "session": true, "reasoning": false, "cost": false, "cacheExpiry": true, "upstream": true },
+    "fields": { "clock": true, "delta": true, "model": true, "variant": true, "turn": true, "session": true, "reasoning": false, "cost": false, "cacheExpiry": true },
     "turnTotals": "latest",
-    "labels": { "delta": "Δ", "turn": "", "session": "sess", "step": "step", "steps": "steps", "input": "in", "cached": "cached", "output": "out", "cacheExpired": "cache expired", "providerChanged": "changed", "upstream": "via" }
+    "labels": { "delta": "Δ", "turn": "", "session": "sess", "step": "step", "steps": "steps", "input": "in", "cached": "cached", "output": "out", "reasoning": "reason", "cost": "cost", "cacheExpired": "cache expired", "providerChanged": "changed", "modelChanged": "model changed" }
   }
 }
 ```
@@ -346,67 +345,99 @@ and the server process (writer) never block each other. Every write is an
 upsert keyed by message id, which makes recording idempotent: replayed events,
 restarts and re-imports never duplicate rows.
 
-Tables: `sessions`, `prompts`, `steps`, `events`, `http_responses` (only used
-with `captureHeaders: true`). The `steps` table is the interesting one:
-`message_id` (primary key), `session_id`, `parent_id`, provider/model/variant,
-input/output/reasoning/cache-read/cache-write tokens, cost, `created_at`,
-`streamed_at`, `completed_at`, `finish`, `provider_state`, `upstream`,
-`upstream_source`, `upstream_model`, `router`, `tps`, `recorded_at`.
+Tables: `sessions`, `prompts`, `steps`, `events` and `meta` (the schema
+version). The `steps` table is the interesting one: `message_id` (primary key),
+`session_id`, `parent_id`, provider/model/variant, input/output/reasoning and
+cache-read/cache-write tokens, cost, `created_at`, `streamed_at`,
+`completed_at`, `finish`, `router` (the endpoint that served the request) and
+`recorded_at`.
 
-`tps` is the step's tokens per second — everything the model generated
-(`output + reasoning`) over the streaming window (`created → streamed`) —
-recorded for analysis (SQL, exports); no view shows it as a column, the
-`latency` view computes the same value from the timings and reports its
-p50/p90/p99. The window is the streaming one on purpose: `streamed` marks the end
-of streaming, and `completed` the end of the step, which for a tool-call step
-happens after the tool calls were handled. It is `NULL` when that window or the
-produced tokens are unknown, and existing rows are backfilled from their timings
-when the column is added.
+Throughput is not stored: `tps` is everything the model generated
+(`output + reasoning`) over the streaming window (`created → streamed`), and the
+`latency` view computes it from the timings and reports its p50/p90/p99. The
+window is the streaming one on purpose — `streamed` marks the end of streaming
+and `completed` the end of the step, which for a tool-call step happens after
+the tool calls were handled — so a step whose window or produced tokens are
+unknown has no throughput and is left out of the percentiles.
 
-### How the upstream operator is found
+Two expression indexes carry every ranged view: `steps_at` on
+`COALESCE(created_at, recorded_at)` (the step's own clock, falling back to the
+recording time for a step that was already in flight when the plugin loaded)
+and `steps_session_at` on the same expression scoped to a session, which is what
+the per-prompt history and the sidebar read. Without them a range filter is a
+full table scan on every panel rebuild.
 
-OpenCode reports the provider it routes through (`providerID`), not necessarily
-the operator that runs the inference. With a gateway (`opencode`, OpenRouter,
-Vercel AI Gateway) that operator is chosen per request, and the gateway names it
-in its own response headers — for example:
+The file is private to the user: its directory is created `0700` and the file
+`0600` (POSIX), re-applied every time either is opened. The TUI reads through a
+read-only connection — it can never write, never migrate and never hold the
+writer's lock — and prune and compact use a separate short-lived writer with a
+250 ms busy timeout, so maintenance fails fast with a message instead of
+stalling the recorder.
 
-```text
-x-opencode-upstream-model-id: deepseek/deepseek-v4.1-flash
-x-opencode-endpoint-id: orcarouter-dsv4.1flash
-server: cloudflare
-```
+### How the endpoint is found
 
-Sources, in the order the recorder tries them:
+OpenCode reports the provider it routes through (`providerID`) — where the
+request came from, not who served it. The endpoint that actually served the
+request comes from two sources, and the header wins:
 
-1. **Gateway response headers** (`header:<name>`): `x-opencode-upstream-model-id`,
-   `x-served-by`, `x-upstream*`, `x-inference-*`, `x-model-served-by`,
-   `x-litellm-*`, `x-portkey-*`. A value may be `operator`, `operator/model` or a
-   bare model id; the operator part is normalized (`deepseek` → DeepSeek) and the
-   whole value is kept as `upstream_model`.
-2. **The endpoint the request went to** (`endpoint:<host>`): a per-operator
-   provider keeps its operator in the host (`api.fireworks.ai` → Fireworks,
-   `bedrock-runtime.<region>.amazonaws.com` → AWS Bedrock).
-3. **The provider package** in the model catalogue
-   (`package:@opencode/ai/providers/fireworks` → Fireworks).
-4. **Compaction provenance** (`provenance`), when the host recorded a route.
+1. **The gateway's own response header** (`x-opencode-endpoint-id`), as in
+   `x-opencode-endpoint-id: orcarouter-dsv4.1flash`. The value has to be a single
+   token (letters, digits, `. _ : / -`, at most 64 characters) and is folded to
+   lowercase, so a gateway that changes the case between responses still reads
+   as one endpoint.
+2. **The host of the request URL**, when no header named one: gateway hosts
+   (`opencode.ai` → `opencode`, `openrouter.ai` → `openrouter`,
+   `ai-gateway.vercel.sh` → `vercel-ai-gateway`) and per-operator hosts
+   (`api.fireworks.ai` → `fireworks`, `api.deepseek.com` → `deepseek`,
+   `bedrock-runtime.us-east-1.amazonaws.com` → `bedrock`,
+   `us-central1-aiplatform.googleapis.com` → `vertex`).
 
-Infrastructure headers (`server`, `via`, `cf-ray`) name the CDN in front of the
-gateway — `server: cloudflare` is the CDN, never the operator. They are stored as
-evidence but never classified. Values that name a gateway (`opencode`,
-`orcarouter`, `openrouter`, `vercel`) become `router` (`x-opencode-endpoint-id`
-lands there too), and unrecognized values are kept as the upstream model id, not
-as an operator: the plugin never guesses. A router is *not* an operator — it is
-the path the request took, not the platform that ran the model. OrcaRouter, for
-example, describes itself as an OpenAI-compatible endpoint in front of a whole
-catalogue, billing at the provider's rate with zero markup; a response routed
-through it reports `deepseek/deepseek-v4.1-flash` as the upstream model, whose
-prefix names the provider, and `orcarouter-dsv4.1flash` as the endpoint.
-`upstream_source` tells you where a value came from, and the raw `provider_state`
-of every step is stored as evidence even when it does not name an operator.
-None of it is surfaced: the panel answers "who ran this inference" with the
-**endpoint** alone (see [The endpoint is the identity](#the-endpoint-is-the-identity)),
-and `bun run report --json` still exposes the recorded operator and provider for
-anyone who wants to audit the inference.
+A host matches on a label boundary only: the domain itself, a subdomain of it
+(`gateway.api.fireworks.ai`), or a region label joined to it by a dash
+(`us-central1-aiplatform.googleapis.com`). A host that merely contains a known
+domain — `api.anthropic.com.evil.tld` — names nothing, so a lookalike cannot
+label the telemetry.
+
+What the recorder learns is applied to the step in flight and to the steps of
+the same session and model that were recorded without an endpoint, and it is
+never overwritten once set: a re-route is not retroactive. A value that is not a
+token — a sentence, a control character, a name a gateway invented — is not an
+endpoint and is not stored. The operator a header *might* have mentioned is
+deliberately not recorded: the plugin answers "who ran this inference" with the
+endpoint alone, and `bun run report --json` still exposes the provider for
+anyone auditing a route.
+
+## Privacy and security
+
+The plugin is local by construction: no network client, no subprocess, no
+credentials, no telemetry. Everything it records stays in the SQLite file in the
+user's own state directory.
+
+**What is stored.** Per step: timings, token counts and cost, the
+provider/model/variant it ran as, the endpoint label, the finish reason, the
+session and parent ids, and the session's title and working directory as the
+host reports them. **Prompts and responses are not stored**: the recorder reads
+event payloads for numbers and identifiers and keeps nothing else — no message
+text, no tool arguments, no file contents, no environment variables.
+
+**What protects it.**
+
+- **Private files.** The database directory is created `0700` and the file
+  `0600` (POSIX), re-applied on every open; on Windows the file inherits the
+  user profile's ACL.
+- **A read-only reader.** The TUI opens the database read-only, so the panel and
+  the sidebar can never write, migrate or take the recorder's lock. Prune and
+  compact open a separate short-lived writer with a 250 ms busy timeout: a
+  maintenance action that cannot take the lock tells the user and stops, instead
+  of stalling the request pipeline that records usage.
+- **Validated input.** Anything that reaches the database from outside — a
+  gateway's endpoint header, a session title, an imported NDJSON dump — is
+  validated as an identifier token or stripped of control characters and capped
+  in length, both when it is stored and again when it is rendered. A terminal
+  escape sequence in a response header cannot reach the terminal, and a dump
+  cannot import a value that does not fit its column.
+- **Parameterized SQL everywhere**, and no dynamic table or column names taken
+  from data.
 
 ## CLI report
 
@@ -418,7 +449,7 @@ bun run report models 7d                # one view, one range
 bun run report all                      # every view
 bun run report endpoints --model deepseek-v4.1-flash-free
 bun run report periods --granularity month
-bun run report affinity --operator Fireworks
+bun run report affinity --endpoint orcarouter-dsv4.1flash
 bun run report --json                   # raw rows and every analysis, for scripting
 bun run report --ndjson > backup.jsonl  # export the whole database
 bun run report --import backup.jsonl    # merge an export (idempotent)
@@ -445,11 +476,17 @@ bun run demo        # render the line and every view from a seeded database
 - `src/line.ts` — adapter from the host message shapes to the pure types, and
   the line parts the TUI renders.
 - `src/stats/` — `db.ts` (schema, upserts, NDJSON export/import), `queries.ts`
-  (totals, models, cache, latency, sessions, turns), `insights.ts` (the
-  per-step analysis: step facts, reuse medians, the endpoint breakdown,
-  affinity, idle-gap survival, calendar periods, coverage), `paths.ts` (per-OS
-  paths).
-- `src/upstream.ts` — header allowlist, operator normalization.
+  (the SQL aggregates: totals, models, sessions, turns, the per-prompt window,
+  the timeline) and `aggregates.ts` (the analysis layer: coverage, latency
+  percentiles, reuse medians, the endpoint breakdown, affinity, idle-gap
+  survival, TTL bounds, reuse losses, calendar periods), `paths.ts` (per-OS
+  paths, `~` expansion and the file-type check) and `maintenance.ts` (what the
+  file holds, prune, vacuum).
+- `src/endpoint.ts` — endpoint discovery: the gateway header, the known hosts
+  (gateway and per-operator, matched on a label boundary) and the merge rule.
+  Pure, so it is testable without a network stack.
+- `src/text.ts` — text hygiene: control-character stripping, length caps and the
+  identifier-token rule shared by the endpoint, the recorder and the renderers.
 - `src/recorder.ts` — the event-stream state machine that fills the database.
 - `src/panel-data.ts` — the panel view models as plain text lines, so every
   view is unit-testable without a renderer.
@@ -464,6 +501,51 @@ bun run demo        # render the line and every view from a seeded database
   declarations. npm `exports` point at `dist`, never at `src` (the Solid
   transform does not run inside `node_modules`).
 - `scripts/demo.ts`, `scripts/report.ts` — the demo and report CLIs.
+- `scripts/bench.ts` — the performance harness: builds a synthetic database of a
+  given size and times the writes on the request path, every panel view and the
+  line. `bun run bench` checks the budgets on 20k steps, `bun run bench --full`
+  on 120k, `--explain` prints the query plans, and a read that stops using the
+  indexes fails the run whatever the timing says.
+- `scripts/check-platform.ts` — `bun run check:platform`: the data layer end to
+  end on the current OS (paths, database, recorder, every panel view, prune,
+  vacuum, dump round-trip, file permissions) against a throwaway database.
+
+### Performance
+
+The plugin sits on paths the host waits for: the recorder's event handlers, the
+`http.response` hook (which the host awaits) and the composer line. The rules it
+keeps are:
+
+- **Writes are small and rare.** A step is one upsert; an endpoint is written
+  once per session and model and only when it changed; a repeated observation
+  costs a map lookup, not a statement.
+- **Reads are index-driven.** Every range filter compares the expression the
+  `steps_at` index covers, the per-prompt history is bounded to the last few
+  prompts, and the line and the sidebar never scan a session's whole history.
+- **The TUI reads, and reads at most 300 ms apart.** The panel and the sidebar
+  share one read-only connection, a burst of step events is coalesced into one
+  rebuild, and each view is memoised; the file's own numbers (`dbInfo`) are only
+  asked for by the `db` view.
+- **The panel's cost is the range it shows.** A view folds the steps of its
+  range — in SQLite where the answer is a sum or a count, in JavaScript where it
+  is a percentile or a comparison between consecutive steps. That is why the
+  range is a first-class setting, why each view reads the rows once and shares
+  them between its reports, and why the budgets in `scripts/bench.ts` are per
+  view.
+
+Two rules came out of measuring, and the bench enforces both:
+
+- **Aggregate in SQL, fold in JS.** `overview` and the `sessions` and `turns`
+  views are sums and counts: they never move a row into JavaScript
+  (`coverageOf` is one SQL statement). Percentiles and pair comparisons read the
+  four to sixteen columns they use and fold them in JS, because SQLite's window
+  functions cost several times more per row than the projection does.
+- **One read per report per view.** `test/panel-build.test.ts` counts the
+  statements a view prepares, and fails if one view asks the database for the
+  steps more than twice.
+
+`bun run bench` is the check: it fails on a budget overrun or on a read that
+stopped using an index.
 
 ### Testing the TUI side
 
@@ -490,7 +572,9 @@ Two consequences for render tests:
 ```sh
 bun install
 bun run typecheck
-bun test
+bun test              # whole suite, Linux
+bun run check:platform
+bun run bench --full  # budgets at 120k steps
 bun run build
 npm pack --dry-run
 ```

@@ -9,6 +9,7 @@ import {
   PANEL_VIEWS,
   RANGE_KEYS,
   filterSummary,
+  formatCount,
   helpLines,
   keysFor,
   nextIn,
@@ -22,7 +23,8 @@ import {
   type PanelTone,
   type PanelView,
 } from "./panel-data"
-import { filterOptions, type Filters } from "./stats/insights"
+import { filterOptions, type Filters } from "./stats/queries"
+import { dbInfo, pruneOlderThan, vacuum, type DbInfo } from "./stats/maintenance"
 
 /**
  * The `/usage` panel. One read-only view over the stats database at a time,
@@ -37,6 +39,14 @@ import { filterOptions, type Filters } from "./stats/insights"
 export type PanelDeps = {
   /** Lazily opened stats database; undefined when it cannot be opened. */
   db: () => Database | undefined
+  /** Where that database lives, for the `db` view. */
+  dbPath: () => string
+  /**
+   * Short-lived write connection for maintenance (prune, compact). The panel
+   * itself only reads; opening a writer on demand is what keeps a read from
+   * ever taking the recorder's lock. Undefined when the write cannot be made.
+   */
+  withWrite?: (<Value>(run: (db: Database) => Value) => Value | undefined) | undefined
   /** Injectable clock, for tests. */
   now: () => number
   /** Creation time of a session, used by the `session` range. */
@@ -59,6 +69,8 @@ export function Panel(props: {
   const [detail, setDetail] = createSignal<PanelRow | undefined>(undefined)
   const [help, setHelp] = createSignal(false)
   const [tick, setTick] = createSignal(0)
+  // Set when a vacuum could not take the write lock: the recorder is mid-write.
+  const [busy, setBusy] = createSignal(false)
   let scroller: Scroller | undefined
 
   const width = (): number => Math.max(60, props.input.width - 4)
@@ -75,6 +87,22 @@ export function Panel(props: {
 
   const rowKey = (row: PanelRow): string => `${row.kind}:${row.value}${row.variant !== undefined ? `#${row.variant}` : ""}`
 
+  /**
+   * What the file holds. Reading it stats the file and counts rows in every
+   * table, so only the `db` view (and the prune confirmation) asks for it: the
+   * other views must not pay for it on every rebuild.
+   */
+  const database = createMemo<DbInfo | undefined>(() => {
+    tick()
+    const handle = props.deps.db()
+    if (handle === undefined) return undefined
+    try {
+      return dbInfo(handle, props.deps.dbPath(), props.deps.now())
+    } catch {
+      return undefined
+    }
+  })
+
   const content = createMemo<PanelLine[]>(() => {
     tick()
     props.deps.refresh?.()
@@ -82,8 +110,9 @@ export function Panel(props: {
     if (help()) return helpLines(width())
     const db = props.deps.db()
     if (db === undefined) {
-      return [{ text: "stats database is not readable; enable the usage-insights server plugin in opencode.json", tone: "warning" }]
+      return [{ text: `stats database is not readable at ${props.deps.dbPath()}; enable the usage-insights server plugin in opencode.json`, tone: "warning" }]
     }
+    const info = current.view === "db" ? database() : undefined
     const request: PanelRequest = {
       db,
       view: current.view,
@@ -98,6 +127,8 @@ export function Panel(props: {
       now: props.deps.now(),
       format: props.format,
       ...(detail() !== undefined ? { detail: detail() } : {}),
+      ...(info !== undefined ? { database: info } : {}),
+      busy: busy(),
       width: width(),
     }
     return buildPanel(request)
@@ -157,8 +188,65 @@ export function Panel(props: {
   function drill(): void {
     const entry = selectable()[cursor()]
     if (entry === undefined) return
+    if (entry.row.kind === "prune") {
+      void prune(Number.parseInt(entry.row.value, 10))
+      return
+    }
     setDetail(entry.row)
     setAnchor(undefined)
+  }
+
+  /** Delete the recorded usage older than `days`, after asking. */
+  async function prune(days: number): Promise<void> {
+    if (!Number.isFinite(days)) return
+    const info = database()
+    const steps = info?.removable.find((option) => option.days === days)?.steps
+    const confirmed = await props.ctx.ui.dialog.confirm({
+      title: `Prune older than ${days} days`,
+      message: `${steps === undefined ? "The recorded usage" : `${steps} of ${formatCount(info?.tables.find((table) => table.name === "steps")?.rows ?? 0)} steps`} would be deleted. This cannot be undone.`,
+      label: { confirm: "Prune", cancel: "Keep" },
+    })
+    if (confirmed !== true) return
+    const cutoff = props.deps.now() - days * 24 * 60 * 60 * 1000
+    const result = props.deps.withWrite?.((handle) => pruneOlderThan(handle, cutoff))
+    if (result === undefined) {
+      props.ctx.ui.toast.show({ message: "the recorder is writing: try again in a moment", variant: "warning" })
+    } else {
+      props.ctx.ui.toast.show({
+        message: `pruned ${result.steps} steps · ${result.prompts} prompts · ${result.events} compactions`,
+        variant: "success",
+      })
+    }
+    setAnchor(undefined)
+    setTick((value) => value + 1)
+  }
+
+  /** Give the space a prune freed back to the filesystem. */
+  async function compact(): Promise<void> {
+    const confirmed = await props.ctx.ui.dialog.confirm({
+      title: "Compact the database",
+      message: "SQLite rewrites the file to reclaim the space of deleted rows. It needs the recorder to be idle, and it can take a moment.",
+      label: { confirm: "Compact", cancel: "Cancel" },
+    })
+    if (confirmed !== true) return
+    const path = props.deps.dbPath()
+    let result: { freed: number } | undefined
+    try {
+      result = props.deps.withWrite?.((handle) => vacuum(handle, path))
+    } catch {
+      result = undefined
+    }
+    if (result === undefined) {
+      setBusy(true)
+      props.ctx.ui.toast.show({ message: "the recorder is writing: try again in a moment", variant: "warning" })
+    } else {
+      setBusy(false)
+      props.ctx.ui.toast.show({
+        message: `compacted: ${(result.freed / 1_048_576).toFixed(1)} MB back`,
+        variant: "success",
+      })
+    }
+    setTick((value) => value + 1)
   }
 
   function back(): void {
@@ -249,11 +337,12 @@ export function Panel(props: {
           setAnchor(undefined)
         }),
         command("usage-insights.refresh", "Refresh", "r", () => setTick((value) => value + 1)),
+        command("usage-insights.vacuum", "Compact the database", "v", () => void compact()),
         command("usage-insights.help", "Help", "?", () => setHelp((open) => !open)),
         command("usage-insights.fullscreen", "Toggle full screen", "f", () => props.input.toggleFullscreen()),
         command("usage-insights.close", "Close usage panel", "escape", () => props.input.close()),
         ...PANEL_VIEWS.map((name, index) =>
-          command(`usage-insights.view.${name}`, `View ${name}`, String(index + 1), () => {
+          command(`usage-insights.view.${name}`, `View ${name}`, String((index + 1) % 10), () => {
             setHelp(false)
             props.update((draft) => {
               draft.view = name

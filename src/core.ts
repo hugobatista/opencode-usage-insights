@@ -75,8 +75,6 @@ export type TurnStats = {
   providerID: string | undefined
   modelID: string | undefined
   variant: string | undefined
-  /** Upstream operator behind the gateway, when a source identifies it. */
-  upstream: string | undefined
   /** Gateway routing endpoint that served the turn, when a source identifies it. */
   router: string | undefined
   /**
@@ -137,6 +135,34 @@ export function transcriptSegments(messages: readonly TranscriptMessage[]): Turn
     prompt = message
   }
   if (current.length > 0) segments.push({ assistants: current, prompt })
+  return segments
+}
+
+/**
+ * The last `count` segments, found by walking the transcript backwards. The
+ * live line only needs the turn that just ended and the one before it, and a
+ * long session holds tens of thousands of messages: the tail walk stops as
+ * soon as it has them, instead of building a segment for every turn.
+ */
+export function transcriptTail(messages: readonly TranscriptMessage[], count: number): TurnSegment[] {
+  const segments: TurnSegment[] = []
+  let current: AssistantMessage[] = []
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!
+    if (message.type === "assistant") {
+      current.unshift(message as AssistantMessage)
+      continue
+    }
+    if (!PROMPT_BOUNDARIES.has(message.type)) continue
+    if (current.length === 0) continue
+    // The boundary closes the run collected after it.
+    segments.unshift({ assistants: current, prompt: message })
+    if (segments.length >= count) return segments
+    current = []
+  }
+  // A leading run with no prompt before it is a segment of its own.
+  if (current.length > 0 && segments.length < count) segments.unshift({ assistants: current, prompt: undefined })
   return segments
 }
 
@@ -264,7 +290,7 @@ export function isSettledStep(message: AssistantMessage): boolean {
  * appears when a turn ends, never with the zeroes of an in-flight response.
  */
 export function computeTurn(messages: readonly TranscriptMessage[], session?: Totals): TurnStats | undefined {
-  const segments = transcriptSegments(messages)
+  const segments = transcriptTail(messages, 2)
   const last = segments[segments.length - 1]
   if (!last) return undefined
   const previous = segments[segments.length - 2]
@@ -304,7 +330,6 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
     providerID: provider,
     modelID: lastStep.model?.id,
     variant: lastStep.model?.variant,
-    upstream: undefined,
     router: undefined,
     identityChanged: false,
     affinityKey: key,
@@ -355,7 +380,6 @@ export type LineLabels = {
   cacheExpired: string
   providerChanged: string
   modelChanged: string
-  upstream: string
 }
 
 /**
@@ -385,7 +409,6 @@ export type LineFields = {
   reasoning: boolean
   cost: boolean
   cacheExpiry: boolean
-  upstream: boolean
 }
 
 export const DEFAULT_LABELS: LineLabels = {
@@ -404,7 +427,6 @@ export const DEFAULT_LABELS: LineLabels = {
   cacheExpired: "cache expired",
   providerChanged: "changed",
   modelChanged: "model changed",
-  upstream: "via",
 }
 
 export const DEFAULT_FIELDS: LineFields = {
@@ -417,10 +439,6 @@ export const DEFAULT_FIELDS: LineFields = {
   reasoning: false,
   cost: false,
   cacheExpiry: true,
-  // The reported upstream operator is best-effort evidence — often absent, and
-  // it can name the wrong party. The line leads with the endpoint that actually
-  // served the turn, so the operator stays out unless it is asked for.
-  upstream: false,
 }
 
 export function formatClock(ms: number): string {
@@ -547,7 +565,6 @@ export function formatLineSegments(
     let text = stats.providerID
     if (fields.model && stats.modelID !== undefined) text += `/${stats.modelID}`
     if (fields.variant && stats.variant) text += ` ${stats.variant}`
-    if (fields.upstream && stats.upstream) text += ` (${labels.upstream} ${stats.upstream})`
     segments.push({ text, tone: stats.providerChanged ? "warning" : "base" })
     if (stats.providerChanged) segments.push({ text: labels.providerChanged, tone: "warning" })
     else if (stats.modelChanged) segments.push({ text: labels.modelChanged, tone: "muted" })

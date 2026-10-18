@@ -19,8 +19,6 @@ export type Options = {
   enabled?: boolean | undefined
   /** SQLite database path override (defaults to the per-OS state directory). */
   db?: string | undefined
-  /** Store redacted model response headers as upstream-discovery evidence. */
-  captureHeaders?: boolean | undefined
 }
 
 function tryOpen(path: string): Database | undefined {
@@ -40,32 +38,12 @@ export default Plugin.define({
     const db = tryOpen(resolveDbPath(options.db))
     if (db === undefined) return
 
-    // Provider packages name the operator when the user configured a
-    // per-operator provider (`@opencode/ai/providers/fireworks`). The catalogue
-    // is fetched once and refreshed when providers change; it is only a
-    // last-resort source, so a failure just leaves the package unknown.
-    const packages = new Map<string, string | undefined>()
-    async function refreshPackages(): Promise<void> {
-      try {
-        const result = await ctx.provider.list()
-        packages.clear()
-        for (const provider of result.data ?? []) packages.set(provider.id, provider.package)
-      } catch {
-        // Keep whatever was known before.
-      }
-    }
-    void refreshPackages()
-
-    const recorder = createRecorder(db, {
-      captureHeaders: options.captureHeaders === true,
-      providerPackage: (providerID) => (providerID === undefined ? undefined : packages.get(providerID)),
-    })
+    const recorder = createRecorder(db)
     const abort = new AbortController()
     const stream = (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           try {
-            if (event.type === "provider.updated" || event.type === "model.updated") void refreshPackages()
             recorder.handleEvent(event as RecorderEvent)
           } catch {
             // A malformed event must never break the stream.

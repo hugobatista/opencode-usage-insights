@@ -50,13 +50,16 @@ type KeymapCommand = {
 }
 type KeymapLayer = { mode?: string; commands?: KeymapCommand[] }
 
-function createHarness(config: { options?: Record<string, unknown>; sessions?: SessionSeed[]; panelOpens?: boolean } = {}) {
+function createHarness(
+  config: { options?: Record<string, unknown>; sessions?: SessionSeed[]; panelOpens?: boolean; confirm?: boolean } = {},
+) {
   const claims: SlotClaim[] = []
   const commands: KeymapCommand[] = []
   const layers: KeymapLayer[] = []
   const opened: string[] = []
   let currentPanel: { name: string; sessionID: string } | undefined
   const toasts: Array<{ message: string; variant?: string }> = []
+  const dialogs: Array<{ title: string; message: string }> = []
   const events: Array<{ type: string; handler: (payload: unknown) => void; live: boolean }> = []
   const sessions = new Map<string, SessionSeed>()
   // The panel keeps its view, range, sort and filters in the host's durable
@@ -155,6 +158,12 @@ function createHarness(config: { options?: Record<string, unknown>; sessions?: S
           toasts.push(options)
         },
       },
+      dialog: {
+        confirm: (options: { title: string; message: string }) => {
+          dialogs.push(options)
+          return Promise.resolve(config.confirm ?? true)
+        },
+      },
     },
     keymap: {
       layer: (factory: () => KeymapLayer) => {
@@ -185,6 +194,7 @@ function createHarness(config: { options?: Record<string, unknown>; sessions?: S
     opened,
     panel: () => currentPanel,
     toasts,
+    dialogs,
     events,
     sessions,
     cleanup,
@@ -397,27 +407,14 @@ describe("telemetry line", () => {
     expect(harness.lineText("ses_options")).toBe("opencode/deepseek-v4.1-flash-free · step in 1k (1.53M), cached 1.53M, out 50")
   })
 
-  test("reads the upstream operator learned by the recorder", () => {
+  test("never shows a reported operator on the line", () => {
     const db = openStatsDb(resolveDbPath())
     upsertSession(db, { sessionID: "ses_upstream", startedAt: at(0) })
-    recordStep(db, {
-      messageID: "msg_1",
-      sessionID: "ses_upstream",
-      providerID: MODEL.providerID,
-      modelID: MODEL.id,
-      input: 100,
-      output: 10,
-      upstream: "fireworks",
-      upstreamSource: "header:x-served-by",
-    })
+    recordStep(db, { messageID: "msg_1", sessionID: "ses_upstream", providerID: MODEL.providerID, modelID: MODEL.id, input: 100, output: 10 })
     db.close()
 
-    // The reported operator is evidence, so it stays off the line by default.
-    const withUpstream = init({ sessions: [session({ id: "ses_upstream" })] })
-    expect(withUpstream.lineText("ses_upstream")).not.toContain("via")
-
-    const asked = init({ options: { fields: { upstream: true } }, sessions: [session({ id: "ses_upstream" })] })
-    expect(asked.lineText("ses_upstream")).toContain("opencode/deepseek-v4.1-flash-free (via fireworks)")
+    const harness = init({ sessions: [session({ id: "ses_upstream" })] })
+    expect(harness.lineText("ses_upstream")).not.toContain("via")
   })
 
   test("drops its cached upstream lookup when a step ends", () => {
@@ -728,6 +725,73 @@ describe("rendering", () => {
   })
 })
 
+describe("the db view's maintenance", () => {
+  /** One step old enough to be prunable, one step that is not. */
+  function seedOldAndNew(): void {
+    const old = Date.now() - 400 * 24 * 60 * 60 * 1000
+    const db = openStatsDb(resolveDbPath())
+    upsertSession(db, { sessionID: "ses_panel_prune", startedAt: old, title: "Old session" })
+    recordStep(db, { messageID: "msg_old", sessionID: "ses_panel_prune", input: 10, createdAt: old, recordedAt: old })
+    recordStep(db, { messageID: "msg_new", sessionID: "ses_panel_prune", input: 20, createdAt: Date.now(), recordedAt: Date.now() })
+    db.close()
+  }
+
+  function stepIDs(): string[] {
+    const db = openStatsDb(resolveDbPath())
+    const ids = (db.query("SELECT message_id FROM steps WHERE session_id = 'ses_panel_prune' ORDER BY message_id").all() as { message_id: string }[]).map(
+      (row) => row.message_id,
+    )
+    db.close()
+    return ids
+  }
+
+  async function openDbView(sessionID: string) {
+    const harness = init({ sessions: [session({ id: sessionID })], confirm: true })
+    harness.command("usage-insights.stats")!.run("db")
+    const claim = harness.claim("session.panel")!
+    const input = { name: PANEL_NAME, sessionID, width: 110, presentation: "panel", focused: false }
+    const setup = await testRender(() => claim.render(input as never) as never, { width: 120, height: 30 })
+    await setup.renderOnce()
+    return { harness, setup }
+  }
+
+  test("prunes the retention the user picks, after asking", async () => {
+    seedOldAndNew()
+    const { harness, setup } = await openDbView("ses_panel_prune")
+    try {
+      // The cursor starts on the first retention the db view offers (30 days).
+      harness.command("usage-insights.drill")!.run()
+      await Bun.sleep(1)
+      expect(harness.dialogs).toHaveLength(1)
+      expect(harness.dialogs[0]!.title).toBe("Prune older than 30 days")
+      expect(harness.dialogs[0]!.message).toContain("would be deleted")
+      expect(harness.toasts[0]?.message).toContain("pruned 1 steps")
+      expect(stepIDs()).toEqual(["msg_new"])
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("declining the confirmation keeps the history", async () => {
+    seedOldAndNew()
+    const harness = init({ sessions: [session({ id: "ses_panel_prune" })], confirm: false })
+    harness.command("usage-insights.stats")!.run("db")
+    const claim = harness.claim("session.panel")!
+    const input = { name: PANEL_NAME, sessionID: "ses_panel_prune", width: 110, presentation: "panel", focused: false }
+    const setup = await testRender(() => claim.render(input as never) as never, { width: 120, height: 30 })
+    try {
+      await setup.renderOnce()
+      harness.command("usage-insights.drill")!.run()
+      await Bun.sleep(1)
+      expect(harness.dialogs).toHaveLength(1)
+      expect(harness.toasts).toHaveLength(0)
+      expect(stepIDs()).toEqual(["msg_new", "msg_old"])
+    } finally {
+      await setup.dispose()
+    }
+  })
+})
+
 describe("history", () => {
   function seedHistory(): void {
     const db = openStatsDb(resolveDbPath())
@@ -745,7 +809,6 @@ describe("history", () => {
       output: 434,
       reasoning: 631,
       router: "orcarouter-dsv4.1flash",
-      upstream: "DeepSeek",
       recordedAt: at(20),
     })
     db.close()
@@ -766,7 +829,8 @@ describe("history", () => {
       expect(text).toContain("hit")
       expect(text).toContain("turns")
       expect(text).toContain("orcarouter-dsv4.1flash")
-      expect(text).toContain("in 1.62k (427.3k)")
+      // The cost of the turn is on its line; the prompt in parentheses gives way.
+      expect(text).toContain("in 1.62k · out 1.06k")
     } finally {
       await setup.dispose()
     }

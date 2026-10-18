@@ -1,17 +1,30 @@
 import { Database } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
+import { chmodSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { UpstreamInfo } from "../upstream"
+import type { EndpointInfo } from "../endpoint"
+import { ensureRegularFile } from "./paths"
+import { normalizeToken, sanitizeLabel, TEXT_LIMIT } from "../text"
 
 /**
  * Persistent usage store. One SQLite database holds every recorded step,
- * prompt, event, session row and (in discovery mode) upstream HTTP response.
+ * prompt, event and session row — and nothing else: the recorder only writes
+ * what a view reads.
  *
  * The database is opened in WAL mode with a busy timeout so the server
- * recorder process and the TUI reader process can share it safely.
+ * recorder process and the TUI reader process can share it safely. The two
+ * sides open it differently on purpose:
+ *
+ * - `openStatsDb` writes: schema, migrations and recording (the server).
+ * - `openStatsDbReadOnly` only reads (the TUI), so no view can change the file
+ *   and no reader pays for a schema write.
+ * - `openStatsDbWrite` is a short-lived maintenance connection (prune, vacuum)
+ *   that gives up quickly instead of holding the recorder up.
  */
 
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 7
+
+/** Longest title or path kept: a label on a line, not a document. */
+const LABEL_LIMIT = 4 * TEXT_LIMIT
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -53,18 +66,19 @@ CREATE TABLE IF NOT EXISTS steps (
   streamed_at INTEGER,
   completed_at INTEGER,
   finish TEXT,
-  provider_state TEXT,
-  upstream TEXT,
-  upstream_source TEXT,
-  upstream_model TEXT,
   router TEXT,
-  tps REAL,
   recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS steps_session ON steps(session_id, created_at);
 CREATE INDEX IF NOT EXISTS steps_model ON steps(provider_id, model_id, variant);
 CREATE INDEX IF NOT EXISTS steps_completed ON steps(completed_at);
-CREATE INDEX IF NOT EXISTS steps_upstream ON steps(upstream);
+CREATE INDEX IF NOT EXISTS steps_router ON steps(router);
+-- Every range filter and every ordering compares the step's own clock, which
+-- falls back to the recording time for a step that was already in flight when
+-- the plugin loaded. The index has to cover that expression, or every ranged
+-- view is a full table scan.
+CREATE INDEX IF NOT EXISTS steps_at ON steps(COALESCE(created_at, recorded_at));
+CREATE INDEX IF NOT EXISTS steps_session_at ON steps(session_id, COALESCE(created_at, recorded_at));
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,20 +90,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_session ON events(session_id, at);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, at);
-
-CREATE TABLE IF NOT EXISTS http_responses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at INTEGER NOT NULL,
-  method TEXT,
-  path TEXT,
-  status INTEGER,
-  headers TEXT
-);
-CREATE INDEX IF NOT EXISTS http_responses_at ON http_responses(at);
 `
 
 /** Tables carried by `exportNdjson` / `importNdjson`, in import-safe order. */
-export const TABLES = ["sessions", "prompts", "events", "steps", "http_responses"] as const
+export const TABLES = ["sessions", "prompts", "events", "steps"] as const
 
 export type TableName = (typeof TABLES)[number]
 
@@ -110,16 +114,8 @@ export type StepRecord = {
   streamedAt?: number | undefined
   completedAt?: number | undefined
   finish?: string | undefined
-  /** Raw `providerState` of the assistant message, stringified when needed. */
-  providerState?: unknown
-  upstream?: string | undefined
-  upstreamSource?: string | undefined
-  /** Upstream model id reported by the gateway (`deepseek/deepseek-v4.1-flash`). */
-  upstreamModel?: string | undefined
   /** Gateway routing endpoint that served the request (`orcarouter-dsv4.1flash`). */
   router?: string | undefined
-  /** Tokens per second of the step: `(output + reasoning)` over `created → streamed`. */
-  tps?: number | undefined
   /** Clock of the recording itself, defaults to `Date.now()`. */
   recordedAt?: number | undefined
 }
@@ -147,14 +143,6 @@ export type SessionRecord = {
   updatedAt?: number | undefined
 }
 
-export type HttpResponseRecord = {
-  at: number
-  method?: string | undefined
-  path?: string | undefined
-  status?: number | undefined
-  headers?: unknown
-}
-
 function jsonText(value: unknown): string | null {
   if (value === undefined || value === null) return null
   if (typeof value === "string") return value
@@ -170,43 +158,41 @@ function jsonText(value: unknown): string | null {
  * an optional statement that backfills them.
  */
 const MIGRATIONS: ReadonlyArray<readonly [string, string, string?]> = [
-  ["upstream_model", "ALTER TABLE steps ADD COLUMN upstream_model TEXT"],
   ["router", "ALTER TABLE steps ADD COLUMN router TEXT"],
-  [
-    "tps",
-    "ALTER TABLE steps ADD COLUMN tps REAL",
-    // Tokens per second are derivable from what is already stored, so the
-    // history gains the column too: (output + reasoning) over the streaming
-    // window (created → streamed).
-    `UPDATE steps
-        SET tps = (output_tokens + reasoning_tokens) * 1000.0 / (streamed_at - created_at)
-      WHERE tps IS NULL
-        AND streamed_at IS NOT NULL
-        AND created_at IS NOT NULL
-        AND streamed_at > created_at
-        AND (output_tokens + reasoning_tokens) > 0`,
-  ],
 ]
 
 /**
- * Data migrations keyed by the schema version that introduced them. They run
- * once per database, in order, and are what lets a derived column change its
- * meaning without leaving stale values behind.
+ * Columns and tables the recorder used to write and no view ever read. They are
+ * dropped from an existing database, together with the rows of the events that
+ * followed the same fate, so a long-lived file shrinks instead of carrying dead
+ * weight forever.
  */
-const DATA_MIGRATIONS: ReadonlyArray<readonly [number, string]> = [
-  [
-    4,
-    `UPDATE steps
-        SET tps = CASE
-              WHEN streamed_at IS NOT NULL
-               AND created_at IS NOT NULL
-               AND streamed_at > created_at
-               AND (output_tokens + reasoning_tokens) > 0
-              THEN (output_tokens + reasoning_tokens) * 1000.0 / (streamed_at - created_at)
-              ELSE NULL
-            END`,
-  ],
-]
+const REMOVED_COLUMNS = ["provider_state", "upstream", "upstream_source", "upstream_model", "tps"] as const
+const REMOVED_EVENT_KINDS = ["execution", "step-failed", "model-selected", "usage-recorded"] as const
+
+function dropUnused(db: Database): void {
+  const objects = db.query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index')").all() as {
+    name: string
+    type: string
+  }[]
+  const tables = new Set(objects.filter((row) => row.type === "table").map((row) => row.name))
+  const indexes = new Set(objects.filter((row) => row.type === "index").map((row) => row.name))
+
+  if (tables.has("http_responses")) db.exec("DROP TABLE http_responses")
+  // The index reads a column that is about to go: SQLite refuses to drop an
+  // indexed column, so the index goes first.
+  if (indexes.has("steps_upstream")) db.exec("DROP INDEX steps_upstream")
+
+  const columns = new Set((db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name))
+  for (const name of REMOVED_COLUMNS) {
+    if (columns.has(name)) db.exec(`ALTER TABLE steps DROP COLUMN ${name}`)
+  }
+
+  if (tables.has("events")) {
+    const kinds = REMOVED_EVENT_KINDS.map((kind) => `'${kind}'`).join(", ")
+    db.exec(`DELETE FROM events WHERE kind IN (${kinds})`)
+  }
+}
 
 function schemaVersion(db: Database): number {
   const row = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | null
@@ -214,7 +200,17 @@ function schemaVersion(db: Database): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
+/**
+ * The endpoint identity is a grouping key: two spellings of the same endpoint
+ * would split its history and read as a change. Values recorded before the
+ * rule existed are folded into the lowercase form.
+ */
+function normalizeRouters(db: Database): void {
+  db.exec("UPDATE steps SET router = lower(router) WHERE router IS NOT NULL AND router <> lower(router)")
+}
+
 function migrate(db: Database): void {
+  const version = schemaVersion(db)
   const steps = db.query("PRAGMA table_info(steps)").all() as { name: string }[]
   const existing = new Set(steps.map((column) => column.name))
   for (const [name, statement, backfill] of MIGRATIONS) {
@@ -222,16 +218,52 @@ function migrate(db: Database): void {
     db.exec(statement)
     if (backfill !== undefined) db.exec(backfill)
   }
-  const version = schemaVersion(db)
-  for (const [target, statement] of DATA_MIGRATIONS) {
-    if (version >= target) continue
-    db.exec(statement)
+  // Anything the recorder used to write and no view ever read is dropped here.
+  // It is cheap and idempotent, so it also heals a database a half-applied
+  // migration left behind.
+  dropUnused(db)
+  if (version < 7) normalizeRouters(db)
+}
+
+/**
+ * The file holds session titles, project directories and usage history, so it
+ * is created for the user alone. Windows takes its access from the parent
+ * directory's ACL, which is not something a plugin should rewrite.
+ */
+const POSIX = process.platform !== "win32"
+
+function hardenDirectory(path: string): void {
+  if (!POSIX) return
+  try {
+    chmodSync(path, 0o700)
+  } catch {
+    // A shared or read-only directory: the database is still usable.
   }
+}
+
+function hardenFiles(path: string): void {
+  if (!POSIX || path === ":memory:") return
+  for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+    try {
+      chmodSync(file, 0o600)
+    } catch {
+      // The WAL and the shared-memory file are created on the first write and
+      // removed on the last close, so one of them is often simply absent.
+    }
+  }
+}
+
+/** Directory for a database path, created private on POSIX. */
+function prepareDirectory(path: string): void {
+  if (path === ":memory:") return
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  hardenDirectory(dirname(path))
 }
 
 /** Open (creating when needed) the stats database and apply the schema. */
 export function openStatsDb(path: string): Database {
-  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true })
+  if (path !== ":memory:") ensureRegularFile(path)
+  prepareDirectory(path)
   const db = new Database(path, { create: true })
   db.exec("PRAGMA journal_mode = WAL")
   db.exec("PRAGMA busy_timeout = 5000")
@@ -241,27 +273,59 @@ export function openStatsDb(path: string): Database {
   db.query("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
     String(SCHEMA_VERSION),
   )
+  // The schema write is what creates the WAL and its shared-memory file.
+  hardenFiles(path)
+  return db
+}
+
+/**
+ * Reader connection for the TUI: no schema, no migration, no write. It throws
+ * when the database is absent or was never written by the recorder, so the
+ * caller can say so instead of showing an empty panel.
+ */
+export function openStatsDbReadOnly(path: string): Database {
+  ensureRegularFile(path)
+  const db = new Database(path, { readonly: true })
+  try {
+    db.query("SELECT 1 FROM steps LIMIT 1").get()
+  } catch (error) {
+    db.close()
+    throw error
+  }
+  return db
+}
+
+/**
+ * Short-lived write connection for maintenance. The busy timeout is short on
+ * purpose: a prune or a vacuum that cannot take the lock must fail in front of
+ * the user, not hold the recorder's response path for seconds.
+ */
+export function openStatsDbWrite(path: string): Database {
+  if (path !== ":memory:") ensureRegularFile(path)
+  prepareDirectory(path)
+  const db = new Database(path, { create: true })
+  db.exec("PRAGMA busy_timeout = 250")
+  db.exec("PRAGMA synchronous = NORMAL")
+  hardenFiles(path)
   return db
 }
 
 /**
  * Insert or refresh an assistant step. Idempotent by message ID so replayed
  * events, restarts and NDJSON imports never duplicate usage. Non-null fields
- * discovered later (upstream operator name, provider state) survive a
- * re-record with `NULL` through COALESCE.
+ * discovered later (the routing endpoint) survive a re-record with `NULL`
+ * through COALESCE.
  */
 export function recordStep(db: Database, record: StepRecord): void {
   db.query(
     `INSERT INTO steps (
        message_id, session_id, parent_id, provider_id, model_id, variant,
        input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost,
-       created_at, streamed_at, completed_at, finish, provider_state,
-       upstream, upstream_source, upstream_model, router, tps, recorded_at
+       created_at, streamed_at, completed_at, finish, router, recorded_at
      ) VALUES (
        $messageID, $sessionID, $parentID, $providerID, $modelID, $variant,
        $input, $output, $reasoning, $cacheRead, $cacheWrite, $cost,
-       $createdAt, $streamedAt, $completedAt, $finish, $providerState,
-       $upstream, $upstreamSource, $upstreamModel, $router, $tps, $recordedAt
+       $createdAt, $streamedAt, $completedAt, $finish, $router, $recordedAt
      )
      ON CONFLICT(message_id) DO UPDATE SET
        session_id = excluded.session_id,
@@ -279,12 +343,7 @@ export function recordStep(db: Database, record: StepRecord): void {
        streamed_at = COALESCE(excluded.streamed_at, steps.streamed_at),
        completed_at = COALESCE(excluded.completed_at, steps.completed_at),
        finish = COALESCE(excluded.finish, steps.finish),
-       provider_state = COALESCE(excluded.provider_state, steps.provider_state),
-       upstream = COALESCE(excluded.upstream, steps.upstream),
-       upstream_source = COALESCE(excluded.upstream_source, steps.upstream_source),
-       upstream_model = COALESCE(excluded.upstream_model, steps.upstream_model),
        router = COALESCE(excluded.router, steps.router),
-       tps = COALESCE(excluded.tps, steps.tps),
        recorded_at = excluded.recorded_at`,
   ).run({
     $messageID: record.messageID,
@@ -302,13 +361,8 @@ export function recordStep(db: Database, record: StepRecord): void {
     $createdAt: record.createdAt ?? null,
     $streamedAt: record.streamedAt ?? null,
     $completedAt: record.completedAt ?? null,
-    $finish: record.finish ?? null,
-    $providerState: jsonText(record.providerState),
-    $upstream: record.upstream ?? null,
-    $upstreamSource: record.upstreamSource ?? null,
-    $upstreamModel: record.upstreamModel ?? null,
-    $router: record.router ?? null,
-    $tps: record.tps ?? null,
+    $finish: record.finish === undefined ? null : sanitizeLabel(record.finish, 64),
+    $router: record.router === undefined ? null : (normalizeToken(record.router) ?? null),
     $recordedAt: record.recordedAt ?? Date.now(),
   })
 }
@@ -331,7 +385,7 @@ export function recordEvent(db: Database, record: EventRecord): void {
      VALUES ($sessionID, $kind, $messageID, $at, $data)`,
   ).run({
     $sessionID: record.sessionID,
-    $kind: record.kind,
+    $kind: sanitizeLabel(record.kind, 64),
     $messageID: record.messageID ?? null,
     $at: record.at ?? Date.now(),
     $data: jsonText(record.data),
@@ -351,72 +405,50 @@ export function upsertSession(db: Database, record: SessionRecord): void {
   ).run({
     $sessionID: record.sessionID,
     $parentID: record.parentID ?? null,
-    $directory: record.directory ?? null,
-    $title: record.title ?? null,
+    // Titles are written by a model and directories come from the host: both
+    // are displayed, so neither may carry control characters into a terminal.
+    $directory: record.directory === undefined ? null : sanitizeLabel(record.directory, LABEL_LIMIT),
+    $title: record.title === undefined ? null : sanitizeLabel(record.title, LABEL_LIMIT),
     $startedAt: record.startedAt ?? null,
     $updatedAt: record.updatedAt ?? null,
   })
 }
 
-/** Attach the upstream evidence discovered after the step was recorded. */
-export function setUpstream(db: Database, messageID: string, info: UpstreamInfo): void {
+/**
+ * Attach the endpoint discovered after the step was recorded. A step that
+ * already carries the same endpoint is left alone: the recorder runs on the
+ * request path, and a no-op write there is a cost with no reader.
+ */
+export function setStepRouter(db: Database, messageID: string, info: EndpointInfo): void {
+  const router = info.router === undefined ? undefined : normalizeToken(info.router)
+  if (router === undefined) return
   db.query(
     `UPDATE steps
-        SET upstream = COALESCE($upstream, upstream),
-            upstream_source = COALESCE($source, upstream_source),
-            upstream_model = COALESCE($model, upstream_model),
-            router = COALESCE($router, router)
-      WHERE message_id = $messageID`,
-  ).run({
-    $upstream: info.operator ?? null,
-    $source: info.source ?? null,
-    $model: info.model ?? null,
-    $router: info.router ?? null,
-    $messageID: messageID,
-  })
+        SET router = $router
+      WHERE message_id = $messageID AND router IS NOT $router`,
+  ).run({ $router: router, $messageID: messageID })
 }
 
 /**
- * Apply provenance learned from a compaction to every step of that session
- * and model that still lacks an operator. Returns the number of rows touched.
+ * Apply the endpoint learned from a compaction to every step of that session
+ * and model that still lacks one. Returns the number of rows touched.
  */
-export function setUpstreamForSessionModel(
+export function setStepRouterForSessionModel(
   db: Database,
   sessionID: string,
   modelID: string | undefined,
-  info: UpstreamInfo,
+  info: EndpointInfo,
 ): number {
+  const router = info.router === undefined ? undefined : normalizeToken(info.router)
+  if (router === undefined) return 0
   const result = db
     .query(
       `UPDATE steps
-          SET upstream = COALESCE(upstream, $upstream),
-              upstream_source = COALESCE(upstream_source, $source),
-              upstream_model = COALESCE(upstream_model, $model),
-              router = COALESCE(router, $router)
-        WHERE session_id = $sessionID AND upstream IS NULL AND ($modelID IS NULL OR model_id = $modelID)`,
+          SET router = $router
+        WHERE session_id = $sessionID AND router IS NULL AND ($modelID IS NULL OR model_id = $modelID)`,
     )
-    .run({
-      $upstream: info.operator ?? null,
-      $source: info.source ?? null,
-      $model: info.model ?? null,
-      $router: info.router ?? null,
-      $sessionID: sessionID,
-      $modelID: modelID ?? null,
-    })
+    .run({ $router: router, $sessionID: sessionID, $modelID: modelID ?? null })
   return result.changes
-}
-
-export function recordHttpResponse(db: Database, record: HttpResponseRecord): void {
-  db.query(
-    `INSERT INTO http_responses (at, method, path, status, headers)
-     VALUES ($at, $method, $path, $status, $headers)`,
-  ).run({
-    $at: record.at,
-    $method: record.method ?? null,
-    $path: record.path ?? null,
-    $status: record.status ?? null,
-    $headers: jsonText(record.headers),
-  })
 }
 
 /** Dump every table as NDJSON (`{"table": "...", "row": {...}}` per line). */
@@ -429,15 +461,67 @@ export function exportNdjson(db: Database): string {
   return lines.length > 0 ? `${lines.join("\n")}\n` : ""
 }
 
+/** Column shape an import has to respect: the type and the NOT NULL rules. */
+type ImportColumn = {
+  name: string
+  /** Declared affinity: `INTEGER`, `REAL`, `TEXT`, `BLOB` or empty. */
+  type: string
+  notNull: boolean
+  primaryKey: boolean
+  /** A column with a default may be left out of the import entirely. */
+  hasDefault: boolean
+}
+
+function numericAffinity(type: string): boolean {
+  const upper = type.toUpperCase()
+  return upper.includes("INT") || upper.includes("REAL") || upper.includes("NUM") || upper.includes("DEC") || upper.includes("DOUB")
+}
+
+/**
+ * One imported value, forced into the shape of its column. Text is sanitized
+ * and capped like everything else that is displayed; a number that is not a
+ * finite number becomes NULL, so a crafted dump cannot store `NaN` or a
+ * string where a view does arithmetic.
+ */
+function importValue(value: unknown, column: ImportColumn): string | number | null {
+  if (value === null || value === undefined) return null
+  if (numericAffinity(column.type)) {
+    const parsed = typeof value === "number" ? value : Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  if (typeof value === "number") return Number.isFinite(value) ? value : null
+  if (typeof value === "boolean") return value ? 1 : 0
+  if (typeof value === "object") return sanitizeLabel(JSON.stringify(value) ?? "", LABEL_LIMIT)
+  return sanitizeLabel(String(value), LABEL_LIMIT)
+}
+
 /**
  * Load an `exportNdjson` dump back in. Rows are inserted with `OR IGNORE`, so
- * importing the same dump twice is harmless. Unknown tables are rejected.
+ * importing the same dump twice is harmless. Unknown tables and rows that are
+ * not objects are rejected; a row that cannot fill a required column is
+ * skipped rather than aborting the rest of the import. A column the row does
+ * not carry is left to its default, the same way a hand-written insert is.
  */
 export function importNdjson(db: Database, text: string): number {
-  const columns = new Map<TableName, string[]>()
+  const columns = new Map<TableName, ImportColumn[]>()
   for (const table of TABLES) {
-    const info = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]
-    columns.set(table, info.map((column) => column.name))
+    const info = db.query(`PRAGMA table_info(${table})`).all() as {
+      name: string
+      type: string
+      notnull: number
+      pk: number
+      dflt_value: string | null
+    }[]
+    columns.set(
+      table,
+      info.map((column) => ({
+        name: column.name,
+        type: column.type,
+        notNull: column.notnull === 1,
+        primaryKey: column.pk > 0,
+        hasDefault: column.dflt_value !== null,
+      })),
+    )
   }
 
   let imported = 0
@@ -453,10 +537,30 @@ export function importNdjson(db: Database, text: string): number {
     const table = parsed.table as TableName | undefined
     const row = parsed.row
     if (!table || !row || !(TABLES as readonly string[]).includes(table)) continue
-    const names = columns.get(table) ?? []
-    const values = names.map((name) => row[name] ?? null)
+    const shape = columns.get(table) ?? []
+    if (shape.length === 0) continue
+    const names: string[] = []
+    const values: (string | number)[] = []
+    let importable = true
+    for (const column of shape) {
+      const value = importValue(row[column.name], column)
+      if (value !== null) {
+        names.push(column.name)
+        values.push(value)
+        continue
+      }
+      // NULL for a column that cannot hold one has no default to fall back on,
+      // and a NULL in a text primary key is a key the database cannot use; an
+      // INTEGER PRIMARY KEY is a rowid, so leaving it out assigns one.
+      const required = (column.notNull || (column.primaryKey && !numericAffinity(column.type))) && !column.hasDefault
+      if (required) {
+        importable = false
+        break
+      }
+    }
+    if (!importable) continue
     const placeholders = names.map(() => "?").join(", ")
-    db.query(`INSERT OR IGNORE INTO ${table} (${names.join(", ")}) VALUES (${placeholders})`).run(...(values as (string | number | null)[]))
+    db.query(`INSERT OR IGNORE INTO ${table} (${names.join(", ")}) VALUES (${placeholders})`).run(...values)
     imported += 1
   }
   return imported

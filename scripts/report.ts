@@ -14,18 +14,25 @@ import { existsSync, readFileSync } from "node:fs"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
 import { DEFAULT_SETTINGS, GRANULARITIES, PANEL_VIEWS, RANGE_KEYS, count, type Granularity, type PanelLine, type PanelView, type RangeKey } from "../src/panel-data"
 import {
-  affinityReport,
-  coverageReport,
-  gapReport,
-  latencyGroups,
-  periodReport,
-  endpointBreakdown,
-  endpointSummary,
-  stepFacts,
-} from "../src/stats/insights"
+  affinityOf,
+  cacheDropsOf,
+  cacheStatsByModel,
+  cachePairs,
+  stepRows,
+  cacheStatsOf,
+  coverageOf,
+  endpointBreakdownOf,
+  endpointSummaryOf,
+  gapReportOf,
+  latencyGroupsOf,
+  latencyOf,
+  periodsOf,
+  ttlEvidenceOf,
+} from "../src/stats/aggregates"
 import { exportNdjson, importNdjson, openStatsDb } from "../src/stats/db"
+import { dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
 import { defaultDbPath, resolveDbPath } from "../src/stats/paths"
-import { cacheDrops, cacheTtlEvidence, latency, models, overview, sessions } from "../src/stats/queries"
+import { models, overview, sessions } from "../src/stats/queries"
 
 type Args = {
   view: PanelView | "all"
@@ -40,6 +47,8 @@ type Args = {
   json: boolean
   ndjson: boolean
   import?: string | undefined
+  prune?: number | undefined
+  vacuum: boolean
 }
 
 const USAGE = `usage: bun run report [view] [range] [options]
@@ -55,15 +64,19 @@ flags  --db <path>          database override (default: ${defaultDbPath()})
        --asc                sort ascending (default: descending)
        --json               print the raw query rows as JSON
        --ndjson             export the whole database as NDJSON
-       --import <file>      merge an NDJSON export into the database and exit`
+       --import <file>      merge an NDJSON export into the database and exit
+       --prune <days>       delete the recorded usage older than <days>
+       --vacuum             rewrite the file to reclaim the space a prune freed`
 
 function parse(argv: readonly string[]): Args {
-  const parsed: Args = { view: "overview", range: "all", width: 100, granularity: "day", sortDesc: true, json: false, ndjson: false }
+  const parsed: Args = { view: "overview", range: "all", width: 100, granularity: "day", sortDesc: true, json: false, ndjson: false, vacuum: false }
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index] ?? ""
     if (token === "--json") parsed.json = true
     else if (token === "--ndjson") parsed.ndjson = true
     else if (token === "--asc") parsed.sortDesc = false
+    else if (token === "--vacuum") parsed.vacuum = true
+    else if (token === "--prune") parsed.prune = Number(argv[++index])
     else if (token === "--db") parsed.db = argv[++index]
     else if (token === "--import") parsed.import = argv[++index]
     else if (token === "--width") parsed.width = Number(argv[++index] ?? 100)
@@ -132,6 +145,25 @@ if (args.ndjson) {
 }
 
 const now = Date.now()
+
+if (args.prune !== undefined) {
+  if (!Number.isFinite(args.prune) || args.prune < 0) {
+    console.error("--prune takes a number of days")
+    db.close()
+    process.exit(2)
+  }
+  const result = pruneOlderThan(db, now - args.prune * 24 * 60 * 60 * 1000)
+  console.log(`pruned ${count(result.steps, "step")} · ${count(result.prompts, "prompt")} · ${count(result.events, "compaction event")}`)
+}
+if (args.vacuum) {
+  const result = vacuum(db, path)
+  console.log(`vacuum: ${(result.freed / 1_048_576).toFixed(1)} MB back (${(result.after / 1_048_576).toFixed(1)} MB now)`)
+}
+if (args.prune !== undefined || args.vacuum) {
+  db.close()
+  process.exit(0)
+}
+
 const range = args.range === "session" ? undefined : rangeForCli(args.range, now)
 if (args.range === "session") console.error("note: no session context here, so \"session\" covers the whole database")
 
@@ -141,18 +173,28 @@ const filters = {
 }
 
 if (args.json) {
-  const facts = stepFacts(db, { range, filters, withPredecessor: true })
+  // Two reads serve the whole dump: the steps, and the pairs (the steps plus
+  // the one before the range, for the reports that compare consecutive steps).
+  const steps = stepRows(db, { range, filters })
+  const pairs = cachePairs(db, { range, filters })
   const data = {
     overview: overview(db, range, filters),
     models: models(db, range, filters),
-    endpoints: endpointSummary(facts),
-    endpointModels: endpointBreakdown(facts),
-    affinity: affinityReport(facts),
-    cache: { drops: cacheDrops(db, { range, filters }), ttl: cacheTtlEvidence(db, { range, filters }), gap: gapReport(facts) },
-    periods: periodReport(facts, args.granularity),
-    latency: { overall: latency(db, range, filters), byModel: latencyGroups(facts, "model"), byOperator: latencyGroups(facts, "operator") },
+    endpoints: endpointSummaryOf(steps),
+    endpointModels: endpointBreakdownOf(steps),
+    affinity: affinityOf(pairs),
+    cache: {
+      stats: cacheStatsOf(db, { range, filters }),
+      byModel: cacheStatsByModel(steps),
+      drops: cacheDropsOf(db, pairs),
+      ttl: ttlEvidenceOf(pairs),
+      gap: gapReportOf(pairs),
+    },
+    periods: periodsOf(steps, args.granularity),
+    latency: { overall: latencyOf(steps), byModel: latencyGroupsOf(steps, "model"), byEndpoint: latencyGroupsOf(steps, "endpoint") },
     sessions: sessions(db, { range, filters, limit: 50 }),
-    coverage: coverageReport(facts),
+    coverage: coverageOf(db, { range, filters }),
+    db: dbInfo(db, path, now),
   }
   console.log(JSON.stringify(data, null, 2))
   db.close()
@@ -175,6 +217,7 @@ for (const view of views) {
     sessionID: "",
     sessionStart: undefined,
     now,
+    database: dbInfo(db, path, now),
     width: args.width,
   }
   const lines: PanelLine[] = buildPanel(request)

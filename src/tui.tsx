@@ -9,17 +9,16 @@ import { lineParts, lineText, sessionTotals, toTranscript, type LinePart, type R
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
 import { TurnsSidebar } from "./sidebar"
-import { openStatsDb } from "./stats/db"
+import { openStatsDbReadOnly, openStatsDbWrite } from "./stats/db"
 import { resolveDbPath } from "./stats/paths"
-import { latestUpstream, routerBefore } from "./stats/queries"
-import type { UpstreamInfo } from "./upstream"
+import { latestRouter, routerBefore } from "./stats/queries"
 
 /**
  * TUI side of the plugin. Two contributions:
  *
  * - `session.composer.top`: one telemetry line after every turn with the end
- *   time, the delta since the previous prompt, the provider, the upstream
- *   operator when known, turn and session token totals, and cache warnings.
+ *   time, the delta since the previous prompt, the endpoint that served it,
+ *   turn and session token totals, and cache warnings.
  * - `session.panel` + the `/stats` slash command: the statistics panel over
  *   the database written by the server entry.
  *
@@ -33,8 +32,6 @@ export type Options = {
   enabled?: boolean | undefined
   /** SQLite database path override; must match the server entry. */
   db?: string | undefined
-  /** Show the upstream operator on the line when a recorder learned it. */
-  upstream?: boolean | undefined
   /**
    * Which identity the line leads with: `endpoint` (default) shows the gateway
    * endpoint that served the turn (`orcarouter-dsv4.1flash`) and warns when it
@@ -61,7 +58,14 @@ export type Options = {
   panel?: boolean | undefined
 }
 
-const UPSTREAM_CACHE_MS = 5_000
+const ROUTER_CACHE_MS = 5_000
+
+/**
+ * Shortest interval between two panel rebuilds. A tool-call loop ends several
+ * steps in a row, and each one used to rebuild every open view; the views read
+ * the database, so the burst is coalesced into one rebuild.
+ */
+const REFRESH_THROTTLE_MS = 300
 
 // Test hook. The plugin loader reads the default export only; named exports
 // are ignored.
@@ -94,15 +98,45 @@ export default Plugin.define({
     // Bumped when a step or an execution ends: the panel and the sidebar read
     // the database, which is not reactive by itself.
     const [refresh, setRefresh] = createSignal(0)
-    const upstreamCache = new Map<string, { value: UpstreamInfo | undefined; at: number }>()
+    const routerCache = new Map<string, { value: string | undefined; at: number }>()
     let database: Database | undefined
     let databaseFailed = false
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    let lastRefresh = 0
 
+    /**
+     * Ask the panel and the sidebar to re-read the database, at most once per
+     * throttle window. The first event after an idle stretch is instant; the
+     * rest of a burst is folded into one trailing rebuild.
+     */
+    function bumpRefresh(): void {
+      const now = Date.now()
+      const wait = lastRefresh + REFRESH_THROTTLE_MS - now
+      if (wait <= 0) {
+        lastRefresh = now
+        setRefresh((value) => value + 1)
+        return
+      }
+      if (refreshTimer !== undefined) return
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined
+        lastRefresh = Date.now()
+        setRefresh((value) => value + 1)
+      }, wait)
+      // A repaint is not a reason to keep the process alive.
+      ;(refreshTimer as { unref?: (() => void) | undefined }).unref?.()
+    }
+
+    /**
+     * Reader connection. Read-only on purpose: the TUI only ever reads, and a
+     * reader that cannot write never takes the recorder's lock, never runs a
+     * schema statement and cannot corrupt what it shows.
+     */
     function db(): Database | undefined {
       if (database !== undefined) return database
       if (databaseFailed) return undefined
       try {
-        database = openStatsDb(resolveDbPath(options.db))
+        database = openStatsDbReadOnly(resolveDbPath(options.db))
         return database
       } catch {
         databaseFailed = true
@@ -110,26 +144,44 @@ export default Plugin.define({
       }
     }
 
+    /**
+     * Write connection for maintenance only (prune, compact), opened for the
+     * duration of the operation with a short busy timeout: a reader waits, but
+     * a maintenance action that cannot take the lock is an error the user can
+     * see and retry.
+     */
+    function withWrite<Value>(run: (handle: Database) => Value): Value | undefined {
+      let handle: Database | undefined
+      try {
+        handle = openStatsDbWrite(resolveDbPath(options.db))
+        return run(handle)
+      } catch {
+        return undefined
+      } finally {
+        handle?.close()
+      }
+    }
+
     function sessionStart(sessionID: string): number | undefined {
       return ctx.data.session.get(sessionID)?.time.created
     }
 
-    function lookupUpstream(sessionID: string, modelID: string | undefined): UpstreamInfo | undefined {
-      if (modelID === undefined || options.upstream === false) return undefined
+    function lookupRouter(sessionID: string, modelID: string | undefined): string | undefined {
+      if (modelID === undefined) return undefined
       const key = `${sessionID}|${modelID}`
       const now = Date.now()
-      const cached = upstreamCache.get(key)
-      if (cached !== undefined && now - cached.at < UPSTREAM_CACHE_MS) return cached.value
-      let value: UpstreamInfo | undefined
+      const cached = routerCache.get(key)
+      if (cached !== undefined && now - cached.at < ROUTER_CACHE_MS) return cached.value
+      let value: string | undefined
       const handle = db()
       if (handle !== undefined) {
         try {
-          value = latestUpstream(handle, sessionID, modelID)
+          value = latestRouter(handle, sessionID, modelID)
         } catch {
           value = undefined
         }
       }
-      upstreamCache.set(key, { value, at: now })
+      routerCache.set(key, { value, at: now })
       return value
     }
 
@@ -155,10 +207,9 @@ export default Plugin.define({
       if (!sessionIdle(sessionID)) return undefined
       const stats = computeTurn(toTranscript(messages), sessionTotals(info))
       if (stats !== undefined) {
-        const upstream = lookupUpstream(sessionID, stats.modelID)
-        if (upstream?.operator !== undefined) stats.upstream = upstream.operator
-        if (upstream?.router !== undefined) {
-          stats.router = upstream.router
+        const router = lookupRouter(sessionID, stats.modelID)
+        if (router !== undefined) {
+          stats.router = router
           // The transcript carries no routing history, so the previous endpoint
           // comes from the database: the line warns when the turn was served by
           // a different endpoint than the turn before it.
@@ -229,7 +280,7 @@ export default Plugin.define({
               <Panel
                 input={input}
                 ctx={ctx}
-                deps={{ db, now: () => Date.now(), sessionStart, refresh }}
+                deps={{ db, dbPath: () => resolveDbPath(options.db), withWrite, now: () => Date.now(), sessionStart, refresh }}
                 settings={settings}
                 update={patchSettings}
                 format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, identity: options.identity }}
@@ -313,16 +364,16 @@ export default Plugin.define({
     }
 
     const disposeEvents = [
-      // A finished step may carry a fresh upstream operator; drop the cache and
-      // let the history views re-read the database.
+      // A finished step may carry a fresh endpoint; drop the cache and let the
+      // history views re-read the database.
       ctx.data.on("session.step.ended", () => {
-        upstreamCache.clear()
-        setRefresh((value) => value + 1)
+        routerCache.clear()
+        bumpRefresh()
       }),
-      ctx.data.on("session.execution.succeeded", () => setRefresh((value) => value + 1)),
-      ctx.data.on("session.execution.failed", () => setRefresh((value) => value + 1)),
-      ctx.data.on("session.execution.interrupted", () => setRefresh((value) => value + 1)),
-      ctx.data.on("session.compaction.ended", () => setRefresh((value) => value + 1)),
+      ctx.data.on("session.execution.succeeded", () => bumpRefresh()),
+      ctx.data.on("session.execution.failed", () => bumpRefresh()),
+      ctx.data.on("session.execution.interrupted", () => bumpRefresh()),
+      ctx.data.on("session.compaction.ended", () => bumpRefresh()),
     ]
 
     __test.line = lineFor
@@ -335,6 +386,7 @@ export default Plugin.define({
     }
 
     return () => {
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer)
       for (const dispose of disposeEvents) dispose()
       disposeLine()
       disposePanel()

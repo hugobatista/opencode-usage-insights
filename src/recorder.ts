@@ -1,16 +1,7 @@
 import type { Database } from "bun:sqlite"
-import {
-  recordEvent,
-  recordHttpResponse,
-  recordPrompt,
-  recordStep,
-  setUpstream,
-  setUpstreamForSessionModel,
-  upsertSession,
-} from "./stats/db"
+import { recordEvent, recordPrompt, recordStep, setStepRouterForSessionModel, upsertSession } from "./stats/db"
 import { COMPACTION_KIND } from "./stats/queries"
-import { tokensPerSecond } from "./core"
-import { inferFromHeaders, inferFromPackage, inferFromUrl, mergeUpstream, normalizeUpstream, redactHeaders, type UpstreamInfo } from "./upstream"
+import { inferFromHeaders, inferFromUrl, mergeEndpoint, type EndpointInfo } from "./endpoint"
 
 /**
  * Event-driven recorder. Every handler is idempotent and defensive: the
@@ -47,11 +38,7 @@ export type RecorderEventData = {
   cost?: number | undefined
   finish?: string | undefined
   rawFinish?: string | undefined
-  providerState?: unknown
-  error?: unknown
   reason?: string | undefined
-  providerContext?: { provenance?: { provider?: string | undefined; modelID?: string | undefined } | undefined } | undefined
-  source?: string | undefined
   location?: { directory?: string | undefined } | undefined
   parentID?: string | undefined
   title?: string | undefined
@@ -80,14 +67,6 @@ export type PendingStep = {
 }
 
 export type RecorderOptions = {
-  /** Store redacted response headers for later analysis. */
-  captureHeaders?: boolean | undefined
-  /**
-   * Package of the provider a step ran through (e.g.
-   * `@opencode/ai/providers/fireworks`), used as a last-resort operator
-   * source. The server entry fills it from the model catalogue.
-   */
-  providerPackage?: ((providerID: string | undefined) => string | undefined) | undefined
   /** Clock override, for tests. */
   now?: (() => number) | undefined
 }
@@ -95,36 +74,73 @@ export type RecorderOptions = {
 export type Recorder = {
   /** Apply one session event. Unknown or malformed events are ignored. */
   handleEvent(event: RecorderEvent): void
-  /** Learn the upstream operator from one model response. */
+  /** Learn the routing endpoint from one model response. */
   handleHttpResponse(event: HttpResponseInput): void
   pendingFor(sessionID: string): PendingStep | undefined
 }
 
-function errorText(error: unknown): string | undefined {
-  if (typeof error === "string") return error
-  if (error !== null && typeof error === "object") {
-    const record = error as { message?: unknown; name?: unknown }
-    if (typeof record.message === "string" && record.message !== "") return record.message
-    if (typeof record.name === "string" && record.name !== "") return record.name
-  }
-  return undefined
-}
-
 export function createRecorder(db: Database, options?: RecorderOptions): Recorder {
+  /**
+   * Ceiling on the per-session maps. A session that ends takes its entries
+   * with it; a host running for weeks has thousands of sessions, and a map that
+   * only ever grows is a leak with a nice name.
+   */
+  const MAX_TRACKED_SESSIONS = 512
+  /** Ceiling on in-flight steps; a step that never ends is a leak too. */
+  const MAX_PENDING = 256
+
   /** Steps in flight between `step.started` and `step.ended`. */
   const pending = new Map<string, PendingStep>()
   /** Last model selected per session, used when a step starts unobserved. */
   const lastModel = new Map<string, SessionModelRef>()
-  /** Upstream evidence learned per session, applied to its steps. */
-  const provenance = new Map<string, { modelID: string | undefined; info: UpstreamInfo }>()
-  const captureHeaders = options?.captureHeaders === true
-  const providerPackage = options?.providerPackage
+  /** Endpoint evidence learned per session, applied to its steps. */
+  const known = new Map<string, { modelID: string | undefined; info: EndpointInfo }>()
   const now = options?.now ?? (() => Date.now())
 
-  function noteUpstream(sessionID: string, modelID: string | undefined, info: UpstreamInfo): void {
-    const merged = mergeUpstream(info, provenance.get(sessionID)?.info)
-    provenance.set(sessionID, { modelID, info: merged ?? info })
-    if (merged !== undefined) setUpstreamForSessionModel(db, sessionID, modelID, merged)
+  /** Insertion-ordered map with a size ceiling: the oldest entry goes first. */
+  function remember<Value>(map: Map<string, Value>, key: string, value: Value, limit: number): void {
+    map.delete(key)
+    map.set(key, value)
+    while (map.size > limit) {
+      const oldest = map.keys().next()
+      if (oldest.done === true) break
+      map.delete(oldest.value)
+    }
+  }
+
+  /** Drop everything remembered about a session that is gone. */
+  function forget(sessionID: string): void {
+    lastModel.delete(sessionID)
+    known.delete(sessionID)
+    for (const [messageID, step] of pending) {
+      if (step.sessionID === sessionID) pending.delete(messageID)
+    }
+  }
+
+  /**
+   * How much an observation is worth: the gateway naming its own routing
+   * endpoint beats inferring it from the host, which beats nothing. Without
+   * this a response that carries no endpoint header would downgrade the one a
+   * previous response named.
+   */
+  function strength(info: EndpointInfo | undefined): number {
+    if (info?.router === undefined) return 0
+    return info.source?.startsWith("header:") === true ? 2 : 1
+  }
+
+  function noteRouter(sessionID: string, modelID: string | undefined, info: EndpointInfo): void {
+    const previous = known.get(sessionID)
+    // A stronger observation wins; at equal strength the newest one does, so a
+    // gateway that re-routes is still seen.
+    const merged = strength(previous?.info) > strength(info) ? previous!.info : mergeEndpoint(info, previous?.info)
+    const info2: EndpointInfo = merged ?? info
+    // The same answer for the same model means the database already agrees: the
+    // rows recorded since the last observation carry the endpoint at insert
+    // time, and the older ones were filled when it was learned. Writing again
+    // would cost the response path a statement to change nothing.
+    const settled = previous !== undefined && previous.modelID === modelID && previous.info.router === info2.router
+    remember(known, sessionID, { modelID, info: info2 }, MAX_TRACKED_SESSIONS)
+    if (!settled) setStepRouterForSessionModel(db, sessionID, modelID, info2)
   }
 
   function recordPendingStep(messageID: string, data: RecorderEventData, finish: string | undefined, at: number): void {
@@ -133,9 +149,8 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
     const info = pending.get(messageID)
     pending.delete(messageID)
     const model = info?.model ?? lastModel.get(sessionID)
-    const learned = provenance.get(sessionID)
+    const learned = known.get(sessionID)
     const matched = learned !== undefined && (learned.modelID === undefined || learned.modelID === model?.id) ? learned.info : undefined
-    const upstream = mergeUpstream(matched, inferFromPackage(providerPackage?.(model?.providerID)))
     recordStep(db, {
       messageID,
       sessionID,
@@ -152,12 +167,7 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
       streamedAt: info?.streamed,
       completedAt: at,
       finish,
-      providerState: data.providerState,
-      tps: tokensPerSecond((data.tokens?.output ?? 0) + (data.tokens?.reasoning ?? 0), info?.started, info?.streamed),
-      upstream: upstream?.operator,
-      upstreamSource: upstream?.source,
-      upstreamModel: upstream?.model,
-      router: upstream?.router,
+      router: matched?.router,
       recordedAt: now(),
     })
   }
@@ -178,7 +188,13 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
           startedAt: at,
           updatedAt: at,
         })
-        if (data.model !== undefined) lastModel.set(sessionID, data.model)
+        if (data.model !== undefined) remember(lastModel, sessionID, data.model, MAX_TRACKED_SESSIONS)
+        return
+      }
+      case "session.deleted": {
+        // The session is gone: its in-flight steps will never end and nothing
+        // else about it will be needed again.
+        if (sessionID !== undefined) forget(sessionID)
         return
       }
       case "session.renamed": {
@@ -199,20 +215,26 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
         return
       }
       case "session.model.selected": {
-        if (sessionID === undefined) return
-        if (data.model !== undefined) lastModel.set(sessionID, data.model)
-        recordEvent(db, { sessionID, kind: "model-selected", at, data: { model: data.model, previous: data.previous } })
+        // The session's current model, remembered so a step that started before
+        // the plugin loaded is still attributed. Nothing is written for it: no
+        // view reads a model-selection event.
+        if (sessionID !== undefined && data.model !== undefined) remember(lastModel, sessionID, data.model, MAX_TRACKED_SESSIONS)
         return
       }
       case "session.step.started": {
         if (sessionID === undefined || typeof data.assistantMessageID !== "string") return
-        pending.set(data.assistantMessageID, {
-          messageID: data.assistantMessageID,
-          sessionID,
-          started: typeof data.started === "number" ? data.started : undefined,
-          streamed: undefined,
-          model: data.model,
-        })
+        remember(
+          pending,
+          data.assistantMessageID,
+          {
+            messageID: data.assistantMessageID,
+            sessionID,
+            started: typeof data.started === "number" ? data.started : undefined,
+            streamed: undefined,
+            model: data.model,
+          },
+          MAX_PENDING,
+        )
         return
       }
       case "session.step.streamed": {
@@ -228,16 +250,9 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
       }
       case "session.step.failed": {
         if (typeof data.assistantMessageID !== "string") return
+        // The step row keeps the outcome through `finish`; the error event is
+        // not written because no view reads it.
         recordPendingStep(data.assistantMessageID, data, data.finish ?? "error", at)
-        if (sessionID !== undefined) {
-          recordEvent(db, {
-            sessionID,
-            kind: "step-failed",
-            messageID: data.assistantMessageID,
-            at,
-            data: { error: errorText(data.error), finish: data.finish, rawFinish: data.rawFinish },
-          })
-        }
         return
       }
       case "session.compaction.ended": {
@@ -247,28 +262,6 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
           kind: COMPACTION_KIND,
           at,
           data: { reason: data.reason, model: data.model, tokens: data.tokens, cost: data.cost },
-        })
-        const provenanceInfo = data.providerContext?.provenance
-        const operator = normalizeUpstream(provenanceInfo?.provider)
-        if (operator !== undefined) {
-          noteUpstream(sessionID, provenanceInfo?.modelID ?? data.model?.id, { operator, source: "provenance" })
-        }
-        return
-      }
-      case "session.usage.recorded": {
-        if (sessionID === undefined) return
-        recordEvent(db, { sessionID, kind: "usage-recorded", at, data: { source: data.source, tokens: data.tokens, cost: data.cost } })
-        return
-      }
-      case "session.execution.succeeded":
-      case "session.execution.failed":
-      case "session.execution.interrupted": {
-        if (sessionID === undefined) return
-        recordEvent(db, {
-          sessionID,
-          kind: "execution",
-          at,
-          data: { outcome: event.type.slice("session.execution.".length) },
         })
         return
       }
@@ -290,30 +283,16 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
     const sessionID = event.sessionID
     if (typeof sessionID !== "string") return
 
-    // Operator evidence: the gateway's own headers first, then the endpoint the
-    // request went to. Network headers (server, via, cf-ray) are CDN evidence
-    // and are never classified.
-    const inferred = mergeUpstream(inferFromHeaders(event.response?.headers), inferFromUrl(event.request?.url))
-    if (captureHeaders) {
-      let path: string | undefined
-      try {
-        path = event.request?.url !== undefined ? new URL(event.request.url).pathname : undefined
-      } catch {
-        path = undefined
-      }
-      recordHttpResponse(db, {
-        at: now(),
-        method: event.request?.method,
-        path,
-        status: event.response?.status,
-        headers: redactHeaders(event.response?.headers),
-      })
-    }
+    // The endpoint that served the request: the gateway's own header first,
+    // then the host the request went to. Nothing else about the exchange is
+    // kept — the headers a gateway happens to send are not who ran the model.
+    const inferred = mergeEndpoint(inferFromHeaders(event.response?.headers), inferFromUrl(event.request?.url))
     if (inferred === undefined) return
 
-    noteUpstream(sessionID, event.model?.id, inferred)
-    const target = pendingFor(sessionID)
-    if (target !== undefined) setUpstream(db, target.messageID, inferred)
+    noteRouter(sessionID, event.model?.id, inferred)
+    // The step in flight is not a row yet: `recordPendingStep` writes it when it
+    // ends, carrying the endpoint learned from this response. Writing here would
+    // be a statement that changes nothing, on the request path.
   }
 
   return { handleEvent, handleHttpResponse, pendingFor }

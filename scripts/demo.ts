@@ -12,6 +12,7 @@ import { sessionTotals, toTranscript, type RuntimeMessage, type RuntimeModelRef,
 import { buildPanel, type PanelRequest } from "../src/panel-build"
 import { PANEL_VIEWS, sidebarLines, type PanelLine } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
+import { dbInfo } from "../src/stats/maintenance"
 import { turns } from "../src/stats/queries"
 
 const width = Number(process.argv[2] ?? 100)
@@ -26,13 +27,13 @@ upsertSession(db, { sessionID: "ses_cache", directory: "/code/opencode-usage-ins
 upsertSession(db, { sessionID: "ses_docs", directory: "/code/opencode-usage-insights", title: "Docs pass", startedAt: at(70) })
 
 const steps = [
-  { sessionID: "ses_recorder", messageID: "msg_r1", promptID: "prt_r1", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 84_200, cacheRead: 1_530_000, cacheWrite: 12_000, output: 3_700, cost: 0.21, started: at(0, 1), streamed: at(0, 1) + 1_400, completed: at(0, 1) + 52_000, finish: "tool-calls", upstream: "Fireworks", upstreamModel: "fireworks/deepseek-v4.1-flash-free", router: "orcarouter-dsv4.1-flash-free" },
-  { sessionID: "ses_recorder", messageID: "msg_r2", promptID: "prt_r2", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 9_400, cacheRead: 1_614_000, cacheWrite: 900, output: 1_250, cost: 0.06, started: at(0, 24), streamed: at(0, 24) + 900, completed: at(0, 24) + 20_000, samePrompt: true, upstream: "Fireworks", upstreamModel: "fireworks/deepseek-v4.1-flash-free", router: "orcarouter-dsv4.1-flash-free" },
-  { sessionID: "ses_recorder", messageID: "msg_r3", promptID: "prt_r3", providerID: "anthropic", modelID: "claude-opus-4.6", input: 12_800, cacheRead: 96_000, cacheWrite: 11_000, output: 2_400, reasoning: 900, cost: 1.42, started: at(0, 41), streamed: at(0, 41) + 2_800, completed: at(0, 41) + 74_000, upstream: "AWS Bedrock", upstreamModel: "bedrock/anthropic.claude-opus-4-6-v1", router: "orcarouter-claude" },
+  { sessionID: "ses_recorder", messageID: "msg_r1", promptID: "prt_r1", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 84_200, cacheRead: 1_530_000, cacheWrite: 12_000, output: 3_700, cost: 0.21, started: at(0, 1), streamed: at(0, 1) + 1_400, completed: at(0, 1) + 52_000, finish: "tool-calls", router: "orcarouter-dsv4.1-flash-free" },
+  { sessionID: "ses_recorder", messageID: "msg_r2", promptID: "prt_r2", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 9_400, cacheRead: 1_614_000, cacheWrite: 900, output: 1_250, cost: 0.06, started: at(0, 24), streamed: at(0, 24) + 900, completed: at(0, 24) + 20_000, samePrompt: true, router: "orcarouter-dsv4.1-flash-free" },
+  { sessionID: "ses_recorder", messageID: "msg_r3", promptID: "prt_r3", providerID: "anthropic", modelID: "claude-opus-4.6", input: 12_800, cacheRead: 96_000, cacheWrite: 11_000, output: 2_400, reasoning: 900, cost: 1.42, started: at(0, 41), streamed: at(0, 41) + 2_800, completed: at(0, 41) + 74_000, router: "orcarouter-claude" },
   { sessionID: "ses_cache", messageID: "msg_c1", promptID: "prt_c1", providerID: "opencode", modelID: "glm-5.3-flash", input: 41_000, cacheRead: 620_000, cacheWrite: 8_000, output: 5_100, cost: 0.32, started: at(30, 2), streamed: at(30, 2) + 1_100, completed: at(30, 2) + 61_000 },
   { sessionID: "ses_cache", messageID: "msg_c2", promptID: "prt_c2", providerID: "opencode", modelID: "glm-5.3-flash", input: 63_700, cacheRead: 12_400, cacheWrite: 9_000, output: 4_800, cost: 0.44, started: at(54, 0), streamed: at(54, 0) + 1_600, completed: at(54, 0) + 58_000 },
-  { sessionID: "ses_docs", messageID: "msg_d1", promptID: "prt_d1", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 22_500, cacheRead: 310_000, cacheWrite: 4_000, output: 6_300, cost: 0.18, started: at(70, 0), streamed: at(70, 0) + 1_200, completed: at(70, 0) + 88_000, upstream: "DeepSeek", upstreamModel: "deepseek/deepseek-v4.1-flash-free", router: "orcarouter-dsv4.1-flash-free" },
-  { sessionID: "ses_docs", messageID: "msg_d2", promptID: "prt_d2", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 7_900, cacheRead: 402_000, cacheWrite: 700, output: 2_100, cost: 0.07, started: at(70, 20), streamed: at(70, 20) + 800, completed: at(70, 20) + 31_000, upstream: "DeepSeek", upstreamModel: "deepseek/deepseek-v4.1-flash-free", router: "orcarouter-dsv4.1-flash-free" },
+  { sessionID: "ses_docs", messageID: "msg_d1", promptID: "prt_d1", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 22_500, cacheRead: 310_000, cacheWrite: 4_000, output: 6_300, cost: 0.18, started: at(70, 0), streamed: at(70, 0) + 1_200, completed: at(70, 0) + 88_000, router: "orcarouter-dsv4.1-flash-free" },
+  { sessionID: "ses_docs", messageID: "msg_d2", promptID: "prt_d2", providerID: "opencode", modelID: "deepseek-v4.1-flash-free", input: 7_900, cacheRead: 402_000, cacheWrite: 700, output: 2_100, cost: 0.07, started: at(70, 20), streamed: at(70, 20) + 800, completed: at(70, 20) + 31_000, router: "orcarouter-dsv4.1-flash-free" },
 ]
 
 for (const step of steps) {
@@ -52,9 +53,6 @@ for (const step of steps) {
     streamedAt: step.streamed,
     completedAt: step.completed,
     finish: step.finish ?? "stop",
-    upstream: step.upstream,
-    upstreamSource: step.upstream === undefined ? undefined : "header:x-opencode-upstream-model-id",
-    upstreamModel: step.upstreamModel,
     router: step.router,
     recordedAt: step.completed,
   })
@@ -100,12 +98,11 @@ const cacheTotals: Totals = { input: 104_700, cached: 632_400, output: 9_900, re
 function turnLine(
   messages: RuntimeMessage[],
   totals: Totals,
-  options: { upstream?: string; router?: string; turnTotals?: TurnTotalsView; identity?: LineIdentity } = {},
+  options: { router?: string; turnTotals?: TurnTotalsView; identity?: LineIdentity } = {},
 ): string {
   const stats = computeTurn(toTranscript(messages), totals)
   if (stats === undefined) return ""
-  // The TUI fills these from the recorder's database; the demo sets them directly.
-  if (options.upstream !== undefined) stats.upstream = options.upstream
+  // The TUI fills this from the recorder's database; the demo sets it directly.
   if (options.router !== undefined) stats.router = options.router
   return formatLine(stats, { turnTotals: options.turnTotals, identity: options.identity })
 }
@@ -118,7 +115,7 @@ const body = (lines: readonly PanelLine[]) => lines.map((entry) => entry.text.re
 
 section(
   "turn · prompt cache survived (the endpoint that served the turn)",
-  turnLine([...recorderTurn1, ...recorderTurn2], recorderTotals, { upstream: "Fireworks", router: "orcarouter-dsv4.1-flash-free" }),
+  turnLine([...recorderTurn1, ...recorderTurn2], recorderTotals, { router: "orcarouter-dsv4.1-flash-free" }),
 )
 section(
   "turn · prompt cache expired after an idle gap",
@@ -126,15 +123,15 @@ section(
 )
 section(
   "turn · provider changed (no endpoint learned: falls back to provider/model)",
-  turnLine([...recorderTurn2, ...recorderTurn3], recorderTotals, { upstream: "AWS Bedrock" }),
+  turnLine([...recorderTurn2, ...recorderTurn3], recorderTotals, {  }),
 )
 section(
   "turn · tool-call loop, latest view (the prompt size the turn ended with)",
-  turnLine(loopTurn, recorderTotals, { upstream: "DeepSeek", router: "orcarouter-dsv4.1flash" }),
+  turnLine(loopTurn, recorderTotals, { router: "orcarouter-dsv4.1flash" }),
 )
 section(
   'turn · tool-call loop, sum view (turnTotals: "sum" — every step of the turn)',
-  turnLine(loopTurn, recorderTotals, { upstream: "DeepSeek", router: "orcarouter-dsv4.1flash", turnTotals: "sum" }),
+  turnLine(loopTurn, recorderTotals, { router: "orcarouter-dsv4.1flash", turnTotals: "sum" }),
 )
 section(
   "turn · response still streaming (no line until the response ends)",
@@ -143,6 +140,7 @@ section(
 section("sidebar history (compact, last 3 turns)", body(sidebarLines(turns(db, { sessionID: "ses_recorder", limit: 3 }), { budget: 34 })))
 
 // Every view of the panel, rendered from the same request the TUI builds.
+const demoPath = join(root, "stats.db")
 for (const view of PANEL_VIEWS) {
   const request: PanelRequest = {
     db,
@@ -157,6 +155,8 @@ for (const view of PANEL_VIEWS) {
     sessionStart: at(0),
     now: at(90),
     width,
+    // The panel component reads this for the db view alone, the same way.
+    ...(view === "db" ? { database: dbInfo(db, demoPath, at(90)) } : {}),
   }
   section(`/usage ${view}`, body(buildPanel(request)))
 }

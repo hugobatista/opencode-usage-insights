@@ -21,8 +21,20 @@ import type {
   TurnUsage,
   TtlEvidenceRow,
 } from "./stats/queries"
-import type { AffinityReport, CacheStats, CoverageReport, EndpointRow, EndpointSummary, GapReport, LatencyGroupRow, PeriodGranularity, PeriodRow } from "./stats/insights"
-import { modelKey } from "./stats/insights"
+import type { DbInfo } from "./stats/maintenance"
+import type {
+  AffinityReport,
+  CacheStats,
+  CoverageReport,
+  EndpointRow,
+  EndpointSummary,
+  GapReport,
+  LatencyGroupRow,
+  PeriodGranularity,
+  PeriodRow,
+} from "./stats/aggregates"
+import { modelKey } from "./stats/queries"
+import { sanitizeText } from "./text"
 
 /**
  * View models and formatting for the stats panel. Everything here is pure:
@@ -33,7 +45,7 @@ import { modelKey } from "./stats/insights"
 
 export const PANEL_NAME = "usage-insights"
 
-export const PANEL_VIEWS = ["overview", "models", "endpoints", "affinity", "cache", "periods", "latency", "sessions", "turns"] as const
+export const PANEL_VIEWS = ["overview", "models", "endpoints", "affinity", "cache", "periods", "latency", "sessions", "turns", "db"] as const
 export type PanelView = (typeof PANEL_VIEWS)[number]
 
 export const RANGE_KEYS = ["session", "today", "7d", "30d", "all"] as const
@@ -46,7 +58,7 @@ export type PanelTone = "base" | "muted" | "warning" | "accent"
 
 /** What a selectable line stands for; Enter drills into it. */
 export type PanelRow = {
-  kind: "model" | "session" | "period" | "operator" | "provider" | "turn"
+  kind: "model" | "session" | "period" | "endpoint" | "provider" | "turn" | "prune"
   value: string
   variant?: string | undefined
 }
@@ -188,19 +200,22 @@ export function formatGap(value: number | undefined): string {
   return `${(value / 86_400_000).toFixed(1)}d`
 }
 
+/** Cut a value to the width, dropping control characters first. */
 export function truncate(value: string, width: number): string {
   if (width <= 1) return ""
-  if (value.length <= width) return value
-  return `${value.slice(0, width - 1).trimEnd()}…`
+  const clean = sanitizeText(value)
+  if (clean.length <= width) return clean
+  return `${clean.slice(0, width - 1).trimEnd()}…`
 }
 
 /** Keep both ends of a long id: the family reads first, the `#variant` last. */
 export function truncateMiddle(value: string, width: number): string {
   if (width <= 1) return ""
-  if (value.length <= width) return value
+  const clean = sanitizeText(value)
+  if (clean.length <= width) return clean
   const head = Math.ceil((width - 1) / 2)
   const tail = width - 1 - head
-  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`
+  return `${clean.slice(0, head)}…${clean.slice(clean.length - tail)}`
 }
 
 /**
@@ -342,17 +357,20 @@ export function usageBuckets(usage: {
  * active view always keeps its full name.
  */
 export function viewBar(view: PanelView, width = 200): PanelLine {
-  const full = PANEL_VIEWS.map((name, index) => (name === view ? `[${index + 1} ${name}]` : `${index + 1} ${name}`))
-  const candidates = [full, PANEL_VIEWS.map((name, index) => (name === view ? `[${index + 1} ${name}]` : `${index + 1} ${name.slice(0, 3)}`))]
+  // Ten views, nine digits: the tenth is `0`.
+  const key = (index: number) => String((index + 1) % 10)
+  const full = PANEL_VIEWS.map((name, index) => (name === view ? `[${key(index)} ${name}]` : `${key(index)} ${name}`))
+  const candidates = [full, PANEL_VIEWS.map((name, index) => (name === view ? `[${key(index)} ${name}]` : `${key(index)} ${name.slice(0, 3)}`))]
   for (const parts of candidates) {
     const text = parts.join("  ")
     if (text.length <= width) return { text, tone: "muted" }
   }
-  return { text: `[${PANEL_VIEWS.indexOf(view) + 1} ${view}] · 1-9 or [ ] to switch`, tone: "muted" }
+  return { text: `[${String((PANEL_VIEWS.indexOf(view) + 1) % 10)} ${view}] · 0-9 or [ ] to switch`, tone: "muted" }
 }
 
 export function keysFor(of: PanelView): string {
-  if (of === "periods") return "↑↓ move · enter drill · b bucket · t range · m/e filter · x clear · 1-9 view · ? help"
+  if (of === "db") return "↑↓ move · enter prune (asks first) · v vacuum · r refresh · 0-9 view · ? help"
+  if (of === "periods") return "↑↓ move · enter drill · b bucket · t range · m/e filter · x clear · 0-9 view · ? help"
   if (of === "turns") return "↑↓ move · a scope · t range · 1-9 view · ? help"
   return "↑↓ move · enter drill · s sort · t range · m/e filter · x clear · 1-9 view · ? help"
 }
@@ -373,7 +391,7 @@ export function helpLines(width: number): PanelLine[] {
   const lines: PanelLine[] = [
     { text: "keys", tone: HEADER_TONE },
     { text: "  ↑ ↓ j k      move the cursor · enter drills in · backspace goes back" },
-    { text: "  1-9 [ ]      choose a view · cycle views" },
+    { text: "  0-9 [ ]      choose a view · cycle views (0 is db)" },
     { text: "  t shift+t    previous / next range" },
     { text: "  s shift+s    cycle sort column · reverse" },
     { text: "  b            periods bucket: day → week → month" },
@@ -392,19 +410,21 @@ export function helpLines(width: number): PanelLine[] {
     { text: "  reasoning part of `out`" },
     { text: "  wall      request → completed step · stream request → last chunk" },
     { text: "  tps       out / streaming seconds, shown as p50" },
-    { text: "  changed   the step's provider, model or endpoint differs from the" },
-    { text: "            step before it in the same session (affinity view)" },
+    { text: "  changed   the step's model or endpoint differs from the step" },
+    { text: "            before it in the same session (affinity view)" },
     { text: "" },
     { text: "evidence", tone: HEADER_TONE },
     { text: "  endpoint  where the request was actually sent: the endpoint that ran" },
     { text: "            the inference in practice, and the only identity the panel" },
     { text: "            shows. The endpoint is the inference provider." },
-    { text: "  recorded  the OpenCode provider and the operator a header reported are" },
-    { text: "            kept in the database as evidence, not surfaced: they say" },
-    { text: "            where a request came from, not who ran it" },
+    { text: "  recorded  the OpenCode provider is kept in the database as evidence," },
+    { text: "            not surfaced: it says where a request came from, not who" },
+    { text: "            ran it" },
     { text: "" },
     { text: "database", tone: HEADER_TONE },
-    { text: "  local time · SQLite in the OpenCode state directory · read-only here" },
+    { text: "  the db view shows where the file lives, what it holds and how much" },
+    { text: "  of it is old: enter prunes a retention, v gives the space back" },
+    { text: "  local time · SQLite in the OpenCode state directory" },
   ]
   return lines.map((line) => ({ ...line, text: truncate(line.text, width) }))
 }
@@ -538,7 +558,7 @@ export type ModelExtras = {
 /**
  * Usage per model with the cache it actually got, where it was served from and
  * how often its identity changed. One line per model; `providers` keeps the
- * per-operator detail.
+ * per-provider detail.
  */
 export function modelsLines(rows: readonly ModelUsage[], width: number, extras?: ModelExtras, limit = 40): PanelLine[] {
   const columns = modelColumns(width)
@@ -569,8 +589,8 @@ export function modelsLines(rows: readonly ModelUsage[], width: number, extras?:
     const key = modelKey(model.modelID, model.variant)
     const name = modelCell(model.modelID, model.variant, columns.model)
     const buckets = usageBuckets(model.totals)
-    // The routing endpoint is the identity that actually served the request;
-    // the reported operator is evidence of a different, less reliable nature.
+    // The endpoint is the identity that actually served the request; the
+    // provider is where it came from, kept as evidence but not shown here.
     const endpoints = unique(model.providers.flatMap((provider) => provider.routers))
     const cache = extras?.cache?.get(key)
     const changes = extras?.changes?.get(key)
@@ -602,7 +622,7 @@ function unique(values: readonly string[]): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Providers (model × provider × operator × endpoint)
+// Providers (model × provider × endpoint)
 // ---------------------------------------------------------------------------
 
 /**
@@ -679,7 +699,7 @@ export function endpointSummaryLines(rows: readonly EndpointSummary[], width: nu
       limit,
       empty: "no routing endpoint was observed in this range",
       // A request whose destination was never observed is not a row to drill into.
-      row: (row) => (row.endpoint === undefined ? undefined : { kind: "operator", value: row.endpoint }),
+      row: (row) => (row.endpoint === undefined ? undefined : { kind: "endpoint", value: row.endpoint }),
       tone: (row) => (row.endpoint === undefined ? "muted" : "base"),
     },
   )
@@ -1072,6 +1092,50 @@ export function sessionsLines(
 }
 
 // ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
+
+/** The database view: where it lives, what it holds, and the two cleanups. */
+export function dbLines(data: { info: DbInfo; busy?: boolean | undefined }, width: number): PanelLine[] {
+  const lines: PanelLine[] = []
+  const size = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`
+  lines.push({ text: truncate(data.info.path, width), tone: "base" })
+  lines.push({
+    text: `${size(data.info.bytes)}${data.info.walBytes === undefined ? "" : ` + ${size(data.info.walBytes)} wal`} · schema v${data.info.schemaVersion}`,
+    tone: "muted",
+  })
+  lines.push({ text: "", tone: "muted" })
+  lines.push({ text: "what it holds", tone: HEADER_TONE })
+  for (const table of data.info.tables) {
+    lines.push({ text: `  ${padCell(table.name, 12)}${formatCount(table.rows)} rows`, tone: table.rows === 0 ? "muted" : "base" })
+  }
+  lines.push({
+    text: `  window      ${data.info.firstAt === undefined ? "–" : new Date(data.info.firstAt).toLocaleDateString("en-GB")} → ${
+      data.info.lastAt === undefined ? "–" : new Date(data.info.lastAt).toLocaleDateString("en-GB")
+    }`,
+    tone: "muted",
+  })
+
+  lines.push({ text: "", tone: "muted" })
+  lines.push({ text: "clean up", tone: HEADER_TONE })
+  lines.push({ text: "  enter prunes the steps older than the row · v gives the space back", tone: "muted" })
+  const widths = [10, 10]
+  lines.push({ text: formatTableRow(["keep", "prunes"], widths, ["left", "right"]), tone: "muted" })
+  for (const option of data.info.removable) {
+    lines.push({
+      text: formatTableRow([`${option.days} days`, `${formatCount(option.steps)} steps`], widths, ["left", "right"]),
+      tone: option.steps === 0 ? "muted" : "base",
+      row: { kind: "prune", value: String(option.days) },
+    })
+  }
+  if (data.busy === true) {
+    lines.push({ text: "", tone: "muted" })
+    lines.push({ text: "the recorder is writing: try the vacuum again in a moment", tone: "warning" })
+  }
+  return lines
+}
+
+// ---------------------------------------------------------------------------
 // Turns
 // ---------------------------------------------------------------------------
 
@@ -1092,7 +1156,6 @@ export function turnStats(turn: TurnUsage): TurnStats {
     providerID: turn.providerID,
     modelID: turn.modelID,
     variant: turn.variant,
-    upstream: turn.upstream,
     router: turn.router,
     identityChanged: turn.routerChanged,
     affinityKey: undefined,
@@ -1164,10 +1227,21 @@ export function sidebarLines(rows: readonly TurnUsage[], options?: LineFormatOpt
     const clock = turn.endAt !== undefined ? formatClock(turn.endAt).slice(0, 5) : "--:--"
     const identity = turn.router ?? (turn.providerID !== undefined && turn.modelID !== undefined ? `${turn.providerID}/${turn.modelID}` : "unknown")
     const display = displayTotals(turn.latest)
-    const numbers = `${labels.input} ${formatTokens(display.input)} (${formatTokens(display.prompt)}) · ${labels.output} ${formatTokens(display.output)}`
+    const input = formatTokens(display.input)
+    const prompt = formatTokens(display.prompt)
+    const output = formatTokens(display.output)
+    const cost = formatCost(turn.totals.cost)
+    const suffix = turn.drops.length > 0 ? " · ⚠" : ""
+    // The cost of the turn is always shown; when the budget is tight the
+    // parenthesised prompt is the first thing to go.
+    const candidates = [
+      `  ${labels.input} ${input} (${prompt}) · ${labels.output} ${output} · ${cost}${suffix}`,
+      `  ${labels.input} ${input} · ${labels.output} ${output} · ${cost}${suffix}`,
+      `  ${labels.input} ${input} · ${labels.output} ${output}${suffix}`,
+    ]
     lines.push({ text: truncate(`${clock} ${identity}`, budget), tone: turn.routerChanged ? "warning" : "base" })
     lines.push({
-      text: truncate(`  ${numbers}${turn.drops.length > 0 ? " · ⚠" : ""}`, budget),
+      text: truncate(candidates.find((text) => text.length <= budget) ?? candidates[candidates.length - 1]!, budget),
       tone: turn.drops.length > 0 ? "warning" : "muted",
     })
   }

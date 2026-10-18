@@ -18,6 +18,7 @@ import {
   tokensPerSecond,
   totalize,
   transcriptSegments,
+  transcriptTail,
   type AssistantMessage,
   type ModelRefLike,
   type Totals,
@@ -112,6 +113,51 @@ describe("transcriptSegments", () => {
   test("ignores runs that never happened", () => {
     expect(transcriptSegments([prompt("u1", 1), idle("i1", 2)])).toHaveLength(0)
     expect(transcriptSegments([])).toHaveLength(0)
+  })
+})
+
+describe("transcriptTail", () => {
+  /** A transcript the two walks must agree on, whatever it holds. */
+  const samples: TranscriptMessage[][] = [
+    [],
+    [step("a1", 1)],
+    [prompt("u1", 1), step("a1", 2)],
+    [prompt("u1", 1), step("a1", 2), step("a2", 3), prompt("u2", 4), step("a3", 5)],
+    [step("a0", 1), prompt("u1", 2), step("a1", 3), prompt("u2", 4), step("a2", 5), idle("i1", 6), step("a3", 7)],
+    [prompt("u1", 1), prompt("u2", 2), step("a1", 3), prompt("u3", 4), idle("i1", 5)],
+    [idle("i1", 1), { type: "compaction" }, step("a1", 2)],
+  ]
+
+  test("agrees with the full walk on the turns it returns", () => {
+    for (const messages of samples) {
+      const all = transcriptSegments(messages)
+      const tail = transcriptTail(messages, 2)
+      const expected = all.slice(Math.max(0, all.length - 2))
+      expect(tail.map((segment) => ({ ids: segment.assistants.map((s) => s.id), prompt: segment.prompt?.id }))).toEqual(
+        expected.map((segment) => ({ ids: segment.assistants.map((s) => s.id), prompt: segment.prompt?.id })),
+      )
+    }
+  })
+
+  test("stops at the requested number of turns", () => {
+    const messages = [prompt("u1", 1), step("a1", 2), prompt("u2", 3), step("a2", 4), prompt("u3", 5), step("a3", 6)]
+    expect(transcriptTail(messages, 1).map((segment) => segment.assistants[0]!.id)).toEqual(["a3"])
+    expect(transcriptTail(messages, 3)).toHaveLength(3)
+  })
+
+  test("computeTurn reads the same turn through the tail walk", () => {
+    const messages = [
+      prompt("u1", 1),
+      step("a1", 2, { read: 5_000, completed: 1_100 }),
+      prompt("u2", 1_200),
+      step("a2", 1_300, { read: 5_000, completed: 1_900 }),
+      idle("i1", 2_000),
+      step("a3", 2_100, { read: 5_000, completed: 2_600 }),
+    ]
+    const stats = computeTurn(messages)
+    expect(stats?.steps).toBe(2)
+    expect(stats?.drops).toHaveLength(0)
+    expect(stats?.totals.cached).toBe(10_000)
   })
 })
 
@@ -350,13 +396,9 @@ describe("line identity", () => {
     expect(formatLine(stats, plain)).toBe("orcarouter-dsv4.1flash · changed · in 100, cached 0, out 10")
   })
 
-  test("identity: model keeps the provider view, without the reported operator", () => {
-    const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash", upstream: "DeepSeek" }
+  test("identity: model keeps the provider view", () => {
+    const stats: TurnStats = { ...computeTurn(transcript())!, router: "orcarouter-dsv4.1flash" }
     expect(formatLine(stats, { ...plain, identity: "model" })).toBe("opencode/deepseek-v4.1-flash-free · in 100, cached 0, out 10")
-    // Still available on request, for anyone who wants the evidence.
-    expect(formatLine(stats, { ...plain, identity: "model", fields: { ...plain.fields, upstream: true } })).toBe(
-      "opencode/deepseek-v4.1-flash-free (via DeepSeek) · in 100, cached 0, out 10",
-    )
   })
 })
 
@@ -466,13 +508,10 @@ describe("formatLineSegments", () => {
     expect(segments.find((s) => s.text === "model changed")!.tone).toBe("muted")
   })
 
-  test("keeps the reported operator out of the default segments", () => {
+  test("never mentions a reported operator: the endpoint is the identity", () => {
     const stats = computeTurn(lineTranscript(), session)!
-    stats.upstream = "DeepInfra"
     expect(formatLineSegments(stats).find((s) => s.text.includes("via"))).toBeUndefined()
-    expect(formatLineSegments(stats, { fields: { upstream: true } }).find((s) => s.text.includes("via"))!.text).toBe(
-      "opencode/deepseek-v4.1-flash-free (via DeepInfra)",
-    )
+    expect(formatLineSegments(stats, { fields: { upstream: true } } as never).find((s) => s.text.includes("via"))).toBeUndefined()
   })
 
   test("respects field toggles and label overrides", () => {

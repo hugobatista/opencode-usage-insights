@@ -5,16 +5,11 @@ import { openStatsDb } from "../src/stats/db"
 
 const NOW = 1_000_000
 
-function harness(options?: { captureHeaders?: boolean; providerPackage?: (providerID: string | undefined) => string | undefined }): {
-  db: Database
-  recorder: Recorder
-} {
+const MODEL = { providerID: "opencode", id: "m1" }
+
+function harness(): { db: Database; recorder: Recorder } {
   const db = openStatsDb(":memory:")
-  const recorder = createRecorder(db, {
-    captureHeaders: options?.captureHeaders ?? false,
-    providerPackage: options?.providerPackage,
-    now: () => NOW,
-  })
+  const recorder = createRecorder(db, { now: () => NOW })
   return { db, recorder }
 }
 
@@ -74,7 +69,7 @@ describe("recorder steps", () => {
         finish: "stop",
         cost: 0.02,
         tokens: { input: 10, output: 20, reasoning: 5, cache: { read: 30, write: 40 } },
-        providerState: { route: "go" },
+  
       },
     })
     expect(stepRow(db)).toEqual({
@@ -94,237 +89,168 @@ describe("recorder steps", () => {
       streamed_at: 550,
       completed_at: 900,
       finish: "stop",
-      provider_state: '{"route":"go"}',
-      upstream: null,
-      upstream_source: null,
-      upstream_model: null,
       router: null,
-      tps: (25 / (550 - 400)) * 1000,
       recorded_at: NOW,
     })
     expect(recorder.pendingFor("s1")).toBeUndefined()
   })
 
-  test("leaves tokens per second null without a streaming window", () => {
+  test("keeps the streaming window even when nothing was generated", () => {
     const { db, recorder } = harness()
     recorder.handleEvent({
       type: "session.step.started",
       created: 500,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" }, started: 400 },
+      data: { sessionID: "s1", assistantMessageID: "a1", finish: "stop", tokens: { input: 10 } },
     })
     recorder.handleEvent({
       type: "session.step.ended",
       created: 900,
       data: { sessionID: "s1", assistantMessageID: "a1", finish: "stop", tokens: { input: 10, output: 20, reasoning: 5 } },
     })
-    expect(stepRow(db).tps).toBeNull()
-  })
-
-  test("falls back to the last selected model when the step start was missed", () => {
-    const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.model.selected",
-      created: 100,
-      data: { sessionID: "s1", model: { providerID: "github-copilot", id: "gpt-5" }, previous: { providerID: "opencode", id: "m1" } },
-    })
-    recorder.handleEvent({
-      type: "session.step.ended",
-      created: 200,
-      data: { sessionID: "s1", assistantMessageID: "a1", finish: "stop", tokens: { input: 1, output: 2 } },
-    })
     const row = stepRow(db)
-    expect(row.provider_id).toBe("github-copilot")
-    expect(row.model_id).toBe("gpt-5")
-    expect(row.created_at).toBeNull()
-    expect(row.completed_at).toBe(200)
-    const event = db.query("SELECT kind, data FROM events WHERE kind = 'model-selected'").get() as Record<string, unknown>
-    expect(JSON.parse(event.data as string)).toEqual({ model: { providerID: "github-copilot", id: "gpt-5" }, previous: { providerID: "opencode", id: "m1" } })
+    expect(row.streamed_at).toBeNull()
+    expect(row.completed_at).toBe(900)
   })
 
-  test("records failed steps with their error", () => {
+  test("records a failed step with its outcome on the step itself", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 100,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } },
-    })
-    recorder.handleEvent({
-      type: "session.step.failed",
-      created: 200,
-      data: { sessionID: "s1", assistantMessageID: "a1", error: { message: "rate limited" }, finish: "content-filter" },
-    })
-    expect(stepRow(db).finish).toBe("content-filter")
-    const event = db.query("SELECT data FROM events WHERE kind = 'step-failed'").get() as Record<string, unknown>
-    expect(JSON.parse(event.data as string)).toEqual({ error: "rate limited", finish: "content-filter", rawFinish: undefined })
+    recorder.handleEvent({ type: "session.step.started", created: NOW, data: { sessionID: "s1", assistantMessageID: "a1", started: NOW - 10, model: MODEL } })
+    recorder.handleEvent({ type: "session.step.failed", created: NOW, data: { sessionID: "s1", assistantMessageID: "a1", finish: "error" } })
+    expect(stepRow(db).finish).toBe("error")
+    // Nothing is written for the failure event: no view reads one.
+    expect(db.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 0 })
+    db.close()
   })
 })
 
-describe("recorder upstream discovery", () => {
-  test("applies compaction provenance to the session's existing steps", () => {
+describe("recorder endpoint discovery", () => {
+  test("applies the endpoint to the step in flight and to later steps", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.created", created: 10, data: { sessionID: "s1" } })
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } },
-    })
-    recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    recorder.handleEvent({
-      type: "session.compaction.ended",
-      created: 120,
-      data: {
-        sessionID: "s1",
-        reason: "auto",
-        model: { providerID: "opencode", id: "m1" },
-        providerContext: { provenance: { provider: "deepinfra", modelID: "m1" } },
-      },
-    })
-    const row = stepRow(db)
-    expect(row.upstream).toBe("DeepInfra")
-    expect(row.upstream_source).toBe("provenance")
-    const compaction = db.query("SELECT data FROM events WHERE kind = 'compaction'").get() as Record<string, unknown>
-    expect(JSON.parse(compaction.data as string)).toMatchObject({ reason: "auto" })
-  })
-
-  test("applies header evidence to the step in flight and to later steps", () => {
-    const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
     recorder.handleHttpResponse({
       sessionID: "s1",
-      kind: "primary",
       model: { providerID: "opencode", id: "m1" },
-      request: { method: "POST", url: "https://gateway.example/inference/go/v1/chat/completions" },
-      response: { status: 200, headers: { "x-served-by": "together-vllm" } },
+      request: { url: "https://opencode.ai/zen/v1/chat" },
+      response: { status: 200, headers: { "x-opencode-endpoint-id": "thesean-dsv4.1flash" } },
     })
+    // The step in flight learns it, and so does the next one.
+    recorder.handleHttpResponse({ sessionID: "s1", model: { providerID: "opencode", id: "m1" }, request: { url: "https://opencode.ai/zen/v1/chat" }, response: { headers: {} } })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    // A later step of the same session inherits the learned operator.
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 90,
-      data: { sessionID: "s1", assistantMessageID: "a2", model: { providerID: "opencode", id: "m1" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 90, data: { sessionID: "s1", assistantMessageID: "a2", model: { providerID: "opencode", id: "m1" } } })
     recorder.handleEvent({ type: "session.step.ended", created: 99, data: { sessionID: "s1", assistantMessageID: "a2", tokens: { input: 1 } } })
-    const rows = db.query("SELECT message_id, upstream, upstream_source FROM steps ORDER BY message_id").all() as Record<string, unknown>[]
+    const rows = db.query("SELECT message_id, router FROM steps ORDER BY message_id").all() as Record<string, unknown>[]
     expect(rows).toEqual([
-      { message_id: "a1", upstream: "Together", upstream_source: "header:x-served-by" },
-      { message_id: "a2", upstream: "Together", upstream_source: "header:x-served-by" },
+      { message_id: "a1", router: "thesean-dsv4.1flash" },
+      { message_id: "a2", router: "thesean-dsv4.1flash" },
     ])
+    db.close()
   })
 
-  test("captures redacted headers only when asked", () => {
-    const { db, recorder } = harness({ captureHeaders: true })
-    recorder.handleHttpResponse({
-      sessionID: "s1",
-      kind: "primary",
-      request: { method: "POST", url: "https://gateway.example/inference/go/v1/chat/completions?x=1" },
-      response: { status: 200, headers: { authorization: "Bearer secret", "x-served-by": "groq" } },
-    })
-    const row = db.query("SELECT method, path, status, headers FROM http_responses").get() as Record<string, unknown>
-    expect(row.method).toBe("POST")
-    expect(row.path).toBe("/inference/go/v1/chat/completions")
-    expect(row.status).toBe(200)
-    expect(JSON.parse(row.headers as string)).toEqual({ "x-served-by": "groq" })
-  })
-
-  test("ignores responses without evidence", () => {
-    const { db, recorder } = harness({ captureHeaders: false })
-    recorder.handleHttpResponse({ sessionID: "s1", kind: "primary", response: { status: 200, headers: { "content-type": "text/event-stream" } } })
-    const count = db.query("SELECT COUNT(*) AS n FROM http_responses").get() as { n: number }
-    expect(count.n).toBe(0)
-  })
-
-  // Regression: `server: cloudflare` is the CDN in front of the gateway, and it
-  // used to win over the gateway's own header naming the real operator.
-  test("reads the gateway's operator header, never the CDN", () => {
+  test("learns the endpoint from the host when no header names one", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "deepseek-v4.1-flash" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "fireworks", id: "m1" } } })
     recorder.handleHttpResponse({
       sessionID: "s1",
-      kind: "primary",
-      model: { providerID: "opencode", id: "deepseek-v4.1-flash" },
-      request: { method: "POST", url: "https://opencode.ai/zen/v1/chat/completions" },
-      response: {
-        status: 200,
-        headers: {
-          server: "cloudflare",
-          "cf-ray": "a4afa2c39f164d29-PHL",
-          "content-type": "text/event-stream",
-          "x-opencode-endpoint-id": "orcarouter-dsv4.1flash",
-          "x-opencode-log-id": "78cd3e7f-b42c-4903-a28a-a177727dfd73",
-          "x-opencode-upstream-model-id": "deepseek/deepseek-v4.1-flash",
-          "x-zen-model": "deepseek-v4.1-flash",
-        },
-      },
+      model: { providerID: "fireworks", id: "m1" },
+      request: { url: "https://api.fireworks.ai/inference/v1/chat/completions" },
+      response: { status: 200, headers: { "x-served-by": "fireworks" } },
     })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    const row = stepRow(db)
-    expect(row.upstream).toBe("DeepSeek")
-    expect(row.upstream_source).toBe("header:x-opencode-upstream-model-id")
-    expect(row.upstream_model).toBe("deepseek/deepseek-v4.1-flash")
-    expect(row.router).toBe("orcarouter-dsv4.1flash")
+    expect(stepRow(db).router).toBe("fireworks")
+    db.close()
   })
 
-  test("CDN headers alone never name an operator", () => {
+  test("stores nothing about an exchange that names no endpoint", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 50, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
     recorder.handleHttpResponse({
       sessionID: "s1",
-      kind: "primary",
-      request: { method: "POST", url: "https://opencode.ai/zen/v1/chat/completions" },
-      response: { status: 200, headers: { server: "cloudflare", via: "1.1 cloudflare", "cf-ray": "abc123" } },
+      model: { providerID: "opencode", id: "m1" },
+      request: { url: "https://example.com/v1/chat" },
+      // Operator and CDN headers only: neither is the endpoint.
+      response: { status: 200, headers: { "x-served-by": "together", server: "cloudflare", "cf-ray": "abc" } },
     })
     recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    const row = stepRow(db)
-    expect(row.upstream).toBeNull()
-    expect(row.router).toBe("opencode")
+    expect(stepRow(db).router).toBeNull()
+    db.close()
   })
 
-  test("names the operator of the endpoint the request went to", () => {
+  test("keeps the endpoint learned for a session across steps of the same model", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "fireworks", id: "llama" } },
-    })
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "opencode", id: "m1" } } })
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
     recorder.handleHttpResponse({
       sessionID: "s1",
-      kind: "primary",
-      request: { method: "POST", url: "https://api.fireworks.ai/inference/v1/chat/completions" },
-      response: { status: 200, headers: { "content-type": "text/event-stream" } },
+      model: { providerID: "opencode", id: "m1" },
+      request: { url: "https://opencode.ai/zen/v1/chat" },
+      response: { headers: { "x-opencode-endpoint-id": "luminal-dsv4.1flash" } },
     })
-    recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    const row = stepRow(db)
-    expect(row.upstream).toBe("Fireworks")
-    expect(row.upstream_source).toBe("endpoint:api.fireworks.ai")
-  })
-
-  test("falls back to the provider package when nothing else names an operator", () => {
-    const { db, recorder } = harness({ providerPackage: (providerID) => (providerID === "fireworks" ? "@opencode/ai/providers/fireworks" : undefined) })
-    recorder.handleEvent({
-      type: "session.step.started",
-      created: 50,
-      data: { sessionID: "s1", assistantMessageID: "a1", model: { providerID: "fireworks", id: "llama" } },
-    })
-    recorder.handleEvent({ type: "session.step.ended", created: 80, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
-    const row = stepRow(db)
-    expect(row.upstream).toBe("Fireworks")
-    expect(row.upstream_source).toBe("package:@opencode/ai/providers/fireworks")
+    expect(stepRow(db).router).toBe("luminal-dsv4.1flash")
+    db.close()
   })
 })
 
 describe("recorder robustness", () => {
+  test("forgets a session that is gone", () => {
+    const { db, recorder } = harness()
+    recorder.handleEvent({ type: "session.created", created: 1, data: { sessionID: "s1", model: MODEL } })
+    recorder.handleEvent({ type: "session.step.started", created: 2, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleHttpResponse({
+      sessionID: "s1",
+      model: MODEL,
+      response: { headers: { "x-opencode-endpoint-id": "gw-1" } },
+    })
+    // The session is deleted before its step ends: the in-flight entry and the
+    // endpoint learned for it go too, so a deleted session leaves nothing.
+    recorder.handleEvent({ type: "session.deleted", created: 3, data: { sessionID: "s1" } })
+    expect(recorder.pendingFor("s1")).toBeUndefined()
+    recorder.handleEvent({ type: "session.step.ended", created: 4, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
+    expect(stepRow(db).router).toBeNull()
+    db.close()
+  })
+
+  test("a gateway that repeats its endpoint costs no write", () => {
+    const { db, recorder } = harness()
+    const response = {
+      sessionID: "s1",
+      model: MODEL,
+      request: { url: "https://opencode.ai/zen/v1/chat" },
+      response: { headers: { "x-opencode-endpoint-id": "gw-1" } },
+    }
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleHttpResponse(response)
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
+    // The step carries the endpoint the gateway named, applied when it was
+    // written rather than by a second statement on the response path.
+    expect(stepRow(db).router).toBe("gw-1")
+
+    // The next response observes the same endpoint for the same model: there
+    // is nothing left to apply, and the response path stays a map lookup.
+    const changes = () => (db.query("SELECT total_changes() AS n").get() as { n: number }).n
+    const before = changes()
+    recorder.handleHttpResponse(response)
+    expect(changes()).toBe(before)
+    db.close()
+  })
+
+  test("a gateway that re-routes is seen", () => {
+    const { db, recorder } = harness()
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleHttpResponse({ sessionID: "s1", model: MODEL, response: { headers: { "x-opencode-endpoint-id": "gw-1" } } })
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
+    recorder.handleEvent({ type: "session.step.started", created: 30, data: { sessionID: "s1", assistantMessageID: "a2", model: MODEL } })
+    recorder.handleHttpResponse({ sessionID: "s1", model: MODEL, response: { headers: { "x-opencode-endpoint-id": "gw-2" } } })
+    recorder.handleEvent({ type: "session.step.ended", created: 40, data: { sessionID: "s1", assistantMessageID: "a2", tokens: { input: 1 } } })
+    // The re-route is not retroactive: a1 keeps the endpoint that served it,
+    // and only steps recorded without one are filled in.
+    const rows = db.query("SELECT message_id, router FROM steps ORDER BY message_id").all()
+    expect(rows).toEqual([
+      { message_id: "a1", router: "gw-1" },
+      { message_id: "a2", router: "gw-2" },
+    ])
+    db.close()
+  })
+
   test("ignores unknown events and malformed payloads", () => {
     const { db, recorder } = harness()
     recorder.handleEvent({ type: "session.text.delta", created: 1, data: { sessionID: "s1" } })
@@ -337,14 +263,13 @@ describe("recorder robustness", () => {
     expect(prompts.n).toBe(0)
   })
 
-  test("records execution outcomes and auxiliary usage", () => {
+  test("ignores the events whose rows no view reads", () => {
     const { db, recorder } = harness()
-    recorder.handleEvent({ type: "session.execution.succeeded", created: 10, data: { sessionID: "s1" } })
-    recorder.handleEvent({ type: "session.execution.failed", created: 20, data: { sessionID: "s1" } })
-    recorder.handleEvent({ type: "session.usage.recorded", created: 30, data: { sessionID: "s1", source: "title", tokens: { input: 5 }, cost: 0.001 } })
-    const events = db.query("SELECT kind, data FROM events ORDER BY at").all() as { kind: string; data: string }[]
-    expect(events.map((event) => event.kind)).toEqual(["execution", "execution", "usage-recorded"])
-    expect(JSON.parse(events[0]!.data)).toEqual({ outcome: "succeeded" })
-    expect(JSON.parse(events[2]!.data)).toMatchObject({ source: "title", cost: 0.001 })
+    recorder.handleEvent({ type: "session.execution.succeeded", created: NOW, data: { sessionID: "s1" } })
+    recorder.handleEvent({ type: "session.execution.failed", created: NOW, data: { sessionID: "s1" } })
+    recorder.handleEvent({ type: "session.usage.recorded", created: NOW, data: { sessionID: "s1", tokens: { input: 5 } } })
+    recorder.handleEvent({ type: "session.model.selected", created: NOW, data: { sessionID: "s1", model: MODEL } })
+    expect(db.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 0 })
+    db.close()
   })
 })
