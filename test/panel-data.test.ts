@@ -234,6 +234,20 @@ describe("formatting helpers", () => {
       24,
     )
     expect(narrow.map((line) => line.text)).toEqual([`${padCell("steps", 11)}3`, `${padCell("input", 11)}12k`])
+
+    // A value wider than its half of the panel stacks instead of overflowing:
+    // every line has to fit the requested width.
+    const overflow = kvGrid(
+      [
+        ["unsettled", "0 · no tps 0.0%"],
+        ["window", "12/10/2026, 09:01:00 → 15/10/2026, 07:20:00"],
+      ],
+      100,
+    )
+    expect(overflow.map((line) => line.text)).toEqual([
+      `${padCell("unsettled", 11)}0 · no tps 0.0%`,
+      `${padCell("window", 11)}12/10/2026, 09:01:00 → 15/10/2026, 07:20:00`,
+    ])
   })
 })
 

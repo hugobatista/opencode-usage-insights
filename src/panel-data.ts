@@ -273,8 +273,12 @@ export function kvGrid(pairs: readonly (readonly [string, string])[], width: num
       continue
     }
     const rightText = `${padCell(right[0], label)}${right[1]}`
-    if (leftText.length + 2 <= column) {
-      lines.push({ text: `${leftText}${" ".repeat(Math.max(2, column - leftText.length))}${rightText}`, tone: "base" })
+    // Both columns have to fit the requested width: the value on the right may
+    // be wider than half the panel (the coverage window dates are), and a line
+    // that overflows wraps in the terminal instead of ending.
+    const gap = Math.max(2, column - leftText.length)
+    if (leftText.length + gap + rightText.length <= width) {
+      lines.push({ text: `${leftText}${" ".repeat(gap)}${rightText}`, tone: "base" })
     } else {
       lines.push({ text: leftText, tone: "base" })
       lines.push({ text: rightText, tone: "base" })
