@@ -20,6 +20,7 @@ import { Database } from "bun:sqlite"
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { computeTurn, type TranscriptMessage } from "../src/core"
+import { toTranscriptTail } from "../src/line"
 import { recordEvent, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
 import { SCHEMA_VERSION, openStatsDb } from "../src/stats/db"
 import { dbInfo } from "../src/stats/maintenance"
@@ -274,6 +275,9 @@ function main(): void {
     // The line: computed per finished turn, over the session's transcript.
     { name: "computeTurn (2k messages)", budget: 1.5, repeat: 50, run: () => computeTurn(shortTranscript) },
     { name: "computeTurn (16k messages)", budget: 1.5, repeat: 50, run: () => computeTurn(longTranscript) },
+    // The line at turn end: converting the whole transcript cost ~1.2 ms here
+    // before the tail walk; only the last turns are needed.
+    { name: "line at turn end (16k msgs)", budget: 0.4, repeat: 200, run: () => computeTurn(toTranscriptTail(longTranscript, 2)) },
     // Writes on the request path: the recorder may not add latency of its own.
     {
       name: "recordStep (write)",

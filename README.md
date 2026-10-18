@@ -518,7 +518,10 @@ keeps are:
 
 - **Writes are small and rare.** A step is one upsert; an endpoint is written
   once per session and model and only when it changed; a repeated observation
-  costs a map lookup, not a statement.
+  costs a map lookup, not a statement. A busy database never stalls the agent:
+  the connection waits a second at most and the write is deferred to the next
+  event instead, in a bounded queue, rather than losing the record or blocking
+  the event handler the agent is waiting on.
 - **Reads are index-driven.** Every range filter compares the expression the
   `steps_at` index covers, the per-prompt history is bounded to the last few
   prompts, and the line and the sidebar never scan a session's whole history.
@@ -526,6 +529,16 @@ keeps are:
   share one read-only connection, a burst of step events is coalesced into one
   rebuild, and each view is memoised; the file's own numbers (`dbInfo`) are only
   asked for by the `db` view.
+- **The live line reads nothing while a turn runs.** The host publishes the
+  message list as a store, so the line is recomputed on every streamed delta;
+  the "is the turn over?" check comes first and the transcript conversion covers
+  only the last turns, because that is all the line shows. Measured before the
+  fix: one message-list read per delta, and a whole-transcript conversion (1.2 ms
+  at 16 000 messages) at every turn end.
+- **Maintenance never holds the write lock for long.** A prune deletes in
+  batches of 5 000 rows, so the recorder interleaves (a single delete of 123k
+  steps held the lock for 1.3 s, which the agent's event handler waited out),
+  and the panel refuses to prune or compact while a session is running.
 - **The panel's cost is the range it shows.** A view folds the steps of its
   range — in SQLite where the answer is a sum or a count, in JavaScript where it
   is a percentile or a comparison between consecutive steps. That is why the

@@ -196,9 +196,26 @@ export function Panel(props: {
     setAnchor(undefined)
   }
 
+  /**
+   * True while the session is running. The recorder writes on the agent's own
+   * event path, so a maintenance action that holds the write lock for a while
+   * would make the agent wait: it is refused instead, before it is even offered.
+   */
+  function sessionRunning(): boolean {
+    try {
+      return props.ctx.data.session.status(props.input.sessionID) === "running"
+    } catch {
+      return false
+    }
+  }
+
   /** Delete the recorded usage older than `days`, after asking. */
   async function prune(days: number): Promise<void> {
     if (!Number.isFinite(days)) return
+    if (sessionRunning()) {
+      props.ctx.ui.toast.show({ message: "the session is running: prune again when it is idle", variant: "warning" })
+      return
+    }
     const info = database()
     const steps = info?.removable.find((option) => option.days === days)?.steps
     const confirmed = await props.ctx.ui.dialog.confirm({
@@ -223,6 +240,10 @@ export function Panel(props: {
 
   /** Give the space a prune freed back to the filesystem. */
   async function compact(): Promise<void> {
+    if (sessionRunning()) {
+      props.ctx.ui.toast.show({ message: "the session is running: compact again when it is idle", variant: "warning" })
+      return
+    }
     const confirmed = await props.ctx.ui.dialog.confirm({
       title: "Compact the database",
       message: "SQLite rewrites the file to reclaim the space of deleted rows. It needs the recorder to be idle, and it can take a moment.",

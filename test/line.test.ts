@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { computeTurn, formatClock, type AssistantMessage, type Totals, type TranscriptMessage } from "../src/core"
-import { lineParts, lineText, sessionTotals, toTranscript, type RuntimeMessage } from "../src/line"
+import { lineParts, lineText, sessionTotals, toTranscript, toTranscriptTail, type RuntimeMessage } from "../src/line"
 
 const BASE = 1_800_000_000_000
 const at = (seconds: number) => BASE + seconds * 1_000
@@ -43,6 +43,55 @@ const sessionTotalsFixture: Totals = {
   cost: 0.14,
   steps: 2,
 }
+
+describe("toTranscriptTail", () => {
+  /** A transcript of `turns` turns, six messages each, like a real session. */
+  function session(turns: number): RuntimeMessage[] {
+    const messages: RuntimeMessage[] = []
+    let at = 1_800_000_000_000
+    for (let turn = 0; turn < turns; turn += 1) {
+      messages.push({ id: `prt_${turn}`, type: "user", time: { created: at } })
+      for (let step = 0; step < 5; step += 1) {
+        at += 1_000
+        messages.push({
+          id: `msg_${turn}_${step}`,
+          type: "assistant",
+          time: { created: at, streamed: at + 400, completed: at + 1_000 },
+          model: { providerID: "opencode", id: "m1" },
+          tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 900, write: 5 } },
+          cost: 0.001,
+          finish: "stop",
+        })
+      }
+      at += 1_000
+      // Things that are not a turn boundary keep the run open.
+      messages.push({ id: `idle_${turn}`, type: "idle", time: { created: at } })
+    }
+    return messages
+  }
+
+  test("converts only the last turns, and answers what the whole transcript would", () => {
+    const messages = session(40)
+    const tail = toTranscriptTail(messages, 2)
+    // Two turns: their prompts, their five steps each, and nothing else.
+    expect(tail.length).toBeLessThanOrEqual(12)
+    expect(computeTurn(tail)).toEqual(computeTurn(toTranscript(messages)))
+  })
+
+  test("keeps a trailing run that no prompt opened", () => {
+    const messages: RuntimeMessage[] = [
+      { id: "prt_1", type: "user", time: { created: at(0) } },
+      { id: "msg_1", type: "assistant", time: { created: at(1), completed: at(2) }, model: { providerID: "opencode", id: "m1" }, tokens: { input: 1, output: 1 }, cost: 0 },
+      { id: "msg_2", type: "assistant", time: { created: at(3), completed: at(4) }, model: { providerID: "opencode", id: "m1" }, tokens: { input: 1, output: 1 }, cost: 0 },
+    ]
+    expect(toTranscriptTail(messages, 2).map((message) => message.id)).toEqual(["prt_1", "msg_1", "msg_2"])
+  })
+
+  test("has nothing to convert without messages", () => {
+    expect(toTranscriptTail([], 2)).toEqual([])
+    expect(toTranscriptTail([{ id: "idle_1", type: "idle" }], 2)).toEqual([])
+  })
+})
 
 describe("toTranscript", () => {
   test("keeps the assistant fields core accounts for", () => {

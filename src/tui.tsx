@@ -5,7 +5,7 @@ import { StyledText, fg, type ColorInput } from "@opentui/core"
 import type { Database } from "bun:sqlite"
 import { Show, createMemo, createRenderEffect, createSignal } from "solid-js"
 import { computeTurn, type LineFields, type LineIdentity, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
-import { lineParts, lineText, sessionTotals, toTranscript, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
+import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
 import { TurnsSidebar } from "./sidebar"
@@ -59,6 +59,9 @@ export type Options = {
 }
 
 const ROUTER_CACHE_MS = 5_000
+
+/** Ceiling on the endpoint lookups kept per session and model. */
+const MAX_ROUTER_CACHE = 512
 
 /**
  * Shortest interval between two panel rebuilds. A tool-call loop ends several
@@ -182,6 +185,13 @@ export default Plugin.define({
         }
       }
       routerCache.set(key, { value, at: now })
+      // Same ceiling as the recorder's maps: a TUI that runs for weeks sees
+      // thousands of sessions, and its oldest entries are the least useful.
+      while (routerCache.size > MAX_ROUTER_CACHE) {
+        const oldest = routerCache.keys().next()
+        if (oldest.done === true) break
+        routerCache.delete(oldest.value)
+      }
       return value
     }
 
@@ -200,12 +210,15 @@ export default Plugin.define({
     }
 
     function lineFor(sessionID: string): TurnStats | undefined {
+      // A running turn has no final numbers yet: the line belongs to finished
+      // work, so it stays hidden until the session goes idle again. The check
+      // comes first on purpose: the host publishes the message list as a store,
+      // so this function is recomputed on every streamed delta, and reading the
+      // list there would be per-delta work for a line that is not shown.
+      if (!sessionIdle(sessionID)) return undefined
       const messages = ctx.data.session.message.list(sessionID) as unknown as RuntimeMessage[]
       const info = ctx.data.session.get(sessionID) as unknown as RuntimeSessionInfo | undefined
-      // A running turn has no final numbers yet: the line belongs to finished
-      // work, so it stays hidden until the session goes idle again.
-      if (!sessionIdle(sessionID)) return undefined
-      const stats = computeTurn(toTranscript(messages), sessionTotals(info))
+      const stats = computeTurn(toTranscriptTail(messages, 2), sessionTotals(info))
       if (stats !== undefined) {
         const router = lookupRouter(sessionID, stats.modelID)
         if (router !== undefined) {

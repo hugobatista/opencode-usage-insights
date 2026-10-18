@@ -73,15 +73,40 @@ export type PruneResult = {
 }
 
 /**
+ * Rows deleted per transaction. A single delete of a long history holds the
+ * write lock for the whole scan — measured at 1.3 s for 123k steps — and the
+ * recorder writes on the agent's event path, so it would wait that long. In
+ * batches the lock is taken and released per batch and the recorder
+ * interleaves. Each batch is atomic; the prune as a whole is not, which is
+ * fine for "delete what is older than this": a prune that is interrupted
+ * leaves fewer rows deleted, and the next one finishes the job.
+ */
+const PRUNE_BATCH = 5_000
+
+function deleteBatched(db: Database, table: "steps" | "prompts" | "events", where: string, cutoff: number): number {
+  // Table names and the WHERE clause are constants of this module: no value
+  // from outside is ever interpolated into the statement.
+  const statement = db.query(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} LIMIT ${PRUNE_BATCH})`)
+  let removed = 0
+  for (;;) {
+    const changes = statement.run(cutoff).changes
+    removed += changes
+    if (changes < PRUNE_BATCH) break
+  }
+  return removed
+}
+
+/**
  * Delete recorded usage older than `cutoff`. Steps, their prompts and the
  * compaction events that explain their cache losses go together: a compaction
  * that no step references answers nothing.
  */
 export function pruneOlderThan(db: Database, cutoff: number): PruneResult {
-  const steps = db.query(`DELETE FROM steps WHERE ${STEP_TIME} < ?`).run(cutoff).changes
-  const prompts = db.query("DELETE FROM prompts WHERE created_at IS NOT NULL AND created_at < ?").run(cutoff).changes
-  const events = db.query("DELETE FROM events WHERE at IS NOT NULL AND at < ?").run(cutoff).changes
-  return { steps, prompts, events }
+  return {
+    steps: deleteBatched(db, "steps", `${STEP_TIME} < ?`, cutoff),
+    prompts: deleteBatched(db, "prompts", "created_at IS NOT NULL AND created_at < ?", cutoff),
+    events: deleteBatched(db, "events", "at IS NOT NULL AND at < ?", cutoff),
+  }
 }
 
 /** Everything the database occupies: the main file plus its write-ahead log. */

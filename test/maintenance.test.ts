@@ -73,6 +73,22 @@ describe("pruneOlderThan", () => {
     db.close()
   })
 
+  test("removes more rows than one batch, in batches", () => {
+    const db = openStatsDb(":memory:")
+    upsertSession(db, { sessionID: "s1", startedAt: NOW })
+    // More rows than a batch holds: the delete has to loop to finish the job.
+    for (let index = 0; index < 5_200; index += 1) {
+      recordStep(db, { messageID: `bulk_${index}`, sessionID: "s1", providerID: "opencode", modelID: "m1", input: 1, createdAt: NOW - 40 * DAY, recordedAt: NOW })
+    }
+    recordStep(db, { messageID: "kept", sessionID: "s1", providerID: "opencode", modelID: "m1", input: 1, createdAt: NOW, recordedAt: NOW })
+    const result = pruneOlderThan(db, NOW - 30 * DAY)
+    expect(result.steps).toBe(5_200)
+    expect(db.query("SELECT message_id FROM steps").all()).toEqual([{ message_id: "kept" }])
+    // A second pass finds nothing: the loop stops on an empty batch.
+    expect(pruneOlderThan(db, NOW - 30 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0 })
+    db.close()
+  })
+
   test("is a no-op when nothing is older than the cutoff", () => {
     const db = seed()
     expect(pruneOlderThan(db, NOW - 400 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0 })

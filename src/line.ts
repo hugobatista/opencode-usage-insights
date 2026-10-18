@@ -9,6 +9,7 @@ import {
   type TurnStats,
   type TurnTotalsView,
 } from "./core"
+import { PROMPT_BOUNDARIES } from "./core"
 import { sanitizeLabel } from "./text"
 
 /**
@@ -75,6 +76,38 @@ export function toTranscript(messages: readonly RuntimeMessage[]): TranscriptMes
     })
   }
   return transcript
+}
+
+/**
+ * Convert only the messages of the last `segments` turns.
+ *
+ * The line is computed from the tail of a transcript (`computeTurn` walks it
+ * backwards), so converting the whole session was pure waste: on a long session
+ * it cost milliseconds at every turn end, on the thread that also paints the
+ * agent's output. Walking backwards costs what the last turns hold.
+ */
+export function toTranscriptTail(messages: readonly RuntimeMessage[], segments = 2): TranscriptMessage[] {
+  const tail: RuntimeMessage[] = []
+  let collected = 0
+  let closed = 0
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!
+    if (message.type === "assistant") {
+      tail.push(message)
+      collected += 1
+      continue
+    }
+    if (message.type === undefined || !PROMPT_BOUNDARIES.has(message.type)) continue
+    // A boundary closes the run collected after it, exactly like the host-side
+    // walk `transcriptTail` does.
+    if (collected === 0) continue
+    tail.push(message)
+    collected = 0
+    closed += 1
+    if (closed >= segments) break
+  }
+  tail.reverse()
+  return toTranscript(tail)
 }
 
 function toModelRef(model: RuntimeModelRef | undefined): { providerID: string; id: string; variant?: string } | undefined {

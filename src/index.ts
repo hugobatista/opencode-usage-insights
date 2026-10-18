@@ -38,6 +38,15 @@ export default Plugin.define({
     const db = tryOpen(resolveDbPath(options.db))
     if (db === undefined) return
 
+    // The recorder's connection runs on the agent's own event path, so it waits
+    // at most a second for another writer and then defers the write: a stalled
+    // event handler is worse than a record that lands on the next event.
+    try {
+      db.exec("PRAGMA busy_timeout = 1000")
+    } catch {
+      // A database that cannot take the pragma is still usable.
+    }
+
     const recorder = createRecorder(db)
     const abort = new AbortController()
     const stream = (async () => {

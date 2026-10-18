@@ -60,6 +60,7 @@ function createHarness(
   let currentPanel: { name: string; sessionID: string } | undefined
   const toasts: Array<{ message: string; variant?: string }> = []
   const dialogs: Array<{ title: string; message: string }> = []
+  let listReads = 0
   const events: Array<{ type: string; handler: (payload: unknown) => void; live: boolean }> = []
   const sessions = new Map<string, SessionSeed>()
   // The panel keeps its view, range, sort and filters in the host's durable
@@ -111,7 +112,10 @@ function createHarness(
         },
         status: (id: string) => statusSignals.get(id)?.[0]() ?? "idle",
         message: {
-          list: (id: string) => messageSignals.get(id)?.[0]() ?? [],
+          list: (id: string) => {
+            listReads += 1
+            return messageSignals.get(id)?.[0]() ?? []
+          },
         },
       },
     },
@@ -195,6 +199,7 @@ function createHarness(
     panel: () => currentPanel,
     toasts,
     dialogs,
+    listReads: () => listReads,
     events,
     sessions,
     cleanup,
@@ -415,6 +420,31 @@ describe("telemetry line", () => {
 
     const harness = init({ sessions: [session({ id: "ses_upstream" })] })
     expect(harness.lineText("ses_upstream")).not.toContain("via")
+  })
+
+  test("keeps the message list out of the path of a running turn", async () => {
+    const harness = init({ sessions: [session({ id: "ses_deltas" })] })
+    const claim = harness.claim("session.composer.top")!
+    const setup = await testRender(() => claim.render({ sessionID: "ses_deltas" } as never) as never, { width: 140, height: 4 })
+    try {
+      await setup.renderOnce()
+      // The host publishes the message list as a store, so the line is
+      // recomputed on every streamed delta; while the turn runs it must not
+      // read the messages at all.
+      harness.setStatus("ses_deltas", "running")
+      await setup.renderOnce()
+      const before = harness.listReads()
+      for (let index = 0; index < 20; index += 1) {
+        harness.setMessages("ses_deltas", [
+          ...(session({ id: "ses_deltas" }).messages ?? []),
+          { id: `live_${index}`, type: "assistant", time: { created: at(600 + index) }, model: MODEL, tokens: { input: 1, output: index } },
+        ])
+        await setup.renderOnce()
+      }
+      expect(harness.listReads()).toBe(before)
+    } finally {
+      await setup.dispose()
+    }
   })
 
   test("drops its cached upstream lookup when a step ends", () => {
@@ -767,6 +797,23 @@ describe("the db view's maintenance", () => {
       expect(harness.dialogs[0]!.message).toContain("would be deleted")
       expect(harness.toasts[0]?.message).toContain("pruned 1 steps")
       expect(stepIDs()).toEqual(["msg_new"])
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("refuses to touch the file while the session is running", async () => {
+    seedOldAndNew()
+    const { harness, setup } = await openDbView("ses_panel_prune")
+    try {
+      harness.setStatus("ses_panel_prune", "running")
+      harness.command("usage-insights.drill")!.run()
+      await Bun.sleep(1)
+      // Not even offered: the recorder writes on the agent's event path, so a
+      // prune that holds the write lock would make the agent wait.
+      expect(harness.dialogs).toHaveLength(0)
+      expect(harness.toasts).toEqual([{ message: "the session is running: prune again when it is idle", variant: "warning" }])
+      expect(stepIDs()).toEqual(["msg_new", "msg_old"])
     } finally {
       await setup.dispose()
     }

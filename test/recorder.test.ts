@@ -1,7 +1,10 @@
 import type { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { createRecorder, type Recorder } from "../src/recorder"
-import { openStatsDb } from "../src/stats/db"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { openStatsDb, openStatsDbWrite } from "../src/stats/db"
 
 const NOW = 1_000_000
 
@@ -187,6 +190,41 @@ describe("recorder endpoint discovery", () => {
     })
     expect(stepRow(db).router).toBe("luminal-dsv4.1flash")
     db.close()
+  })
+})
+
+describe("recorder under a locked database", () => {
+  test("defers the write instead of waiting for the lock", () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-insights-recorder-"))
+    const path = join(directory, "stats.db")
+    const db = openStatsDb(path)
+    // The recorder's connection waits a moment and then gives up: the test
+    // should not have to wait five seconds to prove the point.
+    db.exec("PRAGMA busy_timeout = 50")
+    const recorder = createRecorder(db, { now: () => NOW })
+    const blocker = openStatsDbWrite(path)
+    try {
+      // A maintenance action holds the write lock, as a prune or a vacuum does.
+      blocker.exec("BEGIN IMMEDIATE")
+      const started = Bun.nanoseconds()
+      recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+      recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", tokens: { input: 1 } } })
+      const elapsedMs = (Bun.nanoseconds() - started) / 1e6
+      // One short wait, not a stall: the agent's event path stays responsive.
+      expect(elapsedMs).toBeLessThan(500)
+      // Nothing is lost: the record is queued, not dropped.
+      expect((db.query("SELECT COUNT(*) AS n FROM steps").get() as { n: number }).n).toBe(0)
+      blocker.exec("ROLLBACK")
+      blocker.close()
+      // The next event lands it.
+      recorder.handleEvent({ type: "session.step.streamed", created: 30, data: { sessionID: "s1", assistantMessageID: "a1" } })
+      expect((db.query("SELECT COUNT(*) AS n FROM steps").get() as { n: number }).n).toBe(1)
+      expect(stepRow(db).input_tokens).toBe(1)
+    } finally {
+      blocker.close()
+      db.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
 

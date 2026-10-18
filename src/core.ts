@@ -109,7 +109,8 @@ export type TurnSegment = {
   prompt: TranscriptMessage | undefined
 }
 
-const PROMPT_BOUNDARIES = new Set(["user", "synthetic", "system"])
+/** Message types that open a turn: a run of assistants belongs to the last one. */
+export const PROMPT_BOUNDARIES: ReadonlySet<string> = new Set(["user", "synthetic", "system"])
 
 /**
  * Split a transcript into turns. A turn is a run of assistant steps opened by
