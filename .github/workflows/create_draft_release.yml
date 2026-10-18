@@ -69,15 +69,27 @@ jobs:
 
     - name: Create release branch
       run: |
-        git checkout -b "release/v${{ steps.get_version.outputs.version }}"
-        git push origin "release/v${{ steps.get_version.outputs.version }}"
+        branch="release/v${{ steps.get_version.outputs.version }}"
+        git checkout -B "$branch"
+        # A re-dispatch finds the branch its predecessor pushed: replace it, it
+        # only marks the commit the release was built from.
+        git push --force origin "HEAD:$branch"
 
     - name: Create DRAFT release through github cli and upload assets
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release create v${{ steps.get_version.outputs.version }} \
-          --title v${{ steps.get_version.outputs.version }} \
-          --generate-notes \
-          --draft \
-          dist/*
+        tag="v${{ steps.get_version.outputs.version }}"
+        # A re-run finds the draft left behind by the attempt that failed:
+        # reuse it, but refuse to touch a release that was already published.
+        state=$(gh release view "$tag" --json isDraft -q .isDraft 2>/dev/null || echo missing)
+        if [ "$state" = "missing" ]; then
+          gh release create "$tag" --title "$tag" --generate-notes --draft
+        elif [ "$state" = "false" ]; then
+          echo "release $tag is already published" >&2
+          exit 1
+        fi
+        # Files only: `dist/*` handed gh the `dist/stats/` directory, which it
+        # tried to read as an asset. Nested declarations upload under their
+        # basename, and no two files in dist/ share one.
+        find dist -type f -print0 | xargs -0 gh release upload "$tag" --clobber
