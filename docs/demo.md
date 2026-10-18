@@ -1,6 +1,26 @@
 # Demo output
 
-Generated with `bun run demo 100` against a seeded throwaway database (times render in the local timezone).
+Generated with `bun run demo 100` against a seeded throwaway database (times
+render in the local timezone). `bun run docs:images` captures the screenshots
+from the same database, through the same components the TUI renders.
+
+## The line
+
+![The telemetry line after a turn](images/line.png)
+
+## The sidebar
+
+![The session sidebar: the session totals and its last turns](images/sidebar.png)
+
+## The panel
+
+![The /usage overview view](images/panel-overview.png)
+
+![The /usage endpoints view](images/panel-endpoints.png)
+
+![The /usage cache view](images/panel-cache.png)
+
+## Full output
 
 ```text
 
@@ -56,7 +76,8 @@ cost       $1.69
 
 data coverage
 models     3 · unknown 0.0%                       endpoints  2 · unknown 28.6%
-unsettled  0 · no tps 0.0%                        window     12/10/2026, 09:01:00 → 15/10/2026, 07:20:00
+unsettled  0 · no tps 0.0%
+window     12/10/2026, 09:01:00 → 15/10/2026, 07:20:00
 
 /usage models
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -169,7 +190,7 @@ Docs pass  07:20:31 · Δ 20m00s · orcarouter-dsv4.1-flash-free · in 8.6k (410
 
 /usage db
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-/tmp/usage-insights-demo-NKslxj/stats.db
+/tmp/usage-insights-demo-mnBRbZ/stats.db
 0.0 MB + 0.5 MB wal · schema v7
 
 what it holds
@@ -185,5 +206,4 @@ keep           prunes
 30 days       0 steps
 90 days       0 steps
 365 days      0 steps
-
 ```

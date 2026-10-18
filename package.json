@@ -60,6 +60,7 @@
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build.ts",
     "demo": "bun run scripts/demo.ts",
+    "docs:images": "bun run scripts/screenshot.ts",
     "report": "bun run scripts/report.ts",
     "prepublishOnly": "bun run typecheck && bun test && bun run build",
     "bench": "bun run scripts/bench.ts",
