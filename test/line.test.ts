@@ -78,6 +78,16 @@ describe("toTranscriptTail", () => {
     expect(computeTurn(tail)).toEqual(computeTurn(toTranscript(messages)))
   })
 
+  test("never returns fewer than the two turns computeTurn reads", () => {
+    const messages = session(6)
+    const two = toTranscriptTail(messages, 2)
+    // One segment would answer differently (no `promptGapMs`, no cache
+    // reference), so the floor is part of the contract.
+    expect(toTranscriptTail(messages, 1).map((message) => message.id)).toEqual(two.map((message) => message.id))
+    expect(toTranscriptTail(messages, 0).map((message) => message.id)).toEqual(two.map((message) => message.id))
+    expect(computeTurn(toTranscriptTail(messages, 1))).toEqual(computeTurn(toTranscript(messages)))
+  })
+
   test("keeps a trailing run that no prompt opened", () => {
     const messages: RuntimeMessage[] = [
       { id: "prt_1", type: "user", time: { created: at(0) } },

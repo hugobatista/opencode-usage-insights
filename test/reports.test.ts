@@ -301,6 +301,16 @@ describe("endpoints", () => {
     db.close()
   })
 
+  test("names the model of each row the way the summary does", () => {
+    const db = seed()
+    recordStep(db, { messageID: "v1", sessionID: "s1", providerID: "opencode", modelID: "m1", variant: "max", createdAt: BASE + 80 * MIN, recordedAt: BASE + 80 * MIN })
+    const rows = endpointBreakdownOf(stepRows(db))
+    // A row is one model, named as a label (`m1 max`) and never as its key.
+    expect(rows.find((row) => row.variant === "max")!.models).toEqual(["m1 max"])
+    expect(rows.every((row) => row.models.length === 1 && !row.models[0]!.includes("#"))).toBe(true)
+    db.close()
+  })
+
   test("aggregates every model an endpoint served", () => {
     const db = seed()
     const rows = endpointSummaryOf(stepRows(db))

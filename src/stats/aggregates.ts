@@ -97,6 +97,13 @@ const STEP_COLUMNS = `message_id AS messageID, session_id AS sessionID, provider
 
 const STEP_OPTIONAL = ["providerID", "modelID", "variant", "router", "createdAt", "streamedAt", "completedAt"] as const
 
+/**
+ * A step as the pair reports read it. Their projection leaves the generated
+ * tokens out (nothing they compute sums them), and the type says so: an
+ * aggregate that reads `output` cannot be handed a pair row by mistake.
+ */
+export type PairRow = Omit<StepRow, "output" | "reasoning">
+
 /** The pair reports read no generated tokens: `output` and `reasoning` stay out. */
 const PAIR_COLUMNS = STEP_COLUMNS.replace("COALESCE(output_tokens, 0) AS output, COALESCE(reasoning_tokens, 0) AS reasoning, ", "")
 
@@ -116,14 +123,14 @@ export function stepRows(db: Database, options?: Options): StepRow[] {
  * few milliseconds for a far wider history — never the whole history of the
  * sessions in range.
  */
-export function cachePairs(db: Database, options?: Options): StepRow[] {
+export function cachePairs(db: Database, options?: Options): PairRow[] {
   const filter = buildWhere(options?.range, options?.filters)
   const rows = normalize(
     db
       .query(`SELECT ${PAIR_COLUMNS} FROM steps ${filter.where} ORDER BY session_id, ${STEP_AT}, message_id`)
       .all(...filter.params) as Array<Record<string, unknown>>,
     STEP_OPTIONAL,
-  ) as StepRow[]
+  ) as PairRow[]
   const from = options?.range?.from
   if (from === undefined || rows.length === 0) return rows
   const seek = db.query(
@@ -134,7 +141,7 @@ export function cachePairs(db: Database, options?: Options): StepRow[] {
   for (const sessionID of new Set(rows.map((row) => row.sessionID))) {
     const boundary = seek.get(sessionID, from) as Record<string, unknown> | null
     if (boundary === null) continue
-    const step = normalize([boundary], STEP_OPTIONAL)[0] as StepRow
+    const step = normalize([boundary], STEP_OPTIONAL)[0] as PairRow
     step.boundary = true
     rows.push(step)
   }
@@ -147,7 +154,7 @@ export function cachePairs(db: Database, options?: Options): StepRow[] {
 }
 
 /** The same step in the message shape the shared pair rules are written for. */
-function message(step: StepRow): AssistantMessage {
+function message(step: PairRow): AssistantMessage {
   return {
     type: "assistant",
     id: step.messageID,
@@ -164,8 +171,8 @@ function message(step: StepRow): AssistantMessage {
 }
 
 /** Consecutive steps of the same session, in order. */
-function pairsOf(rows: readonly StepRow[]): Array<{ previous: StepRow; current: StepRow }> {
-  const pairs: Array<{ previous: StepRow; current: StepRow }> = []
+function pairsOf(rows: readonly PairRow[]): Array<{ previous: PairRow; current: PairRow }> {
+  const pairs: Array<{ previous: PairRow; current: PairRow }> = []
   for (let index = 1; index < rows.length; index += 1) {
     const previous = rows[index - 1]!
     const current = rows[index]!
@@ -390,7 +397,7 @@ export type CacheModelRow = {
  * Reuse of the prompt cache per model, most cached first, over the steps of the
  * range. A boundary step is not part of the range, so it is left out.
  */
-export function cacheStatsByModel(rows: readonly StepRow[]): CacheModelRow[] {
+export function cacheStatsByModel(rows: readonly PairRow[]): CacheModelRow[] {
   const out: CacheModelRow[] = []
   const inRange = rows.filter((row) => row.boundary !== true)
   for (const [, group] of groupBy(inRange, (row) => modelKey(row.modelID ?? "(unknown)", row.variant))) {
@@ -441,7 +448,7 @@ function noteTransition(map: Map<string, AffinityTransition>, dimension: "model"
  * endpoint. A change is not by itself a fault — a gateway may re-route
  * deliberately — so the report pairs the count with the cache it actually cost.
  */
-export function affinityOf(rows: readonly StepRow[]): AffinityReport {
+export function affinityOf(rows: readonly PairRow[]): AffinityReport {
   const perModel = new Map<string, AffinityRow>()
   const transitions = new Map<string, AffinityTransition>()
   const totals = { pairs: 0, changes: 0, cacheLost: 0, cacheLostEvents: 0 }
@@ -541,7 +548,7 @@ function bucketFor(gapMs: number): number {
  * endpoint. Only pairs of the same model are comparable, which is exactly the
  * set the cache rule already uses.
  */
-export function gapReportOf(rows: readonly StepRow[]): GapReport {
+export function gapReportOf(rows: readonly PairRow[]): GapReport {
   const buckets: GapBucket[] = GAP_BUCKETS.map(([label]) => ({ label, samples: 0, retained: 0, drops: 0, lostTokens: 0, retainedRatio: undefined }))
   const endpoints = new Map<string, EndpointReuseRow>()
   let samples = 0
@@ -596,7 +603,7 @@ export type TtlEvidenceRow = {
  * reused the cache, and the shortest gap that lost it. Comparing the two per
  * provider turns TTL guesses into observations.
  */
-export function ttlEvidenceOf(rows: readonly StepRow[]): TtlEvidenceRow[] {
+export function ttlEvidenceOf(rows: readonly PairRow[]): TtlEvidenceRow[] {
   const evidence = new Map<string, TtlEvidenceRow>()
 
   for (const { previous, current } of pairsOf(rows)) {
@@ -649,9 +656,9 @@ export type CacheDropRow = {
  * Compactions come from the `events` table: one query for the sessions in
  * play, never one per loss.
  */
-export function cacheDropsOf(db: Database, rows: readonly StepRow[], options?: { ttlHintMs?: number }): CacheDropRow[] {
+export function cacheDropsOf(db: Database, rows: readonly PairRow[], options?: { ttlHintMs?: number }): CacheDropRow[] {
   const ttlHint = options?.ttlHintMs ?? DEFAULT_TTL_HINT_MS
-  const losses: Array<{ previous: StepRow; current: StepRow; tokens: number; gapMs: number | undefined }> = []
+  const losses: Array<{ previous: PairRow; current: PairRow; tokens: number; gapMs: number | undefined }> = []
   for (const { previous, current } of pairsOf(rows)) {
     const tokens = cacheDrop(message(previous), message(current))
     if (tokens === undefined) continue
@@ -766,7 +773,9 @@ export function endpointBreakdownOf(rows: readonly StepRow[]): EndpointRow[] {
     for (const steps of groupBy(modelRows, (step) => step.router ?? "").values()) {
       const [modelID, variant] = [model.slice(0, model.indexOf("#")), model.slice(model.indexOf("#") + 1)]
       out.push({
-        ...endpointOf(steps, model),
+        // One row per model, so its `models` field names that one model — in the
+        // same label form the endpoint summary uses.
+        ...endpointOf(steps, modelNames(steps)),
         modelID,
         variant: variant === "" ? undefined : variant,
         share: steps.length / modelRows.length,

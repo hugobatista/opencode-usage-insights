@@ -87,6 +87,10 @@ export function toTranscript(messages: readonly RuntimeMessage[]): TranscriptMes
  * agent's output. Walking backwards costs what the last turns hold.
  */
 export function toTranscriptTail(messages: readonly RuntimeMessage[], segments = 2): TranscriptMessage[] {
+  // `computeTurn` reads the last turn *and the one before it*: with fewer
+  // segments it answers something else (no `promptGapMs`, no cache reference for
+  // the first step), so the floor is not a matter of taste.
+  const wanted = Math.max(2, segments)
   const tail: RuntimeMessage[] = []
   let collected = 0
   let closed = 0
@@ -104,7 +108,7 @@ export function toTranscriptTail(messages: readonly RuntimeMessage[], segments =
     tail.push(message)
     collected = 0
     closed += 1
-    if (closed >= segments) break
+    if (closed >= wanted) break
   }
   tail.reverse()
   return toTranscript(tail)

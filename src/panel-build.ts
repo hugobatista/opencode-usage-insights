@@ -19,7 +19,7 @@ import {
   type AffinityReport,
   type CacheStats,
   type EndpointRow,
-  type StepRow,
+  type PairRow,
   type EndpointSummary,
   type Dimension,
   type LatencyGroupRow,
@@ -405,7 +405,7 @@ function sortTurns(rows: ReturnType<typeof turns>, sort: string, desc: boolean):
 // ---------------------------------------------------------------------------
 
 /** Token reuse per model, for the models view and the cache view. */
-export function cacheByModel(pairs: readonly StepRow[]): Map<string, CacheStats> {
+export function cacheByModel(pairs: readonly PairRow[]): Map<string, CacheStats> {
   const map = new Map<string, CacheStats>()
   for (const row of cacheStatsByModel(pairs)) {
     map.set(modelKey(row.modelID, row.variant), row.cache)
@@ -414,7 +414,7 @@ export function cacheByModel(pairs: readonly StepRow[]): Map<string, CacheStats>
 }
 
 /** The cache table of the cache view: the models holding the most cache. */
-function topCacheModels(pairs: readonly StepRow[]): CacheModelRow[] {
+function topCacheModels(pairs: readonly PairRow[]): CacheModelRow[] {
   return cacheStatsByModel(pairs)
     .slice(0, 10)
     .map((row) => ({ usage: { modelID: row.modelID, variant: row.variant }, cache: row.cache }))
