@@ -43,15 +43,16 @@ PRs that are too large to review efficiently will be asked to be split.
    ```bash
    bun run typecheck && bun test
    ```
-6. **Push and open a PR** against the `master` (or `main`) branch, filling in the PR template completely.
+6. **Push and open a PR** against the `main` branch, filling in the PR template completely.
 
 ## Ground Rules for This Plugin
 
-- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/stats/` and
-  `src/upstream.ts` must stay free of host imports (`@opencode/*`, `@opentui/*`,
-  `solid-js`) so they remain unit-testable without a TUI runtime.
+- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/stats/`,
+  `src/endpoint.ts` and `src/text.ts` must stay free of host imports
+  (`@opencode/*`, `@opentui/*`, `solid-js`) so they remain unit-testable
+  without a TUI runtime.
 - Every view or line change needs a test at the level it lives at: pure text for
-  the view models, a plugin harness (`test/plugin.test.ts`) for slots, commands
+  the view models, the shared harness (`test/harness.ts`) for slots, commands
   and the line, and a render test for anything that changes JSX.
 - A render test must **drive a reactive update** and assert the new output
   (see `test/plugin.test.ts`): render-once smoke tests cannot catch content that
@@ -66,8 +67,11 @@ PRs that are too large to review efficiently will be asked to be split.
   responses, and never let a telemetry failure surface as a session error.
 - A database write must be idempotent (upsert by message id) — replayed events
   and restarts are normal.
-- Report the upstream operator only from evidence (headers, provenance). Never
-  guess an operator from the provider id.
+- Report an endpoint only from evidence: a gateway's response header or the host
+  of the request. Never guess an endpoint from the provider id.
+- Changes that touch the queries, the panel assembly or the line should keep
+  `bun run bench` green; changes to paths, the database or maintenance should
+  keep `bun run check:platform` green.
 
 ## Response Time Expectations
 

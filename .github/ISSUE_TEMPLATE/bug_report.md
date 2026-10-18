@@ -28,16 +28,11 @@ What did you expect to happen?
 
 If applicable, add screenshots, logs, or files to help explain your problem.
 
-If the problem is about the numbers (tokens, cache, provider, upstream), please
-include the output of:
-
-```sh
-bun run report --json
-```
-
+If the problem is about the numbers (tokens, cache, the endpoint that served a
+request), please include the output of `bun run report --json` from a checkout,
 or the relevant rows from the database (`steps` table). Redact anything private.
 
 ## Additional Context
 
 Add any other context about the problem here (OS, OpenCode version, provider and
-model, `captureHeaders` setting, etc.).
+model, plugin options, etc.).
