@@ -1,221 +1,20 @@
-import { plugin as registerBunPlugin } from "bun"
 import { afterAll, describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
-import solid from "@opentui/solid/bun-plugin"
-import { createSignal } from "solid-js"
-
-registerBunPlugin(solid)
 import { formatClock } from "../src/core"
-import { DEFAULT_SETTINGS, PANEL_NAME, type PanelSettings } from "../src/panel-data"
+import { PANEL_NAME } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
 import { resolveDbPath } from "../src/stats/paths"
-
-registerBunPlugin(solid)
+import { createHarness, pluginModule as mod, type RuntimeMessage, type RuntimeModel, type RuntimeTokens, type SessionSeed } from "./harness"
 
 // Isolate the stats database: the plugin resolves its path on first use, so
 // the escape hatch must be set before any harness reads the line.
 const stateDir = mkdtempSync(join(tmpdir(), "usage-insights-"))
 process.env.OPENCODE_USAGE_INSIGHTS_DB = join(stateDir, "stats.db")
 
-const mod = await import("../src/tui.tsx")
-
 const at = (seconds: number) => 1_800_000_000_000 + seconds * 1_000
-
-type RuntimeModel = { providerID: string; id: string; variant?: string }
-type RuntimeTokens = { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } }
-type RuntimeMessage = {
-  id: string
-  type: string
-  time?: { created?: number; streamed?: number; completed?: number }
-  model?: RuntimeModel
-  tokens?: RuntimeTokens
-  cost?: number
-  finish?: string | null
-}
-type SessionSeed = { id: string; created: number; tokens?: RuntimeTokens; cost?: number; messages?: RuntimeMessage[] }
-
-type SlotClaim = { append?: string; prepend?: string; render: (input: never) => unknown }
-type KeymapCommand = {
-  id: string
-  title: string
-  description?: string
-  bind?: boolean | string
-  palette?: boolean
-  slash?: { name: string; aliases?: string[]; arguments?: boolean }
-  run: (input?: string) => void
-}
-type KeymapLayer = { mode?: string; commands?: KeymapCommand[] }
-
-function createHarness(
-  config: { options?: Record<string, unknown>; sessions?: SessionSeed[]; panelOpens?: boolean; confirm?: boolean } = {},
-) {
-  const claims: SlotClaim[] = []
-  const commands: KeymapCommand[] = []
-  const layers: KeymapLayer[] = []
-  const opened: string[] = []
-  let currentPanel: { name: string; sessionID: string } | undefined
-  const toasts: Array<{ message: string; variant?: string }> = []
-  const dialogs: Array<{ title: string; message: string }> = []
-  let listReads = 0
-  const events: Array<{ type: string; handler: (payload: unknown) => void; live: boolean }> = []
-  const sessions = new Map<string, SessionSeed>()
-  // The panel keeps its view, range, sort and filters in the host's durable
-  // store. The mock mirrors it with a signal-backed proxy: property reads track
-  // and a mutation replaces the draft, exactly like the host's store does for
-  // the plugin.
-  const [panelSettings, setPanelSettings] = createSignal<PanelSettings>({ ...DEFAULT_SETTINGS }, { equals: false })
-  const settingsProxy = new Proxy({} as PanelSettings, {
-    get: (_target, key) => (panelSettings() as Record<string | symbol, unknown>)[key],
-    set: () => true,
-    // A spread reads own keys, not properties: without these two traps the
-    // panel would only ever see the defaults.
-    ownKeys: () => Reflect.ownKeys(panelSettings()),
-    getOwnPropertyDescriptor: (_target, key) => ({
-      enumerable: true,
-      configurable: true,
-      value: (panelSettings() as Record<string | symbol, unknown>)[key],
-    }),
-  })
-  // The reactive message store: the real host publishes session messages
-  // through a store, so render tests must be able to trigger updates.
-  const messageSignals = new Map<string, [() => RuntimeMessage[], (next: RuntimeMessage[]) => void]>()
-  // The host publishes a session's run state from its execution events; the
-  // line reads it to stay hidden while a turn is still running.
-  const statusSignals = new Map<string, [() => "idle" | "running", (next: "idle" | "running") => void]>()
-  for (const session of config.sessions ?? []) {
-    sessions.set(session.id, session)
-    const [messages, setMessages] = createSignal<RuntimeMessage[]>(session.messages ?? [])
-    messageSignals.set(session.id, [messages, setMessages])
-    const [status, setStatus] = createSignal<"idle" | "running">("idle")
-    statusSignals.set(session.id, [status, setStatus])
-  }
-
-  const ctx = {
-    options: config.options ?? {},
-    location: { directory: "/project" },
-    data: {
-      on: (type: string, handler: (payload: unknown) => void) => {
-        const entry = { type, handler, live: true }
-        events.push(entry)
-        return () => {
-          entry.live = false
-        }
-      },
-      session: {
-        get: (id: string) => {
-          const session = sessions.get(id)
-          return session === undefined ? undefined : { id, time: { created: session.created }, tokens: session.tokens, cost: session.cost }
-        },
-        status: (id: string) => statusSignals.get(id)?.[0]() ?? "idle",
-        message: {
-          list: (id: string) => {
-            listReads += 1
-            return messageSignals.get(id)?.[0]() ?? []
-          },
-        },
-      },
-    },
-    theme: {
-      text: {
-        base: RGBA.fromInts(220, 220, 220, 255),
-        muted: RGBA.fromInts(120, 120, 120, 255),
-        feedback: {
-          warning: { base: RGBA.fromInts(255, 200, 0, 255), muted: RGBA.fromInts(180, 140, 0, 255) },
-          info: { base: RGBA.fromInts(80, 160, 255, 255), muted: RGBA.fromInts(60, 120, 200, 255) },
-        },
-      },
-      background: {
-        base: RGBA.fromInts(20, 20, 20, 255),
-        raised: {
-          base: RGBA.fromInts(40, 40, 40, 255),
-          high: RGBA.fromInts(50, 50, 50, 255),
-          max: RGBA.fromInts(60, 60, 60, 255),
-        },
-      },
-    },
-    ui: {
-      slot: (claim: SlotClaim) => {
-        claims.push(claim)
-        return () => {
-          const index = claims.indexOf(claim)
-          if (index >= 0) claims.splice(index, 1)
-        }
-      },
-      panel: {
-        open: (name: string) => {
-          opened.push(name)
-          const ok = config.panelOpens ?? true
-          if (ok) currentPanel = { name, sessionID: "ses_panel" }
-          return ok
-        },
-        current: () => currentPanel,
-        close: () => {
-          currentPanel = undefined
-        },
-      },
-      toast: {
-        show: (options: { message: string; variant?: string }) => {
-          toasts.push(options)
-        },
-      },
-      dialog: {
-        confirm: (options: { title: string; message: string }) => {
-          dialogs.push(options)
-          return Promise.resolve(config.confirm ?? true)
-        },
-      },
-    },
-    keymap: {
-      layer: (factory: () => KeymapLayer) => {
-        const layer = factory()
-        layers.push(layer)
-        commands.push(...(layer.commands ?? []))
-      },
-    },
-    storage: {
-      store: () => [
-        settingsProxy,
-        (mutation: (draft: PanelSettings) => void) => {
-          const draft = { ...panelSettings() }
-          mutation(draft)
-          setPanelSettings(draft)
-          return Promise.resolve()
-        },
-      ],
-    },
-  }
-
-  const cleanup = mod.default.setup(ctx as never) as unknown as (() => void) | undefined
-
-  return {
-    claims,
-    commands,
-    layers,
-    opened,
-    panel: () => currentPanel,
-    toasts,
-    dialogs,
-    listReads: () => listReads,
-    events,
-    sessions,
-    cleanup,
-    command: (id: string) => commands.find((entry) => entry.id === id),
-    claim: (path: string) => claims.find((entry) => (entry.append ?? entry.prepend) === path),
-    setMessages: (sessionID: string, next: RuntimeMessage[]) => messageSignals.get(sessionID)?.[1](next),
-    setStatus: (sessionID: string, next: "idle" | "running") => statusSignals.get(sessionID)?.[1](next),
-    lineText: (sessionID: string) => mod.__test.lineText!(sessionID),
-    state: () => mod.__test.state!(),
-    emit: (type: string, payload?: unknown) => {
-      for (const entry of events) {
-        if (entry.live && entry.type === type) entry.handler({ type, data: payload })
-      }
-    },
-  }
-}
 
 const cleanups: Array<() => void> = []
 
@@ -231,7 +30,7 @@ afterAll(() => {
   rmSync(stateDir, { recursive: true, force: true })
 })
 
-const MODEL: RuntimeModel = { providerID: "opencode", id: "deepseek-v4.1-flash-free" }
+const MODEL = { providerID: "opencode", id: "deepseek-v4.1-flash-free" }
 
 function turn(messageID: string, overrides: { model?: RuntimeModel; tokens?: RuntimeTokens; completedAt?: number } = {}): RuntimeMessage[] {
   return [
