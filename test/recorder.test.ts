@@ -88,6 +88,7 @@ describe("recorder steps", () => {
       cache_read: 30,
       cache_write: 40,
       cost: 0.02,
+      list_cost: null,
       created_at: 400,
       streamed_at: 550,
       completed_at: 900,
@@ -122,6 +123,60 @@ describe("recorder steps", () => {
     // Nothing is written for the failure event: no view reads one.
     expect(db.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 0 })
     db.close()
+  })
+})
+
+describe("recorder list-price estimates", () => {
+  const MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
+
+  function priced(price?: (ref: { providerID?: string; modelID?: string }, tokens: Record<string, number | undefined>) => number | undefined) {
+    const db = openStatsDb(":memory:")
+    const recorder = createRecorder(db, { now: () => NOW, ...(price === undefined ? {} : { price }) })
+    return { db, recorder }
+  }
+
+  test("stores an estimate when the host reported zero", () => {
+    const seen: unknown[] = []
+    const { db, recorder } = priced((ref, tokens) => {
+      seen.push({ ref, tokens })
+      return 0.0042
+    })
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleEvent({
+      type: "session.step.ended",
+      created: 20,
+      data: { sessionID: "s1", assistantMessageID: "a1", cost: 0, tokens: { input: 1_000, output: 50, reasoning: 20, cache: { read: 500, write: 0 } } },
+    })
+    expect(stepRow(db).cost).toBe(0)
+    expect(stepRow(db).list_cost).toBe(0.0042)
+    expect(seen).toEqual([
+      {
+        ref: { providerID: "opencode-go", modelID: "deepseek-v4.1-flash" },
+        tokens: { input: 1_000, output: 50, reasoning: 20, cacheRead: 500, cacheWrite: 0 },
+      },
+    ])
+  })
+
+  test("keeps charged money and writes no estimate", () => {
+    const { db, recorder } = priced(() => 0.5)
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", cost: 0.02, tokens: { input: 1_000 } } })
+    expect(stepRow(db).cost).toBe(0.02)
+    expect(stepRow(db).list_cost).toBeNull()
+  })
+
+  test("leaves the estimate null when no catalog price is known", () => {
+    const { db, recorder } = priced(() => undefined)
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", cost: 0 } })
+    expect(stepRow(db).list_cost).toBeNull()
+  })
+
+  test("stores zero for a model the catalog knows is free", () => {
+    const { db, recorder } = priced(() => 0)
+    recorder.handleEvent({ type: "session.step.started", created: 10, data: { sessionID: "s1", assistantMessageID: "a1", model: MODEL } })
+    recorder.handleEvent({ type: "session.step.ended", created: 20, data: { sessionID: "s1", assistantMessageID: "a1", cost: 0, tokens: { input: 10 } } })
+    expect(stepRow(db).list_cost).toBe(0)
   })
 })
 

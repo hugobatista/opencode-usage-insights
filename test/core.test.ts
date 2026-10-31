@@ -38,6 +38,7 @@ type StepOptions = {
   read?: number
   write?: number
   cost?: number
+  listCost?: number
   streamed?: number
   completed?: number
 }
@@ -65,6 +66,7 @@ function step(id: string, created: number, options: StepOptions = {}): Assistant
       cache: { read: options.read ?? 0, write: options.write ?? 0 },
     },
     cost: options.cost ?? 0,
+    ...(options.listCost !== undefined ? { listCost: options.listCost } : {}),
   }
 }
 
@@ -174,13 +176,14 @@ describe("token accounting", () => {
       reasoning: 6,
       cacheWrite: 60,
       cost: 0.003,
+      listCost: 0,
       steps: 2,
     })
   })
 
   test("totalize tolerates partial messages", () => {
     const totals = totalize([{ type: "assistant", id: "a1" }])
-    expect(totals).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, steps: 1 })
+    expect(totals).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, listCost: 0, steps: 1 })
   })
 
   test("identityKey includes the variant when present", () => {
@@ -275,6 +278,7 @@ describe("computeTurn", () => {
       reasoning: 0,
       cacheWrite: 50,
       cost: 0,
+      listCost: 0,
       steps: 1,
     })
   })
@@ -353,7 +357,7 @@ describe("computeTurn", () => {
   })
 
   test("passes session totals through", () => {
-    const session: Totals = { input: 1, cached: 2, output: 3, reasoning: 4, cacheWrite: 5, cost: 6, steps: 7 }
+    const session: Totals = { input: 1, cached: 2, output: 3, reasoning: 4, cacheWrite: 5, cost: 6, listCost: 0, steps: 7 }
     const stats = computeTurn([prompt("u1", 1_000), step("a1", 2_000, { completed: 2_600 })], session)
     expect(stats!.session).toEqual(session)
   })
@@ -393,7 +397,7 @@ describe("turn totals views", () => {
   // `total = new + cacheRead` for the latest step. These are the real numbers of
   // the step that first showed the mismatch (2,682 new / 425,728 cached).
   test("displayed buckets reconcile with the host's debug numbers", () => {
-    const display = displayTotals({ input: 1_617, cached: 425_728, cacheWrite: 0, output: 434, reasoning: 631, cost: 0, steps: 1 })
+    const display = displayTotals({ input: 1_617, cached: 425_728, cacheWrite: 0, output: 434, reasoning: 631, cost: 0, listCost: 0, steps: 1 })
     const hostNew = 1_617 + 434 + 631 + 0
     const hostTotal = hostNew + 425_728
     expect(display.input).toBe(1_617)
@@ -497,7 +501,16 @@ describe("formatLineSegments", () => {
     ]
   }
 
-  const session: Totals = { input: 2_100_000, cached: 12_400_000, output: 88_000, reasoning: 0, cacheWrite: 0, cost: 0, steps: 9 }
+  const session: Totals = {
+    input: 2_100_000,
+    cached: 12_400_000,
+    output: 88_000,
+    reasoning: 0,
+    cacheWrite: 0,
+    cost: 0,
+    listCost: 0,
+    steps: 9,
+  }
 
   test("renders the telemetry line", () => {
     const stats = computeTurn(lineTranscript(), session)!
@@ -577,6 +590,36 @@ describe("formatLineSegments", () => {
     // is paid per step: the cost is the two steps together.
     const line = formatLine(stats, { fields: { clock: false, delta: false, model: false, session: false } })
     expect(line).toBe("opencode · 2 steps · in 200, cached 0, out 20, cost $0.0114")
+  })
+
+  test("marks a list-price estimate and keeps a mixed turn's two parts apart", () => {
+    const estimated = computeTurn([
+      prompt("u1", 1_000),
+      step("a1", 2_000, { input: 100, output: 10, cost: 0, listCost: 0.0344, completed: 2_600 }),
+    ])!
+    expect(formatLine(estimated, { fields: { clock: false, delta: false, model: false, session: false } })).toBe(
+      "opencode · in 100, cached 0, out 10, cost ≈ $0.0344",
+    )
+
+    const mixed = computeTurn([
+      prompt("u1", 1_000),
+      step("a1", 2_000, { input: 100, output: 10, cost: 0.0103, completed: 2_600 }),
+      step("a2", 4_000, { input: 200, output: 20, cost: 0, listCost: 0.02, completed: 4_600 }),
+    ])!
+    expect(formatLine(mixed, { fields: { clock: false, delta: false, model: false, session: false } })).toBe(
+      "opencode · 2 steps · in 200, cached 0, out 20, cost $0.0103 + ≈ $0.0200",
+    )
+  })
+
+  test("can hide estimates without hiding charged money", () => {
+    const stats = computeTurn([
+      prompt("u1", 1_000),
+      step("a1", 2_000, { input: 100, output: 10, cost: 0.01, completed: 2_600 }),
+      step("a2", 4_000, { input: 200, output: 20, cost: 0, listCost: 0.0344, completed: 4_600 }),
+    ])!
+    const line = formatLine(stats, { fields: { clock: false, delta: false, model: false, session: false }, estimates: false })
+    expect(line).toContain("cost $0.0100")
+    expect(line).not.toContain("≈")
   })
 
   test("omits the cache warning when reuse held", () => {

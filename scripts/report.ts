@@ -44,6 +44,7 @@ type Args = {
   provider?: string | undefined
   sort?: string | undefined
   sortDesc: boolean
+  estimates: boolean
   json: boolean
   ndjson: boolean
   import?: string | undefined
@@ -62,6 +63,7 @@ flags  --db <path>          database override (default: ${defaultDbPath()})
        --provider <name>    only steps that ran through this provider
        --sort <key>         sort key of the view (models: steps cached out cost, …)
        --asc                sort ascending (default: descending)
+       --no-estimates       hide list-price estimates, like pricing: "off"
        --json               print the raw query rows as JSON
        --ndjson             export the whole database as NDJSON
        --import <file>      merge an NDJSON export into the database and exit
@@ -69,12 +71,23 @@ flags  --db <path>          database override (default: ${defaultDbPath()})
        --vacuum             rewrite the file to reclaim the space a prune freed`
 
 function parse(argv: readonly string[]): Args {
-  const parsed: Args = { view: "overview", range: "all", width: 100, granularity: "day", sortDesc: true, json: false, ndjson: false, vacuum: false }
+  const parsed: Args = {
+    view: "overview",
+    range: "all",
+    width: 100,
+    granularity: "day",
+    sortDesc: true,
+    estimates: true,
+    json: false,
+    ndjson: false,
+    vacuum: false,
+  }
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index] ?? ""
     if (token === "--json") parsed.json = true
     else if (token === "--ndjson") parsed.ndjson = true
     else if (token === "--asc") parsed.sortDesc = false
+    else if (token === "--no-estimates") parsed.estimates = false
     else if (token === "--vacuum") parsed.vacuum = true
     else if (token === "--prune") parsed.prune = Number(argv[++index])
     else if (token === "--db") parsed.db = argv[++index]
@@ -214,6 +227,7 @@ for (const view of views) {
     turnsScope: "all",
     sort: args.sort ?? "",
     sortDesc: args.sortDesc,
+    estimates: args.estimates,
     sessionID: "",
     sessionStart: undefined,
     now,

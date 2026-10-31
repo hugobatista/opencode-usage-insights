@@ -13,6 +13,7 @@ import solid from "@opentui/solid/bun-plugin"
 import { createSignal } from "solid-js"
 import { DEFAULT_SETTINGS, type PanelSettings } from "../src/panel-data"
 import type { RuntimeMessage, RuntimeModelRef, RuntimeTokenUsage } from "../src/line"
+import type { ModelInfoLike } from "../src/pricing"
 
 registerBunPlugin(solid)
 
@@ -86,6 +87,8 @@ export type HarnessThemeOverrides = {
 export type HarnessConfig = {
   options?: Record<string, unknown>
   sessions?: SessionSeed[]
+  /** Catalog prices the TUI line and the backfill read. */
+  models?: readonly ModelInfoLike[]
   panelOpens?: boolean
   confirm?: boolean
   theme?: HarnessThemeOverrides
@@ -157,6 +160,13 @@ export function createHarness(config: HarnessConfig = {}) {
             listReads += 1
             return messageSignals.get(id)?.[0]() ?? []
           },
+        },
+      },
+      location: {
+        model: {
+          list: () => config.models,
+          sync: () => Promise.resolve(),
+          invalidate: () => {},
         },
       },
     },

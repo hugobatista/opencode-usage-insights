@@ -21,6 +21,7 @@ import {
   models,
   overview,
   percentile,
+  sessionListCost,
   sessions,
   timeline,
   turns,
@@ -183,6 +184,51 @@ describe("stats queries", () => {
     const db = freshDb()
     recordStep(db, { messageID: "r1", sessionID: "s", output: 50 })
     expect(overview(db).tps).toBeUndefined()
+    db.close()
+  })
+
+  test("aggregates list-price estimates alongside charged money", () => {
+    const db = freshDb()
+    recordPrompt(db, { sessionID: "s", messageID: "p", createdAt: 0 })
+    recordStep(db, {
+      messageID: "e1",
+      sessionID: "s",
+      providerID: "opencode-go",
+      modelID: "m",
+      createdAt: 10,
+      completedAt: 20,
+      finish: "stop",
+      input: 1_000,
+      cost: 0,
+      listCost: 0.01,
+    })
+    recordStep(db, {
+      messageID: "e2",
+      sessionID: "s",
+      providerID: "opencode-go",
+      modelID: "m",
+      createdAt: 30,
+      completedAt: 40,
+      finish: "stop",
+      input: 1_000,
+      cost: 0.02,
+    })
+    expect(overview(db).listCost).toBeCloseTo(0.01, 10)
+    expect(models(db)[0]!.totals.listCost).toBeCloseTo(0.01, 10)
+    expect(sessions(db)[0]!.listCost).toBeCloseTo(0.01, 10)
+    expect(turns(db)[0]!.totals.listCost).toBeCloseTo(0.01, 10)
+    expect(turns(db)[0]!.latest.listCost).toBe(0)
+    db.close()
+  })
+
+  test("sessionListCost sums only the requested session", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "s1a", sessionID: "s1", cost: 0, listCost: 0.01, createdAt: 0 })
+    recordStep(db, { messageID: "s1b", sessionID: "s1", cost: 0, listCost: 0.02, createdAt: 1 })
+    recordStep(db, { messageID: "s2a", sessionID: "s2", cost: 0, listCost: 0.5, createdAt: 2 })
+    expect(sessionListCost(db, "s1")).toBeCloseTo(0.03, 12)
+    expect(sessionListCost(db, "s2")).toBeCloseTo(0.5, 12)
+    expect(sessionListCost(db, "missing")).toBe(0)
     db.close()
   })
 

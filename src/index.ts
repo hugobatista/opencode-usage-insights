@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin"
 import type { Database } from "bun:sqlite"
+import { costOf, priceTable, type PriceFn, type PriceTable } from "./pricing"
 import { createRecorder, type RecorderEvent } from "./recorder"
 import { openStatsDb } from "./stats/db"
 import { resolveDbPath } from "./stats/paths"
@@ -21,6 +22,60 @@ export type Options = {
   enabled?: boolean | undefined
   /** SQLite database path override (defaults to the per-OS state directory). */
   db?: string | undefined
+  /**
+   * List-price estimates for steps the host reports as costing nothing.
+   * `off` records charged money only; the TUI hides any stored estimates.
+   */
+  pricing?: "auto" | "off" | undefined
+}
+
+/** How long a loaded catalog is trusted before a background refresh. */
+const PRICE_TTL_MS = 5 * 60 * 1000
+/** Retry delay after a failed catalog load. */
+const PRICE_RETRY_MS = 30 * 1000
+
+/**
+ * Catalog prices for the recorder, loaded from the host and refreshed in the
+ * background. The recorder never waits for the catalog: until it lands, steps
+ * are recorded exactly as before and the maintenance action can fill them in.
+ */
+function createPriceSource(ctx: { model: { list: () => Promise<unknown> } }): {
+  price: PriceFn
+  refresh: (force?: boolean) => void
+} {
+  let table: PriceTable | undefined
+  let refreshing = false
+  let lastAttempt = 0
+
+  function refresh(force = false): void {
+    if (refreshing) return
+    const now = Date.now()
+    const wait = table === undefined ? PRICE_RETRY_MS : PRICE_TTL_MS
+    if (!force && now - lastAttempt < wait) return
+    lastAttempt = now
+    refreshing = true
+    void (async () => {
+      try {
+        const payload = (await ctx.model.list()) as { data?: unknown } | unknown
+        const models = Array.isArray(payload) ? payload : (payload as { data?: unknown } | null | undefined)?.data
+        // An empty list is not a catalog: keep the previous table and retry.
+        if (Array.isArray(models) && models.length > 0) table = priceTable(models as never)
+      } catch {
+        // A catalog that cannot be read keeps the previous table: recording is
+        // more important than the estimate.
+      } finally {
+        refreshing = false
+      }
+    })()
+  }
+
+  return {
+    price: (ref, tokens) => {
+      refresh()
+      return table === undefined ? undefined : costOf(table, ref, tokens)
+    },
+    refresh,
+  }
 }
 
 function tryOpen(path: string): Database | undefined {
@@ -49,12 +104,21 @@ export default Plugin.define({
       // A database that cannot take the pragma is still usable.
     }
 
-    const recorder = createRecorder(db)
+    const pricing = options.pricing !== "off"
+    const source = pricing ? createPriceSource(ctx) : undefined
+    // Load the catalog without delaying the recorder; the first steps may be
+    // unpriced and the maintenance action can fill them in later.
+    source?.refresh(true)
+
+    const recorder = createRecorder(db, source === undefined ? undefined : { price: source.price })
     const abort = new AbortController()
     const stream = (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           try {
+            // The event carries no model details: a catalog refresh is the only
+            // way to pick up a price change.
+            if (event.type === "model.updated") source?.refresh(true)
             recorder.handleEvent(event as RecorderEvent)
           } catch {
             // A malformed event must never break the stream.

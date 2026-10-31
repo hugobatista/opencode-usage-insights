@@ -1,10 +1,10 @@
-import type { Database } from "bun:sqlite"
+import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { openStatsDb, recordEvent, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
-import { dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
+import { backfillListCost, dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
 
 const DAY = 24 * 60 * 60 * 1000
 const NOW = 1_800_000_000_000
@@ -40,6 +40,8 @@ describe("dbInfo", () => {
       { days: 365, steps: 0 },
     ])
     expect(info.schemaVersion).toBeGreaterThan(0)
+    // The seed records every step at $0 with no estimate.
+    expect(info.unpriced).toBe(3)
     db.close()
   })
 
@@ -92,6 +94,55 @@ describe("pruneOlderThan", () => {
   test("is a no-op when nothing is older than the cutoff", () => {
     const db = seed()
     expect(pruneOlderThan(db, NOW - 400 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0 })
+    db.close()
+  })
+})
+
+describe("backfillListCost", () => {
+  test("prices only the $0 steps without an estimate, and never overwrites one", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "a", sessionID: "s", providerID: "opencode-go", modelID: "m1", input: 1_000_000, cost: 0, createdAt: NOW })
+    recordStep(db, { messageID: "b", sessionID: "s", providerID: "opencode-go", modelID: "m1", input: 2_000_000, cost: 0, listCost: 0.5, createdAt: NOW })
+    recordStep(db, { messageID: "c", sessionID: "s", providerID: "opencode-go", modelID: "m1", input: 1_000_000, cost: 0.02, createdAt: NOW })
+    recordStep(db, { messageID: "d", sessionID: "s", providerID: "opencode-go", modelID: "unknown", input: 1_000_000, cost: 0, createdAt: NOW })
+    recordStep(db, { messageID: "f", sessionID: "s", providerID: "opencode-go", modelID: "free", input: 1_000_000, cost: 0, createdAt: NOW })
+    const prices = {
+      "opencode-go/m1": 0.01,
+      "opencode-go/free": 0,
+    } as Record<string, number>
+    const result = backfillListCost(db, (ref) => (ref.providerID === undefined || ref.modelID === undefined ? undefined : prices[`${ref.providerID}/${ref.modelID}`]))
+    expect(result).toEqual({ candidates: 3, updated: 2 })
+    const rows = db.query("SELECT message_id, list_cost FROM steps ORDER BY message_id").all()
+    expect(rows).toEqual([
+      { message_id: "a", list_cost: 0.01 },
+      { message_id: "b", list_cost: 0.5 },
+      { message_id: "c", list_cost: null },
+      { message_id: "d", list_cost: null },
+      { message_id: "f", list_cost: 0 },
+    ])
+    // The free row is priced as known free and leaves the candidate set; only
+    // the unknown model still needs a price.
+    expect(dbInfo(db, ":memory:").unpriced).toBe(1)
+    // A second run has nothing left to do for the priced and free rows; the
+    // unknown model remains a candidate.
+    expect(backfillListCost(db, () => 0.02)).toEqual({ candidates: 1, updated: 1 })
+    expect(db.query("SELECT list_cost FROM steps WHERE message_id = 'd'").get()).toEqual({ list_cost: 0.02 })
+    db.close()
+  })
+
+  test("does not count steps without an identity or without tokens", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "no-model", sessionID: "s", cost: 0, createdAt: NOW })
+    recordStep(db, { messageID: "empty", sessionID: "s", providerID: "p", modelID: "m", cost: 0, createdAt: NOW })
+    expect(dbInfo(db, ":memory:", NOW).unpriced).toBe(0)
+    expect(backfillListCost(db, () => 0.01)).toEqual({ candidates: 0, updated: 0 })
+    db.close()
+  })
+
+  test("is a no-op on a database without the list-price column", () => {
+    const db = new Database(":memory:")
+    db.exec("CREATE TABLE steps (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, cost REAL NOT NULL DEFAULT 0)")
+    expect(backfillListCost(db, () => 1)).toEqual({ candidates: 0, updated: 0 })
     db.close()
   })
 })

@@ -47,8 +47,8 @@ PRs that are too large to review efficiently will be asked to be split.
 
 ## Ground Rules for This Plugin
 
-- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/stats/` and
-  `src/text.ts` must stay free of host imports
+- `src/core.ts`, `src/line.ts`, `src/panel-data.ts`, `src/pricing.ts`,
+  `src/stats/` and `src/text.ts` must stay free of host imports
   (`@opencode/*`, `@opentui/*`, `solid-js`) so they remain unit-testable
   without a TUI runtime.
 - Every view or line change needs a test at the level it lives at: pure text for

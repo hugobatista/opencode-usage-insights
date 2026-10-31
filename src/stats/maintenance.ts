@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite"
 import { statSync } from "node:fs"
+import type { PriceRef, PriceTokens } from "../pricing"
 import { TABLES, type TableName } from "./db"
 
 /**
@@ -28,6 +29,8 @@ export type DbInfo = {
   lastAt: number | undefined
   /** Steps a prune at each cutoff would remove, for the panel to offer choices. */
   removable: Array<{ days: number; steps: number }>
+  /** Steps at $0 with a model identity and no list-price estimate yet. */
+  unpriced: number
 }
 
 const STEP_TIME = "COALESCE(created_at, recorded_at)"
@@ -53,6 +56,15 @@ export function dbInfo(db: Database, path: string, now = Date.now()): DbInfo {
   const version = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | null
   return {
     path,
+    unpriced: hasListCost(db)
+      ? (db.query(
+          `SELECT COUNT(*) AS n FROM steps
+            WHERE cost = 0 AND list_cost IS NULL
+              AND provider_id IS NOT NULL AND provider_id <> ''
+              AND model_id IS NOT NULL AND model_id <> ''
+              AND input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write > 0`,
+        ).get() as { n: number }).n
+      : 0,
     bytes: size(path),
     walBytes: path === ":memory:" ? undefined : size(`${path}-wal`) || undefined,
     schemaVersion: version === null ? 0 : Number.parseInt(version.value, 10),
@@ -123,6 +135,94 @@ export function vacuum(db: Database, path: string): { before: number; after: num
   db.exec("VACUUM")
   const after = footprint(path)
   return { before, after, freed: Math.max(0, before - after) }
+}
+
+/** True when the database carries the list-price column. */
+export function hasListCost(db: Database): boolean {
+  try {
+    return (db.query("PRAGMA table_info(steps)").all() as { name: string }[]).some((column) => column.name === "list_cost")
+  } catch {
+    return false
+  }
+}
+
+export type BackfillResult = {
+  /** Steps that matched the `cost = 0 AND list_cost IS NULL` condition. */
+  candidates: number
+  /** Steps a price was known for and written. */
+  updated: number
+}
+
+/** Rows per write transaction: a long backfill must not hold the recorder up. */
+const BACKFILL_BATCH = 1_000
+
+/**
+ * Price historical steps the host recorded at $0. The price is today's catalog,
+ * not the one in force when the step ran, so this is explicitly user-triggered.
+ * A step whose model has no price is left NULL for a later run.
+ */
+export function backfillListCost(
+  db: Database,
+  price: (ref: PriceRef, tokens: PriceTokens) => number | undefined,
+): BackfillResult {
+  if (!hasListCost(db)) return { candidates: 0, updated: 0 }
+  const candidates = (db.query(
+    `SELECT COUNT(*) AS n FROM steps
+      WHERE cost = 0 AND list_cost IS NULL
+        AND provider_id IS NOT NULL AND provider_id <> ''
+        AND model_id IS NOT NULL AND model_id <> ''
+        AND input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write > 0`,
+  ).get() as { n: number }).n
+  if (candidates === 0) return { candidates: 0, updated: 0 }
+
+  const select = db.query(
+    `SELECT rowid, provider_id, model_id,
+            input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write
+       FROM steps
+      WHERE cost = 0 AND list_cost IS NULL AND rowid > ?
+        AND provider_id IS NOT NULL AND provider_id <> ''
+        AND model_id IS NOT NULL AND model_id <> ''
+        AND input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write > 0
+      ORDER BY rowid
+      LIMIT ?`,
+  )
+  const update = db.query("UPDATE steps SET list_cost = ? WHERE rowid = ? AND cost = 0 AND list_cost IS NULL")
+  let cursor = 0
+  let updated = 0
+
+  for (;;) {
+    const rows = select.all(cursor, BACKFILL_BATCH) as Array<{
+      rowid: number
+      provider_id: string | null
+      model_id: string | null
+      input_tokens: number | null
+      output_tokens: number | null
+      reasoning_tokens: number | null
+      cache_read: number | null
+      cache_write: number | null
+    }>
+    if (rows.length === 0) break
+    db.transaction(() => {
+      for (const row of rows) {
+        const estimate = price(
+          { providerID: row.provider_id ?? undefined, modelID: row.model_id ?? undefined },
+          {
+            input: row.input_tokens ?? 0,
+            output: row.output_tokens ?? 0,
+            reasoning: row.reasoning_tokens ?? 0,
+            cacheRead: row.cache_read ?? 0,
+            cacheWrite: row.cache_write ?? 0,
+          },
+        )
+        if (estimate === undefined || !Number.isFinite(estimate) || estimate < 0) continue
+        if (update.run(estimate, row.rowid).changes > 0) updated += 1
+      }
+    })()
+    cursor = rows[rows.length - 1]!.rowid
+    if (rows.length < BACKFILL_BATCH) break
+  }
+
+  return { candidates, updated }
 }
 
 export type { TableName }

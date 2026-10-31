@@ -50,7 +50,7 @@ export function TurnsSidebar(props: {
     try {
       // The session's own steps, never the window after it started: siblings
       // and subagents are their own sessions.
-      const summary = sessionSummaryLines(overview(db, undefined, { sessionID: props.sessionID }), budget)
+      const summary = sessionSummaryLines(overview(db, undefined, { sessionID: props.sessionID }), budget, props.options?.estimates !== false)
       const history = sidebarLines(turns(db, { sessionID: props.sessionID, limit: props.deps.limit }), { ...props.options, budget })
       return [...summary, { text: "turns", tone: "accent" as PanelTone }, ...history]
     } catch {

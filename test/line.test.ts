@@ -41,6 +41,7 @@ const sessionTotalsFixture: Totals = {
   reasoning: 0,
   cacheWrite: 12_000,
   cost: 0.14,
+  listCost: 0,
   steps: 2,
 }
 
@@ -152,6 +153,37 @@ describe("toTranscript", () => {
     ])
   })
 
+  test("prices a zero-cost host message through the callback, and leaves charged steps alone", () => {
+    const price = (ref: { providerID?: string; modelID?: string }, tokens: { input?: number }) => {
+      expect(ref).toEqual({ providerID: "opencode-go", modelID: "deepseek-v4.1-flash" })
+      expect(tokens.input).toBe(1_000_000)
+      return 0.15
+    }
+    const transcript = toTranscript(
+      [
+        {
+          id: "msg_1",
+          type: "assistant",
+          time: { created: at(1), completed: at(2) },
+          model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" },
+          tokens: { input: 1_000_000 },
+          cost: 0,
+        },
+        {
+          id: "msg_2",
+          type: "assistant",
+          time: { created: at(3), completed: at(4) },
+          model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" },
+          tokens: { input: 1_000_000 },
+          cost: 0.02,
+        },
+      ],
+      price,
+    )
+    expect(transcript[0]).toMatchObject({ listCost: 0.15 })
+    expect(transcript[1]).not.toHaveProperty("listCost")
+  })
+
   test("round-trips the host shapes used by the TUI line", () => {
     const stats = computeTurn(toTranscript([{ id: "prt_1", type: "user", time: { created: at(0) } }, { id: "msg_1", type: "assistant", time: { created: at(1), completed: at(5) }, model: { providerID: "opencode", id: "m" }, tokens: { input: 100, output: 10, cache: { read: 0 } } }]))
     expect(stats?.providerID).toBe("opencode")
@@ -169,13 +201,18 @@ describe("sessionTotals", () => {
       reasoning: 2,
       cacheWrite: 0,
       cost: 1.5,
+      listCost: 0,
       steps: 0,
     })
   })
 
   test("is undefined when the host has no session yet", () => {
     expect(sessionTotals(undefined)).toBeUndefined()
-    expect(sessionTotals({})).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, steps: 0 })
+    expect(sessionTotals({})).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, listCost: 0, steps: 0 })
+  })
+
+  test("carries the list estimate supplied by the caller", () => {
+    expect(sessionTotals({ tokens: { input: 10 }, cost: 0 }, 0.2)).toMatchObject({ cost: 0, listCost: 0.2 })
   })
 })
 

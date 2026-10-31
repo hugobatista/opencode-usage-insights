@@ -4,6 +4,8 @@ import {
   formatCost,
   formatDuration,
   formatLine,
+  formatMoney,
+  formatSpend,
   formatTokens,
   type LineFields,
   type LineLabels,
@@ -328,6 +330,7 @@ export type UsageBuckets = {
   output: number
   reasoning: number
   cost: number
+  listCost: number
   hit: number | undefined
 }
 
@@ -339,6 +342,7 @@ export function usageBuckets(usage: {
   output: number
   reasoning: number
   cost: number
+  listCost?: number | undefined
 }): UsageBuckets {
   const prompt = usage.input + usage.cached + usage.cacheWrite
   return {
@@ -350,6 +354,7 @@ export function usageBuckets(usage: {
     output: usage.output + usage.reasoning,
     reasoning: usage.reasoning,
     cost: usage.cost,
+    listCost: usage.listCost ?? 0,
     hit: prompt > 0 ? usage.cached / prompt : undefined,
   }
 }
@@ -376,7 +381,7 @@ export function viewBar(view: PanelView, width = 200): PanelLine {
 }
 
 export function keysFor(of: PanelView): string {
-  if (of === "db") return "↑↓ pick a retention · enter prune (asks first) · v vacuum · r refresh · 1-9 view · ? help"
+  if (of === "db") return "↑↓ pick a retention · enter prune · e backfill estimates · v vacuum · r refresh · 1-9 view · ? help"
   if (of === "periods") return "↑↓ move · enter drill · b bucket · t range · m/p filter · x clear · 1-9 view · ? help"
   if (of === "turns") return "↑↓ move · a scope · t range · m/p filter · x clear · 1-9 view · ? help"
   return "↑↓ move · enter drill · s sort · t range · m/p filter · x clear · 1-9 view · ? help"
@@ -405,6 +410,7 @@ export function helpLines(width: number): PanelLine[] {
     { text: "  a            turns scope: this session ↔ all sessions" },
     { text: "  m p          filter by model / provider (x clears)" },
     { text: "  r            re-read the database · f full screen · escape close" },
+    { text: "  e            db: backfill list-price estimates for the $0 steps" },
     { text: "" },
     { text: "numbers · the same buckets as the live line", tone: HEADER_TONE },
     { text: "  prompt    everything the provider saw: cached + fresh + writes" },
@@ -416,6 +422,8 @@ export function helpLines(width: number): PanelLine[] {
     { text: "  out       everything generated: visible output + reasoning" },
     { text: "  reasoning part of `out`" },
     { text: "  cost      money, not tokens: a turn sums every step; $0 is left out" },
+    { text: "  ≈         list-price estimate for steps the host reported as $0;" },
+    { text: "            `$0.12 + ≈ $3.40` keeps charged and estimated money apart" },
     { text: "  wall      request → completed step · stream request → last chunk" },
     { text: "  tps       out / streaming seconds, shown as p50" },
     { text: "  switches  how often a step's model or provider differs from the step" },
@@ -431,7 +439,7 @@ export function helpLines(width: number): PanelLine[] {
     { text: "database", tone: HEADER_TONE },
     { text: "  the db view shows where the file lives, what it holds and how much" },
     { text: "  of it is old: ↑↓ pick a retention, enter prunes from its cutoff date," },
-    { text: "  v gives the space back" },
+    { text: "  e backfills list estimates, v gives the space back" },
     { text: "  local time · SQLite in the OpenCode state directory" },
   ]
   return lines.map((line) => ({ ...line, text: truncate(line.text, width) }))
@@ -441,7 +449,7 @@ export function helpLines(width: number): PanelLine[] {
 // Overview
 // ---------------------------------------------------------------------------
 
-function usagePairs(usage: Overview | SessionUsage | undefined): (readonly [string, string])[] {
+function usagePairs(usage: Overview | SessionUsage | undefined, estimates = true): (readonly [string, string])[] {
   if (usage === undefined) return []
   const buckets = usageBuckets(usage)
   const pairs: (readonly [string, string])[] = [
@@ -454,7 +462,7 @@ function usagePairs(usage: Overview | SessionUsage | undefined): (readonly [stri
     ["write", formatTokens(buckets.cacheWrite)],
   ]
   if (buckets.reasoning > 0) pairs.push(["reasoning", formatTokens(buckets.reasoning)])
-  pairs.push(["cost", formatCost(buckets.cost)])
+  pairs.push(["cost", (estimates ? formatMoney(buckets.cost, buckets.listCost) : undefined) ?? formatCost(buckets.cost)])
   // The selection's average throughput, the same number the sidebar's session
   // block shows.
   if ("tps" in usage && usage.tps !== undefined) pairs.push(["tps", formatTps(usage.tps)])
@@ -470,15 +478,18 @@ export function overviewLines(
     range: RangeKey
     activity?: readonly number[] | undefined
     coverage?: CoverageReport | undefined
+    /** `false` hides list-price estimates. */
+    estimates?: boolean | undefined
   },
   width: number,
 ): PanelLine[] {
   const lines: PanelLine[] = []
+  const estimates = data.estimates !== false
   lines.push({
     text: `${rangeLabel(data.range)} · ${count(data.usage.steps, "step")} · ${count(data.usage.sessions, "session")} · ${count(data.usage.prompts, "prompt")}`,
     tone: "muted",
   })
-  lines.push(...kvGrid(buildOverviewPairs(data.usage, "all"), width))
+  lines.push(...kvGrid(buildOverviewPairs(data.usage, "all", estimates), width))
   if (data.activity !== undefined && data.activity.length > 1) {
     const series = reduceSeries(data.activity)
     lines.push({ text: "", tone: "muted" })
@@ -487,12 +498,13 @@ export function overviewLines(
   if (data.session !== undefined) {
     lines.push({ text: "", tone: "muted" })
     lines.push({ text: "this session", tone: HEADER_TONE })
-    lines.push(...kvGrid(buildOverviewPairs(data.session, "session"), width))
+    lines.push(...kvGrid(buildOverviewPairs(data.session, "session", estimates), width))
     if (data.subagents !== undefined && data.subagents.length > 0) {
       const steps = data.subagents.reduce((sum, row) => sum + row.steps, 0)
       const cost = data.subagents.reduce((sum, row) => sum + row.cost, 0)
+      const listCost = data.subagents.reduce((sum, row) => sum + row.listCost, 0)
       lines.push({
-        text: `  subagents  ${count(data.subagents.length, "session")} · ${count(steps, "step")} · ${formatCost(cost)} (their own sessions)`,
+        text: `  subagents  ${count(data.subagents.length, "session")} · ${count(steps, "step")} · ${formatSpend(cost, estimates ? listCost : 0)} (their own sessions)`,
         tone: "muted",
       })
     }
@@ -505,8 +517,8 @@ export function overviewLines(
   return lines
 }
 
-function buildOverviewPairs(usage: Overview, scope: "all" | "session"): (readonly [string, string])[] {
-  const pairs = usagePairs(usage)
+function buildOverviewPairs(usage: Overview, scope: "all" | "session", estimates = true): (readonly [string, string])[] {
+  const pairs = usagePairs(usage, estimates)
   if (scope === "all") {
     pairs.push(["first", usage.firstAt === undefined ? "–" : new Date(usage.firstAt).toLocaleString("en-GB")])
     pairs.push(["last", usage.lastAt === undefined ? "–" : new Date(usage.lastAt).toLocaleString("en-GB")])
@@ -571,7 +583,7 @@ export type ModelExtras = {
  * and how often its identity changed. One line per model; `providers` keeps the
  * per-provider detail.
  */
-export function modelsLines(rows: readonly ModelUsage[], width: number, extras?: ModelExtras, limit = 40): PanelLine[] {
+export function modelsLines(rows: readonly ModelUsage[], width: number, extras?: ModelExtras, limit = 40, estimates = true): PanelLine[] {
   const columns = modelColumns(width)
   const widths: number[] = [columns.model, columns.steps, columns.prompt, columns.cached]
   const aligns: ("left" | "right")[] = ["left", "right", "right", "right"]
@@ -608,7 +620,7 @@ export function modelsLines(rows: readonly ModelUsage[], width: number, extras?:
     const cells: string[] = [name, formatCount(buckets.steps), formatTokens(buckets.prompt), formatTokens(buckets.cached)]
     if (columns.hit > 0) cells.push(formatPercent(cache?.hit ?? buckets.hit))
     cells.push(formatTokens(buckets.output))
-    if (columns.cost > 0) cells.push(formatCost(buckets.cost))
+    if (columns.cost > 0) cells.push(formatSpend(buckets.cost, estimates ? buckets.listCost : 0))
     if (columns.spread > 0) cells.push(providers.join(", "))
     lines.push({
       text: formatTableRow(cells, widths, aligns),
@@ -695,7 +707,7 @@ function renderTable<Row>(
 }
 
 /** One row per provider, over every model it served. */
-export function providerSummaryLines(rows: readonly ProviderSummary[], width: number, limit = 40): PanelLine[] {
+export function providerSummaryLines(rows: readonly ProviderSummary[], width: number, limit = 40, estimates = true): PanelLine[] {
   const lines = renderTable(
     rows,
     [
@@ -708,7 +720,7 @@ export function providerSummaryLines(rows: readonly ProviderSummary[], width: nu
       { header: "hit", width: 7, align: "right", optional: true, cell: (row) => formatPercent(row.cache.hit) },
       { header: "tps p50", width: 8, align: "right", optional: true, cell: (row) => formatTps(row.tps) },
       { header: "wall", width: 8, align: "right", optional: true, cell: (row) => formatMs(row.wall) },
-      { header: "cost", width: 9, align: "right", optional: true, cell: (row) => formatCost(row.usage.cost) },
+      { header: "cost", width: 9, align: "right", optional: true, cell: (row) => formatSpend(row.usage.cost, estimates ? row.usage.listCost : 0) },
     ],
     width,
     {
@@ -723,7 +735,7 @@ export function providerSummaryLines(rows: readonly ProviderSummary[], width: nu
 }
 
 /** One row per model × provider: the providers each model ran through. */
-export function providerLines(rows: readonly ProviderRow[], width: number, limit = 40): PanelLine[] {
+export function providerLines(rows: readonly ProviderRow[], width: number, limit = 40, estimates = true): PanelLine[] {
   return renderTable(
     rows,
     [
@@ -736,7 +748,7 @@ export function providerLines(rows: readonly ProviderRow[], width: number, limit
       { header: "hit", width: 7, align: "right", optional: true, cell: (row) => formatPercent(row.cache.hit) },
       { header: "tps p50", width: 8, align: "right", optional: true, cell: (row) => formatTps(row.tps) },
       { header: "wall", width: 8, align: "right", optional: true, cell: (row) => formatMs(row.wall) },
-      { header: "cost", width: 9, align: "right", optional: true, cell: (row) => formatCost(row.usage.cost) },
+      { header: "cost", width: 9, align: "right", optional: true, cell: (row) => formatSpend(row.usage.cost, estimates ? row.usage.listCost : 0) },
     ],
     width,
     {
@@ -868,7 +880,7 @@ export function cacheLines(
 // Periods
 // ---------------------------------------------------------------------------
 
-export function periodLines(rows: readonly PeriodRow[], width: number, granularity: PeriodGranularity, limit = 40): PanelLine[] {
+export function periodLines(rows: readonly PeriodRow[], width: number, granularity: PeriodGranularity, limit = 40, estimates = true): PanelLine[] {
   const lines: PanelLine[] = []
   const totals = rows.reduce(
     (sum, row) => {
@@ -880,9 +892,10 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
       sum.output += row.usage.output
       sum.reasoning += row.usage.reasoning
       sum.cost += row.usage.cost
+      sum.listCost += row.usage.listCost
       return sum
     },
-    { steps: 0, sessions: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0 },
+    { steps: 0, sessions: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 },
   )
   const overall = usageBuckets(totals)
   lines.push({
@@ -892,7 +905,10 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
   if (rows.length > 1) {
     lines.push({ text: `steps   ${sparkline(rows.map((row) => row.usage.steps))}`, tone: "muted" })
     lines.push({ text: `cached  ${sparkline(rows.map((row) => row.usage.cached))}`, tone: "muted" })
-    lines.push({ text: `cost    ${sparkline(rows.map((row) => Math.round(row.usage.cost * 10_000)))}`, tone: "muted" })
+    lines.push({
+      text: `cost    ${sparkline(rows.map((row) => Math.round((estimates ? row.usage.cost + row.usage.listCost : row.usage.cost) * 10_000)))}`,
+      tone: "muted",
+    })
   }
   const withSessions = tableWidths(width, [[12, 7, 7, 11, 10, 7, 9, 9]]).length === 8
   const widths = withSessions ? [12, 7, 7, 11, 10, 7, 9, 9] : [12, 7, 11, 10, 7, 9, 9]
@@ -911,7 +927,7 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
       formatTokens(buckets.cached),
       formatPercent(buckets.hit, 0),
       formatTokens(buckets.output),
-      formatCost(buckets.cost),
+      formatSpend(buckets.cost, estimates ? buckets.listCost : 0),
     ]
     lines.push({ text: formatTableRow(cells, widths, aligns), tone: "base", row: { kind: "period", value: row.key } })
   }
@@ -926,7 +942,7 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
         formatTokens(overall.cached),
         formatPercent(overall.hit, 0),
         formatTokens(overall.output),
-        formatCost(overall.cost),
+        formatSpend(overall.cost, estimates ? overall.listCost : 0),
       ],
       widths,
       aligns,
@@ -941,7 +957,7 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
 // Latency
 // ---------------------------------------------------------------------------
 
-export function latencyLines(report: LatencyReport, width: number, groups?: readonly LatencyGroupRow[] | undefined, limit = 12): PanelLine[] {
+export function latencyLines(report: LatencyReport, width: number, groups?: readonly LatencyGroupRow[] | undefined, limit = 12, estimates = true): PanelLine[] {
   const lines: PanelLine[] = []
   lines.push({
     text: formatTableRow(
@@ -975,7 +991,16 @@ export function latencyLines(report: LatencyReport, width: number, groups?: read
       const thin = row.count < 5
       lines.push({
         text: formatTableRow(
-          [row.label, formatCount(row.count), formatMs(row.wall.p50), formatMs(row.wall.p90), formatMs(row.stream.p50), formatTps(row.tps.p50), formatTps(row.tps.p90), formatCost(row.usage.cost)],
+          [
+            row.label,
+            formatCount(row.count),
+            formatMs(row.wall.p50),
+            formatMs(row.wall.p90),
+            formatMs(row.stream.p50),
+            formatTps(row.tps.p50),
+            formatTps(row.tps.p90),
+            formatSpend(row.usage.cost, estimates ? row.usage.listCost : 0),
+          ],
           widths,
           aligns,
         ),
@@ -995,9 +1020,14 @@ export function latencyLines(report: LatencyReport, width: number, groups?: read
 export function sessionsLines(
   rows: readonly SessionUsage[],
   width: number,
-  options?: { limit?: number | undefined; rollup?: { subagentSteps: number; subagentCost: number } | undefined },
+  options?: {
+    limit?: number | undefined
+    estimates?: boolean | undefined
+    rollup?: { subagentSteps: number; subagentCost: number; subagentListCost?: number | undefined } | undefined
+  },
 ): PanelLine[] {
   const limit = options?.limit ?? 20
+  const estimates = options?.estimates !== false
   const widths = [Math.max(18, Math.floor(width * 0.36)), 7, 11, 10, 7, 9, 9]
   const aligns: ("left" | "right")[] = ["left", "right", "right", "right", "right", "right", "right"]
   const lines: PanelLine[] = [
@@ -1021,7 +1051,7 @@ export function sessionsLines(
           formatTokens(buckets.cached),
           formatPercent(buckets.hit, 0),
           formatTokens(buckets.output),
-          formatCost(buckets.cost),
+          formatSpend(buckets.cost, estimates ? buckets.listCost : 0),
         ],
         widths,
         aligns,
@@ -1036,8 +1066,9 @@ export function sessionsLines(
     const share = rows.reduce((sum, row) => sum + row.steps, 0)
     lines.push({ text: "", tone: "muted" })
     lines.push({
-      text: `subagents ${formatCount(options.rollup.subagentSteps)} steps (${formatPercent(share > 0 ? options.rollup.subagentSteps / share : undefined)}) · ${formatCost(
+      text: `subagents ${formatCount(options.rollup.subagentSteps)} steps (${formatPercent(share > 0 ? options.rollup.subagentSteps / share : undefined)}) · ${formatSpend(
         options.rollup.subagentCost,
+        estimates ? (options.rollup.subagentListCost ?? 0) : 0,
       )}`,
       tone: "muted",
     })
@@ -1052,7 +1083,7 @@ export function sessionsLines(
 // ---------------------------------------------------------------------------
 
 /** The database view: where it lives, what it holds, and the two cleanups. */
-export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: number }, width: number): PanelLine[] {
+export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: number; estimates?: boolean | undefined }, width: number): PanelLine[] {
   const lines: PanelLine[] = []
   const size = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`
   lines.push({ text: truncate(data.info.path, width), tone: "base" })
@@ -1077,6 +1108,19 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
   // The retention rows are the only selectable lines here, so the hint says how
   // to pick one and what Enter does: the row is a cutoff, not a count.
   lines.push({ text: truncate("  ↑↓ pick a retention · enter prunes the steps older than it (asks first) · v gives the space back", width), tone: "muted" })
+  if (data.estimates !== false) {
+    lines.push({
+      text: truncate(
+        data.info.schemaVersion < 10
+          ? "  list estimates  the recorder must upgrade this database first"
+          : data.info.unpriced === 0
+            ? "  list estimates  every $0 step has a price"
+            : `  list estimates  ${formatCount(data.info.unpriced)} $0 steps without a known price · e retries`,
+        width,
+      ),
+      tone: data.info.schemaVersion < 10 || data.info.unpriced > 0 ? "base" : "muted",
+    })
+  }
   const widths = [10, 13, 10]
   lines.push({ text: formatTableRow(["keep", "prunes", "older than"], widths, ["left", "right", "left"]), tone: "muted" })
   for (const option of data.info.removable) {
@@ -1102,6 +1146,8 @@ export type LineFormatOptions = {
   labels?: Partial<LineLabels> | undefined
   fields?: Partial<LineFields> | undefined
   turnTotals?: TurnTotalsView | undefined
+  /** `false` hides list-price estimates everywhere this line is rendered. */
+  estimates?: boolean | undefined
 }
 
 /** The line's own view of a recorded turn, so both render identically. */
@@ -1159,7 +1205,7 @@ export function turnsLines(rows: readonly TurnUsage[], width: number, options?: 
  * The accumulated usage of one session, as compact lines for the sidebar. The
  * buckets are the live line's, so the sidebar, the line and the panel agree.
  */
-export function sessionSummaryLines(usage: Overview, budget = 34): PanelLine[] {
+export function sessionSummaryLines(usage: Overview, budget = 34, estimates = true): PanelLine[] {
   const buckets = usageBuckets(usage)
   const steps = formatCount(buckets.steps)
   const input = formatTokens(buckets.input)
@@ -1167,7 +1213,7 @@ export function sessionSummaryLines(usage: Overview, budget = 34): PanelLine[] {
   const out = formatTokens(buckets.output)
   const hit = formatPercent(buckets.hit)
   const tps = formatTpsCompact(usage.tps)
-  const cost = formatCost(buckets.cost)
+  const cost = (estimates ? formatMoney(buckets.cost, buckets.listCost) : undefined) ?? formatCost(buckets.cost)
   // The same order as a turn's three lines: how much was sent (`in`, `cached`),
   // how much came back (`out`), then `hit`, the rate and the cost last.
   const first = [
@@ -1213,7 +1259,10 @@ export function sidebarLines(rows: readonly TurnUsage[], options?: LineFormatOpt
     const input = formatTokens(display.input)
     const prompt = formatTokens(display.prompt)
     const output = formatTokens(display.output)
-    const cost = formatCost(turn.totals.cost)
+    const cost =
+      options?.estimates === false
+        ? formatCost(turn.totals.cost)
+        : formatMoney(turn.totals.cost, turn.totals.listCost) ?? formatCost(turn.totals.cost)
     // The cache hit of the turn, on the same step the numbers come from. One
     // decimal, with a trailing `.0` dropped: the sidebar has no room to spare.
     const hit = formatPercent(display.prompt > 0 ? display.cached / display.prompt : undefined).replace(/\.0%$/, "%")

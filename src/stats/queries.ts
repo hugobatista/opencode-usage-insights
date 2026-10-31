@@ -60,6 +60,33 @@ export type Usage = {
   output: number
   reasoning: number
   cost: number
+  /** List-price estimate for steps the host reported as costing nothing. */
+  listCost: number
+}
+
+/**
+ * What the selection costs: charged money plus the list-price estimate of the
+ * steps the host reported as free. Display code marks the estimated part.
+ */
+export function spend(usage: Pick<Usage, "cost" | "listCost">): number {
+  return usage.cost + usage.listCost
+}
+
+/** True when at least one step in the aggregate is an estimate. */
+export function hasEstimate(usage: Pick<Usage, "listCost">): boolean {
+  return usage.listCost > 0
+}
+
+/**
+ * The list-price estimate of one session, from the steps the plugin recorded.
+ * The live line uses it for the `sess` segment; a session with no recorded
+ * estimate (or a database without the column) answers 0.
+ */
+export function sessionListCost(db: Database, sessionID: string): number {
+  const row = db
+    .query("SELECT COALESCE(SUM(list_cost), 0) AS listCost FROM steps WHERE session_id = ?")
+    .get(sessionID) as { listCost: number | null } | null
+  return row?.listCost ?? 0
 }
 
 type UsageRow = {
@@ -70,6 +97,7 @@ type UsageRow = {
   output: number | null
   reasoning: number | null
   cost: number | null
+  listCost: number | null
 }
 
 export const STEP_TIME = "COALESCE(created_at, recorded_at)"
@@ -96,7 +124,8 @@ const USAGE_SELECT = `COUNT(*) AS steps,
        COALESCE(SUM(cache_write), 0) AS cacheWrite,
        COALESCE(SUM(output_tokens), 0) AS output,
        COALESCE(SUM(reasoning_tokens), 0) AS reasoning,
-       COALESCE(SUM(cost), 0) AS cost`
+       COALESCE(SUM(cost), 0) AS cost,
+       COALESCE(SUM(list_cost), 0) AS listCost`
 
 function usageFrom(row: UsageRow): Usage {
   return {
@@ -107,6 +136,7 @@ function usageFrom(row: UsageRow): Usage {
     output: row.output ?? 0,
     reasoning: row.reasoning ?? 0,
     cost: row.cost ?? 0,
+    listCost: row.listCost ?? 0,
   }
 }
 
@@ -197,7 +227,7 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
   const prompts = rangeWhere(range, "created_at")
   const promptRow = db.query(`SELECT COUNT(*) AS prompts FROM prompts ${prompts.where}`).get(...prompts.params) as { prompts: number } | null
 
-  const usage = usageFrom(row ?? { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0 })
+  const usage = usageFrom(row ?? { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 })
   return {
     ...usage,
     sessions: row?.sessions ?? 0,
@@ -272,7 +302,7 @@ export function models(db: Database, range?: Range, filters?: Filters): ModelUsa
 }
 
 function emptyUsage(): Usage {
-  return { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0 }
+  return { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 }
 }
 
 function addUsage(target: Usage, source: Usage): void {
@@ -283,6 +313,7 @@ function addUsage(target: Usage, source: Usage): void {
   target.output += source.output
   target.reasoning += source.reasoning
   target.cost += source.cost
+  target.listCost += source.listCost
 }
 
 function billedTokens(usage: Pick<Usage, "input" | "cached" | "output">): number {
@@ -409,6 +440,7 @@ export function sessions(
               COALESCE(SUM(st.output_tokens), 0) AS output,
               COALESCE(SUM(st.reasoning_tokens), 0) AS reasoning,
               COALESCE(SUM(st.cost), 0) AS cost,
+              COALESCE(SUM(st.list_cost), 0) AS listCost,
               MIN(COALESCE(st.created_at, st.recorded_at)) AS first_at,
               MAX(COALESCE(st.completed_at, st.created_at, st.recorded_at)) AS last_at
        FROM steps st
@@ -514,6 +546,7 @@ type TurnStepRow = {
   output_tokens: number | null
   reasoning_tokens: number | null
   cost: number | null
+  list_cost: number | null
   created_at: number | null
   streamed_at: number | null
   recorded_at: number
@@ -535,6 +568,7 @@ function stepUsage(row: TurnStepRow): Usage {
     output: row.output_tokens ?? 0,
     reasoning: row.reasoning_tokens ?? 0,
     cost: row.cost ?? 0,
+    listCost: row.list_cost ?? 0,
   }
 }
 
@@ -588,7 +622,7 @@ export function turns(
   const steps = db
     .query(
       `SELECT message_id, session_id, provider_id, model_id, variant,
-              input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost,
+              input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost, list_cost,
               created_at, streamed_at, recorded_at, completed_at, finish
          FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
         ORDER BY session_id, ${STEP_TIME}`,

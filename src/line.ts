@@ -9,6 +9,7 @@ import {
   type TurnTotalsView,
 } from "./core"
 import { PROMPT_BOUNDARIES } from "./core"
+import type { PriceFn } from "./pricing"
 import { sanitizeLabel } from "./text"
 
 /**
@@ -39,6 +40,8 @@ export type RuntimeMessage = {
   model?: RuntimeModelRef | undefined
   tokens?: RuntimeTokenUsage | undefined
   cost?: number | undefined
+  /** Only present in tests/fixtures; the host message carries `cost` alone. */
+  listCost?: number | undefined
   finish?: string | null | undefined
   rawFinish?: string | null | undefined
 }
@@ -54,8 +57,15 @@ export type LinePart = {
   tone: LineTone
 }
 
-/** Convert host messages into the structural transcript `core` understands. */
-export function toTranscript(messages: readonly RuntimeMessage[]): TranscriptMessage[] {
+/**
+ * Convert host messages into the structural transcript `core` understands.
+ *
+ * When `price` is provided, a step the host reported as costing nothing gets a
+ * list-price estimate here. The line is computed from the host transcript, so
+ * this is the only place the live line can learn the estimate without reading
+ * the plugin database.
+ */
+export function toTranscript(messages: readonly RuntimeMessage[], price?: PriceFn | undefined): TranscriptMessage[] {
   const transcript: TranscriptMessage[] = []
   for (const message of messages) {
     if (typeof message.id !== "string" || typeof message.type !== "string") continue
@@ -63,13 +73,29 @@ export function toTranscript(messages: readonly RuntimeMessage[]): TranscriptMes
       transcript.push({ type: message.type, id: message.id, time: message.time })
       continue
     }
+    const model = toModelRef(message.model)
+    let listCost = message.listCost
+    if (listCost === undefined && price !== undefined && model !== undefined && (message.cost === undefined || message.cost <= 0)) {
+      const estimate = price(
+        { providerID: model.providerID, modelID: model.id },
+        {
+          input: message.tokens?.input,
+          output: message.tokens?.output,
+          reasoning: message.tokens?.reasoning,
+          cacheRead: message.tokens?.cache?.read,
+          cacheWrite: message.tokens?.cache?.write,
+        },
+      )
+      if (estimate !== undefined && Number.isFinite(estimate) && estimate > 0) listCost = estimate
+    }
     transcript.push({
       type: "assistant",
       id: message.id,
       time: message.time,
-      model: toModelRef(message.model),
+      model,
       tokens: message.tokens,
       cost: message.cost,
+      ...(listCost !== undefined ? { listCost } : {}),
       finish: message.finish ?? undefined,
       rawFinish: message.rawFinish ?? undefined,
     })
@@ -85,7 +111,7 @@ export function toTranscript(messages: readonly RuntimeMessage[]): TranscriptMes
  * it cost milliseconds at every turn end, on the thread that also paints the
  * agent's output. Walking backwards costs what the last turns hold.
  */
-export function toTranscriptTail(messages: readonly RuntimeMessage[], segments = 2): TranscriptMessage[] {
+export function toTranscriptTail(messages: readonly RuntimeMessage[], segments = 2, price?: PriceFn | undefined): TranscriptMessage[] {
   // `computeTurn` reads the last turn *and the one before it*: with fewer
   // segments it answers something else (no `promptGapMs`, no cache reference for
   // the first step), so the floor is not a matter of taste.
@@ -110,7 +136,7 @@ export function toTranscriptTail(messages: readonly RuntimeMessage[], segments =
     if (closed >= wanted) break
   }
   tail.reverse()
-  return toTranscript(tail)
+  return toTranscript(tail, price)
 }
 
 function toModelRef(model: RuntimeModelRef | undefined): { providerID: string; id: string; variant?: string } | undefined {
@@ -119,8 +145,11 @@ function toModelRef(model: RuntimeModelRef | undefined): { providerID: string; i
   return { providerID: model.providerID, id: model.id, variant: model.variant }
 }
 
-/** Session-wide accumulated usage, as reported by the host on the session. */
-export function sessionTotals(info: RuntimeSessionInfo | undefined): Totals | undefined {
+/**
+ * Session-wide accumulated usage: the host's tokens and charged cost, plus the
+ * list-price estimate the plugin recorded for the session's steps.
+ */
+export function sessionTotals(info: RuntimeSessionInfo | undefined, listCost = 0): Totals | undefined {
   if (info === undefined) return undefined
   const tokens = info.tokens
   return {
@@ -130,6 +159,7 @@ export function sessionTotals(info: RuntimeSessionInfo | undefined): Totals | un
     reasoning: tokens?.reasoning ?? 0,
     cacheWrite: tokens?.cache?.write ?? 0,
     cost: info.cost ?? 0,
+    listCost,
     steps: 0,
   }
 }
@@ -140,7 +170,7 @@ export function sessionTotals(info: RuntimeSessionInfo | undefined): Totals | un
  */
 export function lineParts(
   stats: TurnStats | undefined,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; estimates?: boolean },
 ): LinePart[] {
   if (stats === undefined) return []
   const parts: LinePart[] = []

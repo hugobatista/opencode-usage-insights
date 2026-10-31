@@ -24,8 +24,13 @@ replayed events, restarts and re-imports never duplicate rows.
 Tables: `sessions`, `prompts`, `steps`, `events` and `meta` (the schema
 version). The `steps` table is the interesting one: `message_id` (primary key),
 `session_id`, `parent_id`, provider/model/variant, input/output/reasoning and
-cache-read/cache-write tokens, cost, `created_at`, `streamed_at`,
-`completed_at`, `finish` and `recorded_at`.
+cache-read/cache-write tokens, charged `cost`, list-price `list_cost`,
+`created_at`, `streamed_at`, `completed_at`, `finish` and `recorded_at`.
+`list_cost` is nullable on purpose: `NULL` means the step was charged or its
+price was unknown; `0` means the host's model list knows the model is free; a positive
+value is an estimate for a step the host reported as `$0`. Storing zero for a
+free model keeps it out of the backfill's "needs an estimate" set without
+inventing money.
 
 Throughput is not stored: `tps` is everything the model generated
 (`output + reasoning`) over the streaming window (`created → streamed`), and the
@@ -43,11 +48,14 @@ the per-prompt history and the sidebar read. Without them a range filter is a
 full table scan on every panel rebuild.
 
 The file is private to the user: its directory is created `0700` and the file
-`0600` (POSIX), re-applied every time either is opened. The TUI reads through a
+`0600` (POSIX), re-applied every time either is opened. Schema migrations run on
+the server's writer connection; a read-only TUI that opens a file from before
+the current schema cannot add the column, so it reports the query error until
+the upgraded server has opened it once. The TUI reads through a
 read-only connection — it can never write, never migrate and never hold the
-writer's lock — and prune and compact use a separate short-lived writer with a
-250 ms busy timeout, so maintenance fails fast with a message instead of
-stalling the recorder.
+writer's lock — and prune, the list-price backfill and compact use a separate
+short-lived writer with a 250 ms busy timeout, so maintenance fails fast with a
+message instead of stalling the recorder.
 
 ## The identity of a step
 
@@ -100,13 +108,116 @@ different rules on purpose:
 - **Money is always summed.** Every step of a turn is paid for, so the turn's
   cost is the sum over its steps whatever the token view shows (`totalsText`
   takes the cost explicitly for that reason, never the `latest` step's share).
-  The session's cost is the one the host reports for the session.
+  For the session, the charged cost is the one the host reports; the list
+  estimate is `SUM(list_cost)` over the plugin's recorded steps, cached per
+  session and invalidated on every write event.
 - **A zero cost is left out.** A free model reads as free instead of repeating
-  `$0`; `fields.cost: false` hides the segment entirely for a narrower line.
+  `$0`; `fields.cost: false` hides both charged cost and estimate.
+- **A list estimate is labelled.** OpenCode 2.2.0 trusts a reported `cost: 0`
+  instead of falling back to its model list, and OpenCode Go reports `0` for
+  subscription-covered requests. The recorder keeps that charged `0` and stores
+  the model-list price in `list_cost`; the line renders `cost ≈ $0.0344`. A turn
+  that mixes charged and estimated steps renders both parts
+  (`cost $0.12 + ≈ $3.40`) rather than adding them silently. The `sess`
+  segment applies the same rule: the host's charged total plus the estimate
+  summed from the recorded steps, so a Go session shows its list cost there
+  too.
 - **Switches the line warns about are between turns.** A provider change against
   the previous prompt is `changed`, a model change inside one provider is
   `model changed`; the same comparison between *steps* is what the `models`
   view's detail line counts.
+
+## List-price estimates
+
+The “catalog” is the model list exposed by the OpenCode process that is
+currently serving the session — not a file and not a plugin-owned network
+request. The host resolves provider configuration and overrides before
+exposing it. Prices are USD per 1,000,000 tokens. `steps.cost` is always the
+host's reported charge; the plugin does not recalculate it.
+
+| Surface | Source |
+| --- | --- |
+| Server recorder | `ctx.model.list()` → `ModelListOutput.data: ModelInfo[]` |
+| Live turn / backfill | `ctx.data.location.model.list(ctx.location)` → `ModelInfo[] \| undefined` |
+| Panel, sidebar, NDJSON, CLI report | stored `steps.list_cost` |
+| `sess` segment | `SUM(list_cost)` from the database |
+
+Each `ModelInfo` carries the prices in `cost: ModelCost[]`, with
+`input`, `output`, `cache.read`, `cache.write` and an optional
+`tier: { type: "context", size }`. The plugin keys its table by
+`providerID/modelID`; variants do not change the price.
+
+The plugin deliberately does **not** read `~/.cache/opencode/models.json`, does
+**not** use `opencode models` for prices (that command lists model IDs only),
+and makes no network call of its own.
+
+The server loads the list without blocking the recorder, refreshes it on
+`model.updated` and on a coarse TTL, and keeps the previous table when a refresh
+fails. The TUI builds its own table for the live line and the backfill, with the
+same event invalidation and TTL; a missing table means no estimate. The
+historical views never consult it: they read `steps.list_cost`, which is why
+they work without a host runtime.
+
+The estimate is the host's own `cost` fallback:
+
+```text
+input       tokens.input (fresh, uncached prompt)
+cache.read  tokens.cache.read
+cache.write tokens.cache.write
+output      visible output tokens
+reasoning   reasoning tokens
+
+prompt = input + cache.read + cache.write
+tier   = the largest tier with tier.type === "context" and prompt > tier.size
+         else the untiered entry
+cost   = (input * inputPrice
+          + (output + reasoning) * outputPrice
+          + cache.read * cacheReadPrice
+          + cache.write * cacheWritePrice) / 1e6
+```
+
+Reasoning is billed at the output price. For a model with context tiers, the
+strict `>` matters: at exactly the tier size the untiered price applies. No
+applicable tier or an unknown model means no estimate; an all-zero applicable
+price returns `0`, which records a known free model.
+
+These are the same buckets the line folds for display: `in = input +
+cache.write`, `cached = cache.read`, `out = output + reasoning`, and `prompt =
+in + cached`. In particular, the formula's `input` is **not** the line's `in`;
+using the displayed `in` would count cache writes twice.
+
+A worked example with the `opencode-go/deepseek-v4.1-flash` prices
+(`input 0.15`, `output 0.6`, `cache.read 0.003`):
+
+```text
+2,591 × 0.15 + (564 + 3,239) × 0.6 + 514,944 × 0.003
+= 4,215.282 per 1,000,000 tokens = $0.004215282
+```
+
+`list_cost` is `NULL` when the step was charged or its price is unknown, `0`
+for a known free model, and positive for an estimate. The line omits a zero
+cost; the panel has a cell to fill, so it shows `$0` for a free or unknown-price
+step.
+
+The estimate is stored instead of recomputed on read for a practical reason:
+the panel, the sidebar, the NDJSON export and `bun run report` read the database
+without a host runtime. `list_cost` freezes the price at record time; the live
+turn prices from the TUI's current model list, which may be newer. The
+maintenance backfill intentionally uses today's model list and is user-triggered,
+because a model that was free when the step ran may not be free now.
+
+The session segment follows a split rule: its charged total is the host's, and
+its estimate is `SUM(list_cost)` over the plugin's recorded steps, cached per
+session and invalidated on every write event. If the plugin began recording in
+the middle of a session, that estimate covers only the recorded steps; the
+charged total still comes from the host. If the database is unavailable, the
+line falls back to the host total with no estimate.
+
+The backfill only considers steps with a provider, a model and at least one
+token; it prices free models as `0` and leaves models the host's current model
+list no longer contains as `NULL`, so `e` can be retried after the list changes.
+`pricing: "off"` stops new estimates, hides stored ones in the line, panel and
+sidebar, and disables the backfill. It does not delete the column.
 
 ## Privacy and security
 
@@ -114,9 +225,10 @@ The plugin is local by construction: no network client, no subprocess, no
 credentials, no telemetry. Everything it records stays in the SQLite file in the
 user's own state directory.
 
-**What is stored.** Per step: timings, token counts and cost, the
-provider/model/variant it ran as, the finish reason, the session and parent ids,
-and the session's title and working directory as the host reports them.
+**What is stored.** Per step: timings, token counts, charged cost and the
+list-price estimate when the host reported `$0`, the provider/model/variant it
+ran as, the finish reason, the session and parent ids, and the session's title
+and working directory as the host reports them.
 **Prompts and responses are not stored**: the recorder reads event payloads for
 numbers and identifiers and keeps nothing else — no message text, no tool
 arguments, no file contents, no environment variables.

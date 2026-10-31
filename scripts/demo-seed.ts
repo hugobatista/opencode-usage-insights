@@ -118,7 +118,16 @@ export const liveTurn: RuntimeMessage[] = [
 ]
 
 /** Host session totals for the two recorder turns, as the TUI reads them. */
-export const recorderTotals: Totals = { input: 106_400, cached: 2_890_000, output: 6_100, reasoning: 900, cacheWrite: 700, cost: 0.27, steps: 2 }
+export const recorderTotals: Totals = {
+  input: 106_400,
+  cached: 2_890_000,
+  output: 6_100,
+  reasoning: 900,
+  cacheWrite: 700,
+  cost: 0.27,
+  listCost: 0,
+  steps: 2,
+}
 /**
  * The same session once the third turn (the opus one) has finished: the turn
  * cost more than the session had spent before it, so a line that shows both
@@ -131,7 +140,17 @@ export const recorderTotalsAfterOpus: Totals = {
   reasoning: 900,
   cacheWrite: 23_900,
   cost: 1.69,
+  listCost: 0,
   steps: 3,
 }
 /** Host session totals for the two cache turns. */
-export const cacheTotals: Totals = { input: 104_700, cached: 632_400, output: 9_900, reasoning: 0, cacheWrite: 17_000, cost: 0.76, steps: 1 }
+export const cacheTotals: Totals = {
+  input: 104_700,
+  cached: 632_400,
+  output: 9_900,
+  reasoning: 0,
+  cacheWrite: 17_000,
+  cost: 0.76,
+  listCost: 0,
+  steps: 1,
+}

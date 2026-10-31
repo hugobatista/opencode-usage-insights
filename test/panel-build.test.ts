@@ -299,6 +299,42 @@ describe("filters and detail", () => {
   })
 })
 
+describe("list-price estimates", () => {
+  function estimatedDb(): Database {
+    const db = openStatsDb(":memory:")
+    recordStep(db, {
+      messageID: "est",
+      sessionID: "s1",
+      providerID: "opencode-go",
+      modelID: "m",
+      input: 2_591,
+      cacheRead: 514_944,
+      output: 564,
+      reasoning: 3_239,
+      cost: 0,
+      listCost: 0.004215282,
+      createdAt: BASE,
+      completedAt: BASE + 1_000,
+      finish: "stop",
+    })
+    return db
+  }
+
+  test("the overview marks an estimate and pricing off hides it", () => {
+    const db = estimatedDb()
+    expect(text(buildPanel(request(db, { view: "overview" })))).toContain("≈ $0.0042")
+    expect(text(buildPanel(request(db, { view: "overview", estimates: false })))).not.toContain("≈")
+    db.close()
+  })
+
+  test("the models view shows the estimate in the cost column", () => {
+    const db = estimatedDb()
+    expect(text(buildPanel(request(db, { view: "models" })))).toContain("≈$0.0042")
+    expect(text(buildPanel(request(db, { view: "models", estimates: false })))).not.toContain("≈")
+    db.close()
+  })
+})
+
 describe("the db view", () => {
   test("shows where the file lives, what it holds and what each prune would remove", () => {
     const db = seed()
@@ -312,8 +348,20 @@ describe("the db view", () => {
     expect(body).toContain("steps")
     expect(body).toContain("schema v")
     expect(body).toContain("clean up")
+    expect(body).toContain("list estimates")
     expect(lines.filter((line) => line.row?.kind === "prune").length).toBe(3)
     expect(body).toContain("365 days")
+    db.close()
+  })
+
+  test("counts the $0 steps that still need an estimate", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "u1", sessionID: "s", providerID: "opencode-go", modelID: "m", input: 10, cost: 0, createdAt: BASE })
+    const lines = buildPanel(request(db, { view: "db", database: dbInfoOf(db) }))
+    expect(text(lines)).toContain("1 $0 steps without a known price · e retries")
+    // Pricing off removes the action from the view entirely.
+    const hidden = buildPanel(request(db, { view: "db", database: dbInfoOf(db), estimates: false }))
+    expect(text(hidden)).not.toContain("list estimates")
     db.close()
   })
 

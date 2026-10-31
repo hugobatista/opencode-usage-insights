@@ -72,6 +72,30 @@ describe("schema", () => {
   })
 })
 
+describe("list-price migration", () => {
+  test("adds list_cost to a database created before it existed", () => {
+    const directory = tempDir("list-cost-migration")
+    const path = join(directory, "usage.db")
+    try {
+      const first = openStatsDb(path)
+      recordStep(first, { messageID: "old", sessionID: "ses", cost: 0, recordedAt: BASE })
+      // Shape the file like schema 9: no list_cost, and the old version stamp.
+      first.exec("ALTER TABLE steps DROP COLUMN list_cost")
+      first.query("UPDATE meta SET value = '9' WHERE key = 'schema_version'").run()
+      first.close()
+
+      const second = openStatsDb(path)
+      const columns = (second.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name)
+      expect(columns).toContain("list_cost")
+      expect((second.query("SELECT list_cost FROM steps WHERE message_id = 'old'").get() as { list_cost: null }).list_cost).toBeNull()
+      expect((second.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe(String(SCHEMA_VERSION))
+      second.close()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
 describe("opening modes", () => {
   test("the reader never creates the file", () => {
     const directory = tempDir("readonly-missing")
@@ -205,6 +229,32 @@ describe("writing", () => {
     db.close()
   })
 
+  test("stores an estimate only for a step that was not charged", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "e1", sessionID: "ses", cost: 0, listCost: 0.0042, recordedAt: BASE })
+    recordStep(db, { messageID: "e2", sessionID: "ses", cost: 0.02, listCost: 0.0042, recordedAt: BASE })
+    recordStep(db, { messageID: "e3", sessionID: "ses", cost: 0, listCost: 0, recordedAt: BASE })
+    const rows = db.query("SELECT message_id, cost, list_cost FROM steps ORDER BY message_id").all()
+    expect(rows).toEqual([
+      { message_id: "e1", cost: 0, list_cost: 0.0042 },
+      { message_id: "e2", cost: 0.02, list_cost: null },
+      { message_id: "e3", cost: 0, list_cost: 0 },
+    ])
+    db.close()
+  })
+
+  test("keeps an estimate when a replay omits it, and drops it when the step becomes charged", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "r1", sessionID: "ses", cost: 0, listCost: 0.1, recordedAt: BASE })
+    // A replay without a price table does not erase the estimate.
+    recordStep(db, { messageID: "r1", sessionID: "ses", cost: 0, recordedAt: BASE })
+    expect((db.query("SELECT list_cost FROM steps WHERE message_id = 'r1'").get() as { list_cost: number }).list_cost).toBe(0.1)
+    // The step is later reported as charged: the estimate no longer applies.
+    recordStep(db, { messageID: "r1", sessionID: "ses", cost: 0.2, recordedAt: BASE })
+    expect((db.query("SELECT list_cost FROM steps WHERE message_id = 'r1'").get() as { list_cost: null }).list_cost).toBeNull()
+    db.close()
+  })
+
   test("an event kind is a short label", () => {
     const db = openStatsDb(":memory:")
     recordEvent(db, { sessionID: "ses", kind: "compaction\u001b[2J", at: BASE })
@@ -270,18 +320,18 @@ describe("importNdjson", () => {
   test("round-trips what the recorder wrote", () => {
     const db = target()
     upsertSession(db, { sessionID: "ses", title: "One", directory: "/tmp/ses", startedAt: BASE })
-    recordStep(db, { messageID: "rt1", sessionID: "ses", providerID: "opencode-go", modelID: "m", input: 10, output: 2, cost: 0.5, createdAt: BASE, recordedAt: BASE })
-    const dump = `{"table":"sessions","row":{"session_id":"ses","title":"One","directory":"/tmp/ses","started_at":${BASE},"updated_at":${BASE}}}\n{"table":"steps","row":{"message_id":"rt1","session_id":"ses","provider_id":"opencode-go","model_id":"m","input_tokens":10,"output_tokens":2,"cost":0.5,"created_at":${BASE},"recorded_at":${BASE}}}`
+    recordStep(db, { messageID: "rt1", sessionID: "ses", providerID: "opencode-go", modelID: "m", input: 10, output: 2, cost: 0, listCost: 0.0042, createdAt: BASE, recordedAt: BASE })
+    const dump = `{"table":"sessions","row":{"session_id":"ses","title":"One","directory":"/tmp/ses","started_at":${BASE},"updated_at":${BASE}}}\n{"table":"steps","row":{"message_id":"rt1","session_id":"ses","provider_id":"opencode-go","model_id":"m","input_tokens":10,"output_tokens":2,"cost":0,"list_cost":0.0042,"created_at":${BASE},"recorded_at":${BASE}}}`
     const fresh = target()
     expect(importNdjson(fresh, dump)).toBe(2)
     // A dump written before the endpoint was dropped still imports: the row's
     // own columns are the ones the table has, and an unknown one is ignored.
     const older = `{"table":"steps","row":{"message_id":"old1","session_id":"ses","router":"gw-1","model_id":"m","recorded_at":${BASE}}}`
     expect(importNdjson(fresh, older)).toBe(1)
-    const steps = fresh.query("SELECT message_id, provider_id, input_tokens, cost FROM steps ORDER BY message_id").all()
+    const steps = fresh.query("SELECT message_id, provider_id, input_tokens, cost, list_cost FROM steps ORDER BY message_id").all()
     expect(steps).toEqual([
-      { message_id: "old1", provider_id: null, input_tokens: 0, cost: 0 },
-      { message_id: "rt1", provider_id: "opencode-go", input_tokens: 10, cost: 0.5 },
+      { message_id: "old1", provider_id: null, input_tokens: 0, cost: 0, list_cost: null },
+      { message_id: "rt1", provider_id: "opencode-go", input_tokens: 10, cost: 0, list_cost: 0.0042 },
     ])
     db.close()
     fresh.close()

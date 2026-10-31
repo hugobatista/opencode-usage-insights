@@ -325,6 +325,26 @@ describe("providers", () => {
     db.close()
   })
 
+  test("aggregates list-price estimates into provider and period usage", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, {
+      messageID: "e1",
+      sessionID: "s1",
+      providerID: "opencode-go",
+      modelID: "m1",
+      input: 1_000,
+      cost: 0,
+      listCost: 0.01,
+      createdAt: BASE,
+      completedAt: BASE + 1_000,
+    })
+    const steps = stepRows(db)
+    expect(providerSummaryOf(steps)[0]!.usage.listCost).toBeCloseTo(0.01, 12)
+    expect(providerBreakdownOf(steps)[0]!.usage.listCost).toBeCloseTo(0.01, 12)
+    expect(periodsOf(steps, "day")[0]!.usage.listCost).toBeCloseTo(0.01, 12)
+    db.close()
+  })
+
   test("aggregates every model a provider served", () => {
     const db = seed()
     const rows = providerSummaryOf(stepRows(db))

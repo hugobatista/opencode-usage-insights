@@ -54,6 +54,7 @@ function overview(overrides: Partial<Overview> = {}): Overview {
     output: 900,
     reasoning: 0,
     cost: 0.42,
+    listCost: 0,
     sessions: 2,
     prompts: 4,
     firstAt: undefined,
@@ -77,11 +78,12 @@ function model(overrides: Partial<ModelUsage> & { modelID: string }): ModelUsage
         output: 900,
         reasoning: 0,
         cost: 0.42,
+        listCost: 0,
         firstAt: undefined,
         lastAt: undefined,
       },
     ],
-    totals: { steps: 4, input: 12_000, cached: 340_000, cacheWrite: 5_000, output: 900, reasoning: 0, cost: 0.42 },
+    totals: { steps: 4, input: 12_000, cached: 340_000, cacheWrite: 5_000, output: 900, reasoning: 0, cost: 0.42, listCost: 0 },
     ...overrides,
   }
 }
@@ -270,6 +272,15 @@ describe("overviewLines", () => {
     expect(text(lines)).not.toContain("this session")
   })
 
+  test("marks a list-price estimate and keeps a mixed total in two parts", () => {
+    const estimated = overviewLines({ usage: overview({ cost: 0, listCost: 0.0344 }), session: undefined, range: "all" }, 100)
+    expect(text(estimated)).toContain(`${padCell("cost", 11)}≈ $0.0344`)
+    const mixed = overviewLines({ usage: overview({ cost: 0.12, listCost: 3.4 }), session: undefined, range: "all" }, 100)
+    expect(text(mixed)).toContain(`${padCell("cost", 11)}$0.1200 + ≈ $3.40`)
+    const hidden = overviewLines({ usage: overview({ cost: 0, listCost: 0.0344 }), session: undefined, range: "all", estimates: false }, 100)
+    expect(text(hidden)).toContain(`${padCell("cost", 11)}$0`)
+  })
+
   test("adds reasoning, first/last and a session block when available", () => {
     const lines = overviewLines(
       {
@@ -313,6 +324,7 @@ describe("modelsLines", () => {
     output: 900,
     reasoning: 0,
     cost: 0.42,
+    listCost: 0,
     firstAt: undefined,
     lastAt: undefined,
     ...overrides,
@@ -337,6 +349,13 @@ describe("modelsLines", () => {
     // The same model through two providers is named as both, not as one.
     expect(lines[1]!.text).toContain("opencode-go, deepseek")
     expect(text(lines)).toContain("$0.42")
+  })
+
+  test("marks an estimated cost and hides it when pricing is off", () => {
+    const totals = { steps: 4, input: 12_000, cached: 340_000, cacheWrite: 5_000, output: 900, reasoning: 0, cost: 0, listCost: 0.0344 }
+    const rows = [model({ modelID: "go-model", providers: [providerRow({ cost: 0, listCost: 0.0344 })], totals })]
+    expect(text(modelsLines(rows, 120))).toContain("≈$0.0344")
+    expect(text(modelsLines(rows, 120, undefined, 40, false))).not.toContain("≈")
   })
 
   test("adds the p50 hit and the switches the facts provide", () => {
@@ -466,6 +485,7 @@ describe("sessionsLines", () => {
         output: 1_200,
         reasoning: 0,
         cost: 1.25,
+        listCost: 0,
         cacheHitRatio: 500_000 / 520_000,
       },
     ]
@@ -476,6 +496,31 @@ describe("sessionsLines", () => {
     expect(text(lines)).toContain("/project")
     expect(text(lines)).toContain("$1.25")
     expect(text(lines)).toContain("96%")
+  })
+
+  test("marks an estimated session cost and hides it when pricing is off", () => {
+    const row: SessionUsage = {
+      sessionID: "ses_estimate",
+      parentID: undefined,
+      title: "Estimate",
+      directory: undefined,
+      providers: ["opencode-go"],
+      models: ["m"],
+      prompts: 1,
+      firstAt: undefined,
+      lastAt: undefined,
+      steps: 1,
+      input: 1_000,
+      cached: 0,
+      cacheWrite: 0,
+      output: 10,
+      reasoning: 0,
+      cost: 0,
+      listCost: 0.0344,
+      cacheHitRatio: 0,
+    }
+    expect(text(sessionsLines([row], 100))).toContain("≈$0.0344")
+    expect(text(sessionsLines([row], 100, { estimates: false }))).not.toContain("≈")
   })
 
   test("indents subagent sessions and rolls their usage up", () => {
@@ -496,6 +541,7 @@ describe("sessionsLines", () => {
       output: 100,
       reasoning: 0,
       cost: 1,
+      listCost: 0,
       cacheHitRatio: 0.9,
     }
     const child: SessionUsage = { ...parent, sessionID: "ses_child", parentID: "ses_parent", title: "Child", steps: 4, cost: 0.25 }
@@ -524,6 +570,7 @@ describe("sessionsLines", () => {
           output: 1,
           reasoning: 0,
           cost: 0,
+          listCost: 0,
           cacheHitRatio: 0,
         },
       ],
@@ -535,6 +582,12 @@ describe("sessionsLines", () => {
 })
 
 describe("sessionSummaryLines", () => {
+  test("shows a list-price estimate as an estimate", () => {
+    expect(text(sessionSummaryLines(overview({ cost: 0, listCost: 0.0344 })))).toContain("≈ $0.0344")
+    expect(text(sessionSummaryLines(overview({ cost: 0.12, listCost: 3.4 })))).toContain("$0.1200 + ≈ $3.40")
+    expect(text(sessionSummaryLines(overview({ cost: 0, listCost: 0.0344 }), 34, false))).not.toContain("≈")
+  })
+
   test("summarises the session with the line's own buckets, inside the budget", () => {
     const lines = sessionSummaryLines(overview({ steps: 12, cost: 1.25 }))
     expect(lines[0]!.text).toBe("session")
@@ -620,7 +673,7 @@ describe("panel chrome", () => {
 })
 
 describe("turnsLines", () => {
-  const usage = { steps: 1, input: 1_617, cached: 425_728, cacheWrite: 0, output: 434, reasoning: 631, cost: 0.01 }
+  const usage = { steps: 1, input: 1_617, cached: 425_728, cacheWrite: 0, output: 434, reasoning: 631, cost: 0.01, listCost: 0 }
   const turn = (overrides: Partial<TurnUsage> = {}): TurnUsage => ({
     sessionID: "s1",
     promptAt: 1_000,

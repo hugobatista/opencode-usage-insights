@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite"
 import { recordEvent, recordPrompt, recordStep, upsertSession } from "./stats/db"
 import { COMPACTION_KIND } from "./stats/queries"
+import type { PriceFn } from "./pricing"
 
 /**
  * Event-driven recorder. Every handler is idempotent and defensive: the
@@ -62,6 +63,11 @@ export type PendingStep = {
 export type RecorderOptions = {
   /** Clock override, for tests. */
   now?: (() => number) | undefined
+  /**
+   * List-price estimate for a step the host reported as costing nothing.
+   * Undefined keeps the recorder on charged money alone.
+   */
+  price?: PriceFn | undefined
 }
 
 export type Recorder = {
@@ -167,6 +173,22 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
     const info = pending.get(messageID)
     pending.delete(messageID)
     const model = info?.model ?? lastModel.get(sessionID)
+    // The host's reported cost wins when it charged something. A reported zero
+    // (Go's subscription) or a missing value gets the catalog estimate.
+    const charged = data.cost
+    const estimate =
+      charged !== undefined && charged > 0
+        ? undefined
+        : options?.price?.(
+            { providerID: model?.providerID, modelID: model?.id },
+            {
+              input: data.tokens?.input,
+              output: data.tokens?.output,
+              reasoning: data.tokens?.reasoning,
+              cacheRead: data.tokens?.cache?.read,
+              cacheWrite: data.tokens?.cache?.write,
+            },
+          )
     write(() =>
       recordStep(db, {
         messageID,
@@ -180,6 +202,7 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
         cacheRead: data.tokens?.cache?.read,
         cacheWrite: data.tokens?.cache?.write,
         cost: data.cost,
+        listCost: estimate !== undefined && Number.isFinite(estimate) && estimate >= 0 ? estimate : undefined,
         createdAt: info?.started,
         streamedAt: info?.streamed,
         completedAt: at,

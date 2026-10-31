@@ -8,9 +8,12 @@ import { computeTurn, type LineFields, type LineLabels, type TurnStats, type Tur
 import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
+import { costOf, priceTable, type PriceFn, type PriceTable } from "./pricing"
 import { TurnsSidebar } from "./sidebar"
 import { openStatsDbReadOnly, openStatsDbWrite } from "./stats/db"
+import { backfillListCost, type BackfillResult } from "./stats/maintenance"
 import { resolveDbPath } from "./stats/paths"
+import { sessionListCost } from "./stats/queries"
 
 /**
  * TUI side of the plugin. Two contributions:
@@ -32,6 +35,12 @@ export type Options = {
   enabled?: boolean | undefined
   /** SQLite database path override; must match the server entry. */
   db?: string | undefined
+  /**
+   * List-price estimates for steps the host reports as costing nothing.
+   * `off` hides them on the line, in the panel and in the sidebar, and
+   * disables the historical backfill. Defaults to `auto`.
+   */
+  pricing?: "auto" | "off" | undefined
   /**
    * How the turn segment counts prompt usage: `latest` (default) shows the
    * prompt size the turn ended with, `sum` adds every step of the turn.
@@ -79,6 +88,35 @@ export default Plugin.define({
     const options = (ctx.options ?? {}) as Options
     if (options.enabled === false) return
     const panelEnabled = options.panel !== false
+    const pricing = options.pricing !== "off"
+    const PRICE_TTL_MS = 5 * 60 * 1000
+    let priceCache: { table: PriceTable; at: number } | undefined
+
+    /**
+     * The catalog prices the live line prices steps with. The host publishes
+     * the model list as a location collection, so a stale table is still
+     * usable when the collection is temporarily unavailable.
+     */
+    function priceTableFor(): PriceTable | undefined {
+      if (!pricing) return undefined
+      const now = Date.now()
+      if (priceCache !== undefined && now - priceCache.at < PRICE_TTL_MS) return priceCache.table
+      try {
+        const models = ctx.data.location?.model?.list(ctx.location)
+        if (models !== undefined && models.length > 0) {
+          priceCache = { table: priceTable(models), at: now }
+          return priceCache.table
+        }
+      } catch {
+        // Fall through to the previous table.
+      }
+      return priceCache?.table
+    }
+
+    function priceFor(): PriceFn | undefined {
+      const table = priceTableFor()
+      return table === undefined ? undefined : (ref, tokens) => costOf(table, ref, tokens)
+    }
 
     // Panel state lives in the host's durable store, so the view, range, sort,
     // bucket and filters survive a restart and the command palette and the
@@ -94,6 +132,8 @@ export default Plugin.define({
     let databaseFailed = false
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let lastRefresh = 0
+    /** Per-session list estimate for the `sess` segment; cleared on every write event. */
+    const sessionCostCache = new Map<string, number>()
 
     /**
      * Ask the panel and the sidebar to re-read the database, at most once per
@@ -101,6 +141,7 @@ export default Plugin.define({
      * rest of a burst is folded into one trailing rebuild.
      */
     function bumpRefresh(): void {
+      sessionCostCache.clear()
       const now = Date.now()
       const wait = lastRefresh + REFRESH_THROTTLE_MS - now
       if (wait <= 0) {
@@ -136,6 +177,31 @@ export default Plugin.define({
     }
 
     /**
+     * The session's recorded list estimate, for the `sess` segment. One indexed
+     * sum per session between write events, cached so a long transcript does
+     * not pay for it on every recompute. A missing database or an older schema
+     * degrades to the host's charged total alone.
+     */
+    function sessionListCostFor(sessionID: string): number {
+      if (!pricing) return 0
+      const cached = sessionCostCache.get(sessionID)
+      if (cached !== undefined) return cached
+      const handle = db()
+      if (handle === undefined) return 0
+      try {
+        const value = sessionListCost(handle, sessionID)
+        if (sessionCostCache.size >= 512) {
+          const oldest = sessionCostCache.keys().next()
+          if (oldest.done !== true) sessionCostCache.delete(oldest.value)
+        }
+        sessionCostCache.set(sessionID, value)
+        return value
+      } catch {
+        return 0
+      }
+    }
+
+    /**
      * Write connection for maintenance only (prune, compact), opened for the
      * duration of the operation with a short busy timeout: a reader waits, but
      * a maintenance action that cannot take the lock is an error the user can
@@ -151,6 +217,18 @@ export default Plugin.define({
       } finally {
         handle?.close()
       }
+    }
+
+    /**
+     * Price every historical step the host recorded at $0 and that has no
+     * estimate yet. Explicit, because the catalog used is today's: a model
+     * that was free at the time is priced as it is now.
+     */
+    function backfill(): BackfillResult | undefined {
+      if (!pricing) return undefined
+      const table = priceTableFor()
+      if (table === undefined) return undefined
+      return withWrite((handle) => backfillListCost(handle, (ref, tokens) => costOf(table, ref, tokens)))
     }
 
     function sessionStart(sessionID: string): number | undefined {
@@ -178,9 +256,15 @@ export default Plugin.define({
       // so this function is recomputed on every streamed delta, and reading the
       // list there would be per-delta work for a line that is not shown.
       if (!sessionIdle(sessionID)) return undefined
+      // Track the shared write signal: a backfill or prune changes the session
+      // estimate without changing the transcript, and the line must recompute.
+      if (pricing) refresh()
       const messages = ctx.data.session.message.list(sessionID) as unknown as RuntimeMessage[]
       const info = ctx.data.session.get(sessionID) as unknown as RuntimeSessionInfo | undefined
-      return computeTurn(toTranscriptTail(messages, 2), sessionTotals(info))
+      // The host supplies the charged session total; the plugin database supplies
+      // the list estimate for the steps the host reported as $0.
+      const session = info === undefined ? undefined : sessionTotals(info, sessionListCostFor(sessionID))
+      return computeTurn(toTranscriptTail(messages, 2, priceFor()), session)
     }
 
     function toneColor(tone: LinePart["tone"]): ColorInput {
@@ -198,6 +282,7 @@ export default Plugin.define({
           labels: options.labels,
           fields: options.fields,
           turnTotals: options.turnTotals,
+          estimates: pricing,
         }),
       )
       return (
@@ -235,10 +320,10 @@ export default Plugin.define({
               <Panel
                 input={input}
                 ctx={ctx}
-                deps={{ db, dbPath: () => resolveDbPath(options.db), withWrite, now: () => Date.now(), sessionStart, refresh }}
+                deps={{ db, dbPath: () => resolveDbPath(options.db), withWrite, backfill, now: () => Date.now(), sessionStart, refresh, bump: bumpRefresh }}
                 settings={settings}
                 update={patchSettings}
-                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals }}
+                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, estimates: pricing }}
               />
             ) : null,
         })
@@ -252,7 +337,7 @@ export default Plugin.define({
             sessionID={input.sessionID}
             ctx={ctx}
             deps={{ db, refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 5)) }}
-            options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals }}
+            options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, estimates: pricing }}
           />
         ),
     })
@@ -326,11 +411,16 @@ export default Plugin.define({
       ctx.data.on("session.execution.failed", () => bumpRefresh()),
       ctx.data.on("session.execution.interrupted", () => bumpRefresh()),
       ctx.data.on("session.compaction.ended", () => bumpRefresh()),
+      // A price change invalidates the live line's table; the next line reads
+      // the catalog again (and the TTL keeps it fresh even without this event).
+      ctx.data.on("model.updated", () => {
+        priceCache = undefined
+      }),
     ]
 
     __test.line = lineFor
     __test.lineText = (sessionID: string) =>
-      lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields }))
+      lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields, estimates: pricing }))
     __test.open = open
     __test.state = () => {
       const current = sanitizeSettings(settings)

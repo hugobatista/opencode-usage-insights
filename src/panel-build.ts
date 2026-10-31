@@ -24,7 +24,7 @@ import {
   type LatencyGroupRow,
   type SwitchRow,
 } from "./stats/aggregates"
-import { childSessionIDs, modelKey, models, overview, sessionUsageOf, sessions, STEP_TIME, turns, type Filters } from "./stats/queries"
+import { childSessionIDs, modelKey, models, overview, sessionUsageOf, sessions, spend, STEP_TIME, turns, type Filters } from "./stats/queries"
 import type { DbInfo } from "./stats/maintenance"
 import {
   cacheLines,
@@ -76,6 +76,8 @@ export type PanelRequest = {
   database?: DbInfo | undefined
   /** Set when the last vacuum could not take the write lock. */
   busy?: boolean | undefined
+  /** `false` hides list-price estimates in every view. */
+  estimates?: boolean | undefined
   width: number
 }
 
@@ -132,12 +134,13 @@ export function buildPanel(request: PanelRequest): PanelLine[] {
 
 function build(request: PanelRequest): PanelLine[] {
   const { db, view, now, sessionStart, width } = request
+  const estimates = request.estimates !== false
   // The `session` range is the session itself, not "everything recorded after it
   // started": siblings and subagents run in that window too.
   const scoped = request.range === "session" && request.sessionID !== ""
   const range = scoped ? undefined : request.range === "session" ? (sessionStart === undefined ? undefined : { from: sessionStart }) : rangeForRequest(request.range, now)
   const filters: Filters = scoped ? { ...request.filters, sessionID: request.sessionID } : request.filters
-  if (request.detail !== undefined) return buildDetail(request, range, filters)
+  if (request.detail !== undefined) return buildDetail(request, range, filters, estimates)
 
   switch (view) {
     case "overview": {
@@ -156,12 +159,13 @@ function build(request: PanelRequest): PanelLine[] {
           range: request.range,
           activity: activityOf(db, range, now),
           coverage: coverageOf(db, { range, filters }),
+          estimates,
         },
         width,
       )
     }
     case "models": {
-      const rows = sortModels(models(db, range, filters), request.sort, request.sortDesc)
+      const rows = sortModels(models(db, range, filters), request.sort, request.sortDesc, estimates)
       // One read of the pairs serves the reuse table and the switch counts.
       const pairs = cachePairs(db, { range, filters })
       const switches = switchesOf(pairs)
@@ -173,10 +177,16 @@ function build(request: PanelRequest): PanelLine[] {
           switches: switchesByModel(switches.rows),
         },
         40,
+        estimates,
       )
     }
     case "providers":
-      return providerSummaryLines(sortProviders(providerSummaryOf(stepRows(db, { range, filters })), request.sort, request.sortDesc), width, 40)
+      return providerSummaryLines(
+        sortProviders(providerSummaryOf(stepRows(db, { range, filters })), request.sort, request.sortDesc, estimates),
+        width,
+        40,
+        estimates,
+      )
     case "cache": {
       // One read of the pairs serves the losses, the TTL bounds and the
       // survival buckets: they are three views of the same comparison.
@@ -192,19 +202,30 @@ function build(request: PanelRequest): PanelLine[] {
       )
     }
     case "periods":
-      return periodLines(periodsOf(stepRows(db, { range, filters }), request.granularity), width, request.granularity, 40)
+      return periodLines(periodsOf(stepRows(db, { range, filters }), request.granularity), width, request.granularity, 40, estimates)
     case "latency": {
       // One read of the timings serves the overall block and the group table.
       const timings = timingRows(db, { range, filters })
       const by: Dimension = filters.modelID !== undefined ? "provider" : "model"
-      return latencyLines(latencyOf(timings), width, sortLatency(latencyGroupsOf(timings, by), request.sort, request.sortDesc), 14)
+      return latencyLines(
+        latencyOf(timings),
+        width,
+        sortLatency(latencyGroupsOf(timings, by), request.sort, request.sortDesc),
+        14,
+        estimates,
+      )
     }
     case "sessions": {
-      const rows = sortSessions(sessions(db, { range, filters, limit: 200 }), request.sort, request.sortDesc)
+      const rows = sortSessions(sessions(db, { range, filters, limit: 200 }), request.sort, request.sortDesc, estimates)
       const child = rows.filter((row) => row.parentID !== undefined && rows.some((parent) => parent.sessionID === row.parentID))
       return sessionsLines(rows, width, {
         limit: 20,
-        rollup: { subagentSteps: child.reduce((sum, row) => sum + row.steps, 0), subagentCost: child.reduce((sum, row) => sum + row.cost, 0) },
+        estimates,
+        rollup: {
+          subagentSteps: child.reduce((sum, row) => sum + row.steps, 0),
+          subagentCost: child.reduce((sum, row) => sum + row.cost, 0),
+          subagentListCost: child.reduce((sum, row) => sum + row.listCost, 0),
+        },
       })
     }
     case "db":
@@ -212,15 +233,15 @@ function build(request: PanelRequest): PanelLine[] {
       // builder without them says so instead of inventing a location.
       return request.database === undefined
         ? [{ text: "the database location is unavailable to this panel", tone: "warning" }]
-        : dbLines({ info: request.database, busy: request.busy, now }, width)
+        : dbLines({ info: request.database, busy: request.busy, now, estimates }, width)
     case "turns": {
       const sessionID = request.turnsScope === "session" ? request.sessionID : undefined
-      const rows = sortTurns(turns(db, { sessionID, range, filters, limit: 300 }), request.sort, request.sortDesc)
+      const rows = sortTurns(turns(db, { sessionID, range, filters, limit: 300 }), request.sort, request.sortDesc, estimates)
       const titles =
         request.turnsScope === "all"
           ? new Map(sessions(db, { range, filters, limit: 200 }).map((row) => [row.sessionID, row.title ?? row.sessionID]))
           : undefined
-      return turnsLines(rows.slice(0, 60), width, { ...request.format, sessionTitles: titles })
+      return turnsLines(rows.slice(0, 60), width, { ...request.format, estimates, sessionTitles: titles })
     }
   }
 }
@@ -249,6 +270,7 @@ function buildDetail(
   request: PanelRequest,
   range: { from?: number | undefined; to?: number | undefined } | undefined,
   filters: Filters,
+  estimates: boolean,
 ): PanelLine[] {
   const row = request.detail!
   const db = request.db
@@ -274,18 +296,18 @@ function buildDetail(
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...providerLines(providerBreakdownOf(steps), width, 40),
+      ...providerLines(providerBreakdownOf(steps), width, 40, estimates),
       { text: "", tone: "muted" },
       // One model, so its latency is worth reading per provider: that is what
       // the model's own identity no longer separates.
-      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "provider"), 14),
+      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "provider"), 14, estimates),
       { text: "", tone: "muted" },
       back,
     ]
   }
   if (row.kind === "session" || row.kind === "turn") {
     const rows = turns(db, { sessionID: row.value, limit: 80 })
-    return [head, { text: "", tone: "muted" }, ...turnsLines(rows, width, request.format), { text: "", tone: "muted" }, back]
+    return [head, { text: "", tone: "muted" }, ...turnsLines(rows, width, { ...request.format, estimates }), { text: "", tone: "muted" }, back]
   }
   if (row.kind === "provider") {
     // A provider detail: every model it served, then its latency.
@@ -302,9 +324,9 @@ function buildDetail(
         tone: "muted",
       },
       { text: "", tone: "muted" },
-      ...providerLines(providerBreakdownOf(steps), width, 40),
+      ...providerLines(providerBreakdownOf(steps), width, 40, estimates),
       { text: "", tone: "muted" },
-      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "model"), 14),
+      ...latencyLines(latencyOf(steps), width, latencyGroupsOf(steps, "model"), 14, estimates),
       { text: "", tone: "muted" },
       back,
     ]
@@ -317,7 +339,7 @@ function buildDetail(
       head,
       { text: `${formatCount(period?.steps ?? 0)} steps`, tone: "muted" },
       { text: "", tone: "muted" },
-      ...providerSummaryLines(providerSummaryOf(stepRows(db, { range, filters })), width, 40),
+      ...providerSummaryLines(providerSummaryOf(stepRows(db, { range, filters })), width, 40, estimates),
       { text: "", tone: "muted" },
       back,
     ]
@@ -333,23 +355,23 @@ function percent(value: number | undefined): string {
 // Sorting
 // ---------------------------------------------------------------------------
 
-function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean): ReturnType<typeof models> {
+function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean, estimates = true): ReturnType<typeof models> {
   const sign = desc ? -1 : 1
   const pick = (model: (typeof rows)[number]): number => {
     if (sort === "cached") return model.totals.cached
     if (sort === "out") return model.totals.output
-    if (sort === "cost") return model.totals.cost
+    if (sort === "cost") return estimates ? spend(model.totals) : model.totals.cost
     return model.totals.steps
   }
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortProviders(rows: readonly ProviderSummary[], sort: string, desc: boolean): ProviderSummary[] {
+function sortProviders(rows: readonly ProviderSummary[], sort: string, desc: boolean, estimates = true): ProviderSummary[] {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "cached") return row.cache.cached
     if (sort === "hit") return row.cache.hit ?? -1
-    if (sort === "cost") return row.usage.cost
+    if (sort === "cost") return estimates ? spend(row.usage) : row.usage.cost
     if (sort === "share") return row.share
     if (sort === "tps") return row.tps ?? -1
     return row.usage.steps
@@ -367,21 +389,21 @@ function sortLatency(rows: readonly LatencyGroupRow[], sort: string, desc: boole
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortSessions(rows: ReturnType<typeof sessions>, sort: string, desc: boolean): ReturnType<typeof sessions> {
+function sortSessions(rows: ReturnType<typeof sessions>, sort: string, desc: boolean, estimates = true): ReturnType<typeof sessions> {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "steps") return row.steps
     if (sort === "cached") return row.cached
-    if (sort === "cost") return row.cost
+    if (sort === "cost") return estimates ? spend(row) : row.cost
     return row.lastAt ?? 0
   }
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
 }
 
-function sortTurns(rows: ReturnType<typeof turns>, sort: string, desc: boolean): ReturnType<typeof turns> {
+function sortTurns(rows: ReturnType<typeof turns>, sort: string, desc: boolean, estimates = true): ReturnType<typeof turns> {
   const sign = desc ? -1 : 1
   const pick = (row: (typeof rows)[number]): number => {
-    if (sort === "cost") return row.totals.cost
+    if (sort === "cost") return estimates ? spend(row.totals) : row.totals.cost
     if (sort === "tokens") return row.totals.cached + row.totals.input + row.totals.output
     return row.endAt ?? 0
   }

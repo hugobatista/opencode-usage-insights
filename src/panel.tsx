@@ -24,7 +24,7 @@ import {
   type PanelView,
 } from "./panel-data"
 import { filterOptions, type Filters } from "./stats/queries"
-import { dbInfo, pruneOlderThan, vacuum, type DbInfo } from "./stats/maintenance"
+import { dbInfo, pruneOlderThan, vacuum, type BackfillResult, type DbInfo } from "./stats/maintenance"
 
 /**
  * The `/usage` panel. One read-only view over the stats database at a time,
@@ -47,12 +47,19 @@ export type PanelDeps = {
    * ever taking the recorder's lock. Undefined when the write cannot be made.
    */
   withWrite?: (<Value>(run: (db: Database) => Value) => Value | undefined) | undefined
+  /** Price the historical $0 steps that have no estimate yet. */
+  backfill?: (() => BackfillResult | undefined) | undefined
   /** Injectable clock, for tests. */
   now: () => number
   /** Creation time of a session, used by the `session` range. */
   sessionStart: (sessionID: string) => number | undefined
   /** Bumped by the TUI when a step or an execution ends, so views re-read. */
   refresh?: (() => number) | undefined
+  /**
+   * Ask the TUI to rebuild every read view after a maintenance write. The
+   * panel has its own tick; the sidebar observes the TUI's shared signal.
+   */
+  bump?: (() => void) | undefined
 }
 
 type Scroller = { scrollChildIntoView?: ((id: string) => void) | undefined }
@@ -126,6 +133,7 @@ export function Panel(props: {
       sessionStart: props.deps.sessionStart(props.input.sessionID),
       now: props.deps.now(),
       format: props.format,
+      estimates: props.format?.estimates !== false,
       ...(detail() !== undefined ? { detail: detail() } : {}),
       ...(info !== undefined ? { database: info } : {}),
       busy: busy(),
@@ -236,6 +244,50 @@ export function Panel(props: {
     }
     setAnchor(undefined)
     setTick((value) => value + 1)
+    // A batched prune can have committed some batches before failing; the
+    // sidebar reads the same database but has no tick of its own.
+    props.deps.bump?.()
+  }
+
+  /** Price the historical steps the host recorded at $0. */
+  async function backfillEstimates(): Promise<void> {
+    if (props.format?.estimates === false) {
+      props.ctx.ui.toast.show({ message: "list-price estimates are turned off", variant: "warning" })
+      return
+    }
+    if (sessionRunning()) {
+      props.ctx.ui.toast.show({ message: "the session is running: backfill again when it is idle", variant: "warning" })
+      return
+    }
+    const info = database()
+    if (info !== undefined && info.schemaVersion < 10) {
+      props.ctx.ui.toast.show({ message: "the recorder must upgrade the database before estimates can be backfilled", variant: "warning" })
+      return
+    }
+    const candidates = info?.unpriced ?? 0
+    if (candidates === 0) {
+      props.ctx.ui.toast.show({ message: "every $0 step already has a list estimate" })
+      return
+    }
+    const confirmed = await props.ctx.ui.dialog.confirm({
+      title: "Backfill list-price estimates",
+      message: `${formatCount(candidates)} steps recorded at $0 have no estimate. Those with a known catalog price will be filled using today's catalog; models the catalog no longer lists stay unknown.`,
+      label: { confirm: "Backfill", cancel: "Cancel" },
+    })
+    if (confirmed !== true) return
+    const result = props.deps.backfill?.()
+    if (result === undefined) {
+      props.ctx.ui.toast.show({ message: "the price catalog is unavailable: try again in a moment", variant: "warning" })
+    } else {
+      props.ctx.ui.toast.show({
+        message: `backfilled ${formatCount(result.updated)} of ${formatCount(result.candidates)} steps`,
+        variant: result.updated === 0 ? "warning" : "success",
+      })
+    }
+    setTick((value) => value + 1)
+    // A backfill can have committed some batches before failing; re-read even
+    // when the final result is unknown.
+    props.deps.bump?.()
   }
 
   /** Give the space a prune freed back to the filesystem. */
@@ -358,6 +410,9 @@ export function Panel(props: {
           setAnchor(undefined)
         }),
         command("usage-insights.refresh", "Refresh", "r", () => setTick((value) => value + 1)),
+        command("usage-insights.backfill", "Backfill list-price estimates", "e", () => {
+          if (view() === "db") void backfillEstimates()
+        }),
         command("usage-insights.vacuum", "Compact the database", "v", () => void compact()),
         command("usage-insights.help", "Help", "?", () => setHelp((open) => !open)),
         command("usage-insights.fullscreen", "Toggle full screen", "f", () => props.input.toggleFullscreen()),

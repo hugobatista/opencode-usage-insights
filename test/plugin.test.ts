@@ -33,7 +33,7 @@ afterAll(() => {
 
 const MODEL = { providerID: "opencode", id: "deepseek-v4.1-flash-free" }
 
-function turn(messageID: string, overrides: { model?: RuntimeModel; tokens?: RuntimeTokens; completedAt?: number } = {}): RuntimeMessage[] {
+function turn(messageID: string, overrides: { model?: RuntimeModel; tokens?: RuntimeTokens; cost?: number; completedAt?: number } = {}): RuntimeMessage[] {
   return [
     { id: `prt_${messageID}`, type: "user", time: { created: at(200) } },
     {
@@ -42,7 +42,7 @@ function turn(messageID: string, overrides: { model?: RuntimeModel; tokens?: Run
       time: { created: at(201), streamed: at(202), completed: overrides.completedAt ?? at(205) },
       model: overrides.model ?? MODEL,
       tokens: overrides.tokens ?? { input: 1_000, output: 50, reasoning: 0, cache: { read: 1_534_000, write: 0 } },
-      cost: 0.02,
+      cost: overrides.cost ?? 0.02,
     },
   ]
 }
@@ -194,6 +194,93 @@ describe("telemetry line", () => {
       `${formatClock(at(205))} · Δ 3m20s · opencode/deepseek-v4.1-flash-free · in 1k (1.53M), cached 1.53M, out 50, cost $0.0200 · sess in 132k (2.13M), cached 2M, out 5k, cost $0.5000`,
     )
     expect(harness.state()).toEqual({ view: "overview", range: "all" })
+  })
+
+  test("shows a list-price estimate for a Go step the host reported as $0", () => {
+    const estimateModel = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
+    const tokens = { input: 2_591, output: 564, reasoning: 3_239, cache: { read: 514_944, write: 0 } }
+    const harness = init({
+      models: [
+        {
+          ...estimateModel,
+          modelID: estimateModel.id,
+          cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }],
+        },
+      ],
+      sessions: [session({ id: "ses_estimate", messages: [...FIRST_TURN, ...turn("msg_2", { model: estimateModel, tokens, cost: 0 })] })],
+    })
+    const line = harness.lineText("ses_estimate")
+    expect(line).toContain("cost ≈ $0.0042")
+    // The session is still the host's charged total.
+    expect(line).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost $0.5000")
+  })
+
+  test("shows the recorded session estimate in the sess segment", () => {
+    const db = openStatsDb(resolveDbPath())
+    recordStep(db, {
+      messageID: "msg_session_estimate",
+      sessionID: "ses_session_estimate",
+      cost: 0,
+      listCost: 0.2,
+      input: 1_000,
+      createdAt: at(1),
+      completedAt: at(2),
+    })
+    db.close()
+
+    const harness = init({ sessions: [session({ id: "ses_session_estimate", cost: 0 })] })
+    expect(harness.lineText("ses_session_estimate")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.2000")
+  })
+
+  test("refreshes the session estimate after a write event", () => {
+    const db = openStatsDb(resolveDbPath())
+    recordStep(db, {
+      messageID: "msg_session_refresh_a",
+      sessionID: "ses_session_refresh",
+      cost: 0,
+      listCost: 0.2,
+      input: 1_000,
+      createdAt: at(1),
+      completedAt: at(2),
+    })
+    db.close()
+
+    const harness = init({ sessions: [session({ id: "ses_session_refresh", cost: 0 })] })
+    expect(harness.lineText("ses_session_refresh")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.2000")
+
+    const writer = openStatsDb(resolveDbPath())
+    recordStep(writer, {
+      messageID: "msg_session_refresh_b",
+      sessionID: "ses_session_refresh",
+      cost: 0,
+      listCost: 0.1,
+      input: 1_000,
+      createdAt: at(3),
+      completedAt: at(4),
+    })
+    writer.close()
+
+    // The next step event clears the line's per-session cache.
+    harness.emit("session.step.ended")
+    expect(harness.lineText("ses_session_refresh")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.3000")
+  })
+
+  test("hides estimates when pricing is off", () => {
+    const estimateModel = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
+    const harness = init({
+      options: { pricing: "off" },
+      models: [{ ...estimateModel, modelID: estimateModel.id, cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }] }],
+      sessions: [
+        session({
+          id: "ses_no_estimate",
+          messages: [
+            ...FIRST_TURN,
+            ...turn("msg_2", { model: estimateModel, tokens: { input: 2_591, output: 564, reasoning: 3_239, cache: { read: 514_944, write: 0 } }, cost: 0 }),
+          ],
+        }),
+      ],
+    })
+    expect(harness.lineText("ses_no_estimate")).not.toContain("≈")
   })
 
   test("has no line before the first response and after cleanup", () => {
@@ -385,6 +472,83 @@ describe("rendering", () => {
       expect(countOccurrences(after, MODEL.id)).toBe(1)
       expect(after).toContain("in 2k (1.54M), cached 1.54M, out 60")
       expect(after).not.toContain("in 1k (1.53M)")
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("replaces a charged cost with a list-price estimate on update", async () => {
+    const estimateModel = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
+    const harness = init({
+      models: [
+        {
+          ...estimateModel,
+          modelID: estimateModel.id,
+          cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }],
+        },
+      ],
+      sessions: [session({ id: "ses_render_estimate" })],
+    })
+    const claim = harness.claim("session.composer.top")!
+    const setup = await testRender(() => claim.render({ sessionID: "ses_render_estimate" } as never) as never, { width: 140, height: 8 })
+    try {
+      await setup.renderOnce()
+      expect(treeText(setup)).not.toContain("≈")
+      expect(treeText(setup)).toContain("cost $0.0200")
+
+      harness.setMessages("ses_render_estimate", [
+        ...FIRST_TURN,
+        ...turn("msg_2", {
+          model: estimateModel,
+          tokens: { input: 2_591, output: 564, reasoning: 3_239, cache: { read: 514_944, write: 0 } },
+          cost: 0,
+        }),
+      ])
+      await setup.renderOnce()
+      const text = treeText(setup)
+      expect(countOccurrences(text, "≈")).toBe(1)
+      expect(text).toContain("cost ≈ $0.0042")
+      expect(text).not.toContain("cost $0.0200")
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("updates the session estimate when the shared write signal fires", async () => {
+    const db = openStatsDb(resolveDbPath())
+    recordStep(db, {
+      messageID: "msg_render_session_a",
+      sessionID: "ses_render_session",
+      cost: 0,
+      listCost: 0.2,
+      input: 1_000,
+      createdAt: at(1),
+      completedAt: at(2),
+    })
+    db.close()
+
+    const harness = init({ sessions: [session({ id: "ses_render_session", cost: 0 })] })
+    const claim = harness.claim("session.composer.top")!
+    const setup = await testRender(() => claim.render({ sessionID: "ses_render_session" } as never) as never, { width: 160, height: 6 })
+    try {
+      await setup.renderOnce()
+      expect(treeText(setup)).toContain("cost ≈ $0.2000")
+
+      const writer = openStatsDb(resolveDbPath())
+      recordStep(writer, {
+        messageID: "msg_render_session_b",
+        sessionID: "ses_render_session",
+        cost: 0,
+        listCost: 0.1,
+        input: 1_000,
+        createdAt: at(3),
+        completedAt: at(4),
+      })
+      writer.close()
+
+      harness.emit("session.step.ended")
+      await setup.renderOnce()
+      expect(treeText(setup)).toContain("cost ≈ $0.3000")
     } finally {
       await setup.dispose()
     }
@@ -660,6 +824,91 @@ describe("the db view's maintenance", () => {
       expect(harness.dialogs[0]!.message).toContain("would be deleted")
       expect(harness.toasts[0]?.message).toContain("pruned 1 steps")
       expect(stepIDs()).toEqual(["msg_new"])
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("backfills the $0 steps at today's list price", async () => {
+    const db = openStatsDb(resolveDbPath())
+    recordStep(db, {
+      messageID: "msg_backfill",
+      sessionID: "ses_panel_backfill",
+      providerID: "opencode-go",
+      modelID: "deepseek-v4.1-flash",
+      input: 1_000_000,
+      cost: 0,
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+    })
+    db.close()
+
+    const harness = init({
+      sessions: [session({ id: "ses_panel_backfill" })],
+      confirm: true,
+      models: [{ providerID: "opencode-go", modelID: "deepseek-v4.1-flash", cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }] }],
+    })
+    // The sidebar is mounted before the write: it must receive the same refresh
+    // signal the panel gets, not just re-read the database on some later event.
+    const sidebarClaim = harness.claim("sidebar.content")!
+    const sidebar = await testRender(() => sidebarClaim.render({ sessionID: "ses_panel_backfill" } as never) as never, { width: 60, height: 12 })
+    await sidebar.renderOnce()
+    expect(treeText(sidebar)).toContain("$0")
+
+    harness.command("usage-insights.stats")!.run("db")
+    const claim = harness.claim("session.panel")!
+    const input = { name: PANEL_NAME, sessionID: "ses_panel_backfill", width: 110, presentation: "panel", focused: false }
+    const setup = await testRender(() => claim.render(input as never) as never, { width: 120, height: 30 })
+    try {
+      await setup.renderOnce()
+      harness.command("usage-insights.backfill")!.run()
+      // The refresh is throttled: let the trailing rebuild land before asserting.
+      await Bun.sleep(350)
+      expect(harness.toasts.some((toast) => toast.message.includes("backfilled"))).toBe(true)
+      await sidebar.renderOnce()
+      expect(treeText(sidebar)).toContain("≈ $0.1500")
+      const check = openStatsDb(resolveDbPath())
+      const row = check.query("SELECT list_cost FROM steps WHERE message_id = 'msg_backfill'").get() as { list_cost: number }
+      expect(row.list_cost).toBeCloseTo(0.15, 10)
+      check.close()
+    } finally {
+      await setup.dispose()
+      await sidebar.dispose()
+    }
+  })
+
+  test("refuses the backfill when pricing is off", async () => {
+    const db = openStatsDb(resolveDbPath())
+    recordStep(db, {
+      messageID: "msg_no_backfill",
+      sessionID: "ses_panel_no_backfill",
+      providerID: "opencode-go",
+      modelID: "deepseek-v4.1-flash",
+      input: 1_000_000,
+      cost: 0,
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+    })
+    db.close()
+
+    const harness = init({
+      options: { pricing: "off" },
+      sessions: [session({ id: "ses_panel_no_backfill" })],
+      confirm: true,
+      models: [{ providerID: "opencode-go", modelID: "deepseek-v4.1-flash", cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }] }],
+    })
+    harness.command("usage-insights.stats")!.run("db")
+    const claim = harness.claim("session.panel")!
+    const input = { name: PANEL_NAME, sessionID: "ses_panel_no_backfill", width: 110, presentation: "panel", focused: false }
+    const setup = await testRender(() => claim.render(input as never) as never, { width: 120, height: 30 })
+    try {
+      await setup.renderOnce()
+      harness.command("usage-insights.backfill")!.run()
+      await Bun.sleep(5)
+      expect(harness.toasts.some((toast) => toast.message.includes("turned off"))).toBe(true)
+      const check = openStatsDb(resolveDbPath())
+      expect((check.query("SELECT list_cost FROM steps WHERE message_id = 'msg_no_backfill'").get() as { list_cost: null }).list_cost).toBeNull()
+      check.close()
     } finally {
       await setup.dispose()
     }

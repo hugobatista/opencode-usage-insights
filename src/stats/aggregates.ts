@@ -79,6 +79,7 @@ export type StepRow = {
   output: number
   reasoning: number
   cost: number
+  listCost: number
   createdAt: number | undefined
   streamedAt: number | undefined
   completedAt: number | undefined
@@ -92,6 +93,7 @@ const STEP_COLUMNS = `message_id AS messageID, session_id AS sessionID, provider
        model_id AS modelID, variant,
        COALESCE(input_tokens, 0) AS input, COALESCE(cache_read, 0) AS cached, COALESCE(cache_write, 0) AS cacheWrite,
        COALESCE(output_tokens, 0) AS output, COALESCE(reasoning_tokens, 0) AS reasoning, COALESCE(cost, 0) AS cost,
+       COALESCE(list_cost, 0) AS listCost,
        created_at AS createdAt, streamed_at AS streamedAt, completed_at AS completedAt, ${STEP_AT} AS at`
 
 const STEP_OPTIONAL = ["providerID", "modelID", "variant", "createdAt", "streamedAt", "completedAt"] as const
@@ -181,11 +183,11 @@ function pairsOf(rows: readonly PairRow[]): Array<{ previous: PairRow; current: 
   return pairs
 }
 
-type Counted = { input: number; cached: number; cacheWrite: number; output: number; reasoning: number; cost: number }
+type Counted = { input: number; cached: number; cacheWrite: number; output: number; reasoning: number; cost: number; listCost: number }
 
 /** The buckets the panel and the line agree on. */
 function usageOf(steps: readonly Counted[]): Usage {
-  const usage: Usage = { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0 }
+  const usage: Usage = { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 }
   for (const step of steps) {
     usage.steps += 1
     usage.input += step.input
@@ -194,6 +196,7 @@ function usageOf(steps: readonly Counted[]): Usage {
     usage.output += step.output
     usage.reasoning += step.reasoning
     usage.cost += step.cost
+    usage.listCost += step.listCost
   }
   return usage
 }

@@ -27,6 +27,8 @@ export type AssistantMessage = {
       }
     | undefined
   cost?: number | undefined
+  /** List-price estimate for a step the host reported as costing nothing. */
+  listCost?: number | undefined
   finish?: string | null | undefined
   rawFinish?: string | null | undefined
 }
@@ -50,6 +52,8 @@ export type Totals = {
   reasoning: number
   cacheWrite: number
   cost: number
+  /** Sum of list-price estimates for steps the host reported as $0. */
+  listCost: number
   steps: number
 }
 
@@ -170,7 +174,7 @@ export function tokenCounts(message: AssistantMessage): { input: number; output:
 }
 
 export function totalize(steps: readonly AssistantMessage[]): Totals {
-  const totals: Totals = { input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, steps: steps.length }
+  const totals: Totals = { input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, listCost: 0, steps: steps.length }
   for (const step of steps) {
     const counts = tokenCounts(step)
     totals.input += counts.input
@@ -179,6 +183,7 @@ export function totalize(steps: readonly AssistantMessage[]): Totals {
     totals.reasoning += counts.reasoning
     totals.cacheWrite += counts.write
     totals.cost += step.cost ?? 0
+    totals.listCost += step.listCost ?? 0
   }
   return totals
 }
@@ -382,6 +387,8 @@ export type LineLabels = {
   output: string
   reasoning: string
   cost: string
+  /** Prefix for a list-price estimate, e.g. `cost ≈ $0.03`. */
+  estimate: string
   cacheExpired: string
   providerChanged: string
   modelChanged: string
@@ -420,6 +427,7 @@ export const DEFAULT_LABELS: LineLabels = {
   output: "out",
   reasoning: "reason",
   cost: "cost",
+  estimate: "≈",
   cacheExpired: "cache expired",
   providerChanged: "changed",
   modelChanged: "model changed",
@@ -483,6 +491,32 @@ export function formatCost(value: number): string {
 }
 
 /**
+ * Charged and estimated money as one string. A mixed total keeps both parts
+ * visible so list price is never mistaken for money that was charged:
+ * `$0.12 + ≈ $3.40`. Returns undefined when there is no money to show.
+ */
+export function formatMoney(charged: number, estimated: number, marker = "≈"): string | undefined {
+  const paid = Number.isFinite(charged) && charged > 0 ? formatCost(charged) : undefined
+  const estimate =
+    Number.isFinite(estimated) && estimated > 0
+      ? `${marker.trim() === "" ? "" : `${marker.trim()} `}${formatCost(estimated)}`
+      : undefined
+  if (paid !== undefined && estimate !== undefined) return `${paid} + ${estimate}`
+  return paid ?? estimate
+}
+
+/**
+ * The list-equivalent total for a compact table cell: charged money plus the
+ * estimates, marked with `≈` when any part is estimated.
+ */
+export function formatSpend(charged: number, estimated: number, marker = "≈"): string {
+  const paid = Number.isFinite(charged) ? Math.max(0, charged) : 0
+  const estimate = Number.isFinite(estimated) ? Math.max(0, estimated) : 0
+  if (estimate > 0) return `${marker.trim()}${formatCost(paid + estimate)}`
+  return formatCost(paid)
+}
+
+/**
  * The buckets the line displays, derived from a totals group. `input` is the
  * *uncached* part of the prompt (fresh input plus cache writes, i.e. what the
  * debug line's `new` counts on the prompt side), `prompt` is the whole prompt
@@ -505,6 +539,7 @@ export function displayTotals(totals: Totals): DisplayTotals {
     output: totals.output + totals.reasoning,
     reasoning: totals.reasoning,
     cost: totals.cost,
+    listCost: totals.listCost,
     steps: totals.steps,
     prompt,
   }
@@ -514,9 +549,18 @@ export function displayTotals(totals: Totals): DisplayTotals {
  * The numbers of one totals group. `cost` is passed explicitly because the two
  * callers mean different money: a turn's cost is the sum over its steps
  * whatever view its tokens follow, and money never comes from a "latest" step.
- * A zero cost is left out of the line.
+ * A charged cost of zero is left out; a list-price estimate is shown with `≈`.
  */
-function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: LineFields, stepCount = 0, cost = totals.cost): string {
+function totalsText(
+  prefix: string,
+  totals: Totals,
+  labels: LineLabels,
+  fields: LineFields,
+  stepCount = 0,
+  cost = totals.cost,
+  listCost = totals.listCost,
+  estimates = true,
+): string {
   const display = displayTotals(totals)
   // The parenthesised value is the whole prompt, shown only when it differs
   // from the uncached part the label leads with.
@@ -530,7 +574,8 @@ function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: 
     `${labels.output} ${formatTokens(display.output)}`,
   ]
   if (fields.reasoning) parts.push(`${labels.reasoning} ${formatTokens(display.reasoning)}`)
-  if (fields.cost && cost > 0) parts.push(`${labels.cost} ${formatCost(cost)}`)
+  const money = fields.cost ? formatMoney(cost, estimates ? listCost : 0, labels.estimate) : undefined
+  if (money !== undefined) parts.push(`${labels.cost} ${money}`)
   // An empty label (the default for the turn) leaves the numbers unlabelled; a
   // multi-step turn still says how many requests it took.
   const steps = stepCount > 1 ? `${stepCount} ${stepCount === 1 ? labels.step : labels.steps}` : ""
@@ -546,11 +591,12 @@ function totalsText(prefix: string, totals: Totals, labels: LineLabels, fields: 
  */
 export function formatLineSegments(
   stats: TurnStats,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; estimates?: boolean },
 ): LineSegment[] {
   const labels = { ...DEFAULT_LABELS, ...options?.labels }
   const fields = { ...DEFAULT_FIELDS, ...options?.fields }
   const turnTotals = options?.turnTotals ?? "latest"
+  const estimates = options?.estimates !== false
   const segments: LineSegment[] = []
 
   if (fields.clock && stats.endAt !== undefined) {
@@ -576,12 +622,24 @@ export function formatLineSegments(
     // — but money is paid per step: the turn's cost is the sum over its steps,
     // never the last step's share of it.
     segments.push({
-      text: totalsText(labels.turn, totals, labels, fields, turnTotals === "sum" ? stats.totals.steps : stats.steps, stats.totals.cost),
+      text: totalsText(
+        labels.turn,
+        totals,
+        labels,
+        fields,
+        turnTotals === "sum" ? stats.totals.steps : stats.steps,
+        stats.totals.cost,
+        stats.totals.listCost,
+        estimates,
+      ),
       tone: "base",
     })
   }
   if (fields.session && stats.session) {
-    segments.push({ text: totalsText(labels.session, stats.session, labels, fields, 0, stats.session.cost), tone: "muted" })
+    segments.push({
+      text: totalsText(labels.session, stats.session, labels, fields, 0, stats.session.cost, stats.session.listCost, estimates),
+      tone: "muted",
+    })
   }
   if (fields.cacheExpiry && stats.cacheExpired) {
     const count = stats.drops.length > 1 ? `×${stats.drops.length}` : ""
@@ -592,7 +650,7 @@ export function formatLineSegments(
 
 export function formatLine(
   stats: TurnStats,
-  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView },
+  options?: { labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView; estimates?: boolean },
 ): string {
   return formatLineSegments(stats, options)
     .map((segment) => segment.text)

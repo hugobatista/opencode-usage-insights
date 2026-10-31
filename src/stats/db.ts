@@ -20,7 +20,7 @@ import { isToken, sanitizeLabel, TEXT_LIMIT } from "../text"
  *   that gives up quickly instead of holding the recorder up.
  */
 
-export const SCHEMA_VERSION = 9
+export const SCHEMA_VERSION = 10
 
 /** Longest title or path kept: a label on a line, not a document. */
 const LABEL_LIMIT = 4 * TEXT_LIMIT
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS steps (
   cache_read INTEGER NOT NULL DEFAULT 0,
   cache_write INTEGER NOT NULL DEFAULT 0,
   cost REAL NOT NULL DEFAULT 0,
+  list_cost REAL,
   created_at INTEGER,
   streamed_at INTEGER,
   completed_at INTEGER,
@@ -108,6 +109,12 @@ export type StepRecord = {
   cacheRead?: number | undefined
   cacheWrite?: number | undefined
   cost?: number | undefined
+  /**
+   * List-price estimate for a step the host reported as costing nothing.
+   * `0` means a known free model; `NULL` means charged money or an unknown
+   * price.
+   */
+  listCost?: number | undefined
   createdAt?: number | undefined
   streamedAt?: number | undefined
   completedAt?: number | undefined
@@ -189,13 +196,25 @@ function dropUnused(db: Database): void {
 }
 
 /**
- * Bring an existing file up to date. There is no version ladder: a column the
- * schema carries is created with the table, and a column the recorder stopped
- * writing is dropped by `dropUnused`, which is idempotent and also heals a
- * database a half-applied run left behind.
+ * Add the columns a newer recorder writes. `CREATE TABLE IF NOT EXISTS` does
+ * not touch a table that already exists, so a column added to `SCHEMA` after a
+ * database was created has to be added here too. The check is idempotent and
+ * also heals a database a half-applied run left behind.
+ */
+function addMissing(db: Database): void {
+  const columns = new Set((db.query("PRAGMA table_info(steps)").all() as { name: string }[]).map((column) => column.name))
+  if (columns.size > 0 && !columns.has("list_cost")) {
+    db.exec("ALTER TABLE steps ADD COLUMN list_cost REAL")
+  }
+}
+
+/**
+ * Bring an existing file up to date: drop what no view reads, then add what a
+ * newer recorder writes. Both steps are idempotent.
  */
 function migrate(db: Database): void {
   dropUnused(db)
+  addMissing(db)
 }
 
 /**
@@ -287,7 +306,9 @@ export function openStatsDbWrite(path: string): Database {
  * Insert or refresh an assistant step. Idempotent by message ID so replayed
  * events, restarts and NDJSON imports never duplicate usage. A non-null field
  * (the provider, the model, the finish reason) survives a re-record with `NULL`
- * through COALESCE.
+ * through COALESCE. `list_cost` follows the opposite rule: a step that becomes
+ * charged loses its estimate, and an estimate survives a replay that carries
+ * no price table.
  *
  * The provider is the identity every view groups by, so it is validated as a
  * token before it is stored: a value that is not a provider id is recorded as
@@ -297,11 +318,11 @@ export function recordStep(db: Database, record: StepRecord): void {
   db.query(
     `INSERT INTO steps (
        message_id, session_id, parent_id, provider_id, model_id, variant,
-       input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost,
+       input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost, list_cost,
        created_at, streamed_at, completed_at, finish, recorded_at
      ) VALUES (
        $messageID, $sessionID, $parentID, $providerID, $modelID, $variant,
-       $input, $output, $reasoning, $cacheRead, $cacheWrite, $cost,
+       $input, $output, $reasoning, $cacheRead, $cacheWrite, $cost, $listCost,
        $createdAt, $streamedAt, $completedAt, $finish, $recordedAt
      )
      ON CONFLICT(message_id) DO UPDATE SET
@@ -316,6 +337,9 @@ export function recordStep(db: Database, record: StepRecord): void {
        cache_read = excluded.cache_read,
        cache_write = excluded.cache_write,
        cost = excluded.cost,
+       -- A step that starts being charged loses its estimate; an estimate is
+       -- kept when a replayed event arrives without a price table.
+       list_cost = CASE WHEN excluded.cost > 0 THEN NULL ELSE COALESCE(excluded.list_cost, steps.list_cost) END,
        created_at = COALESCE(excluded.created_at, steps.created_at),
        streamed_at = COALESCE(excluded.streamed_at, steps.streamed_at),
        completed_at = COALESCE(excluded.completed_at, steps.completed_at),
@@ -334,6 +358,10 @@ export function recordStep(db: Database, record: StepRecord): void {
     $cacheRead: record.cacheRead ?? 0,
     $cacheWrite: record.cacheWrite ?? 0,
     $cost: record.cost ?? 0,
+    $listCost:
+      (record.cost ?? 0) <= 0 && record.listCost !== undefined && Number.isFinite(record.listCost) && record.listCost >= 0
+        ? record.listCost
+        : null,
     $createdAt: record.createdAt ?? null,
     $streamedAt: record.streamedAt ?? null,
     $completedAt: record.completedAt ?? null,
