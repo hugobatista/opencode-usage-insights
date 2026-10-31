@@ -56,10 +56,7 @@ written by the server-side recorder and read by the TUI.
 
 ## Install
 
-> [!IMPORTANT]
-> **Not on the npm registry yet.** Until the first release is published,
-> `opencode plugin add` and the package-name form below cannot resolve it — use
-> the local checkout, the last form of this section.
+The plugin is published on npm as `opencode-usage-insights`.
 
 ```sh
 opencode plugin add opencode-usage-insights
