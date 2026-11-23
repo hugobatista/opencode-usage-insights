@@ -422,6 +422,9 @@ describe("turns", () => {
     const db = freshDb()
     upsertSession(db, { sessionID: "s1", title: "Turns", directory: "/tmp/s1", startedAt: 900 })
     recordPrompt(db, { sessionID: "s1", messageID: "p1", createdAt: 1_000 })
+    // A synthetic system-reminder prompt with no steps: it opens no turn, so it
+    // must not become the previous prompt for the next turn's gap.
+    recordPrompt(db, { sessionID: "s1", messageID: "p1_synthetic", createdAt: 3_000 })
     recordPrompt(db, { sessionID: "s1", messageID: "p2", createdAt: 5_000 })
     recordPrompt(db, { sessionID: "s1", messageID: "p3", createdAt: 9_000 })
     // Turn 1: a tool call and the final answer.
@@ -455,6 +458,35 @@ describe("turns", () => {
     expect(loop.totals).toMatchObject({ input: 120, cached: 1_900, output: 60, steps: 2 })
     expect(loop.latest).toMatchObject({ input: 100, cached: 900 })
     expect(loop.drops).toEqual([{ messageID: "a2", tokens: 100, gapMs: 300 }])
+  })
+
+  test("limit counts finished turns, not empty prompt rows", () => {
+    const db = freshDb()
+    // Six user turns, each preceded by an empty synthetic prompt at the same
+    // moment. A fixed prompt window would let the synthetics consume the limit.
+    for (let index = 0; index < 6; index += 1) {
+      const base = 10_000 + index * 10_000
+      recordPrompt(db, { sessionID: "s", messageID: `syn_${index}`, createdAt: base })
+      recordPrompt(db, { sessionID: "s", messageID: `user_${index}`, createdAt: base + 100 })
+      recordStep(db, {
+        messageID: `a_${index}`,
+        sessionID: "s",
+        createdAt: base + 200,
+        completedAt: base + 300,
+        finish: "stop",
+        input: 10,
+      })
+    }
+    // A still-running newest turn is not history, but must not steal a slot.
+    recordPrompt(db, { sessionID: "s", messageID: "running", createdAt: 80_000 })
+    recordStep(db, { messageID: "running_a", sessionID: "s", createdAt: 80_100, completedAt: 80_200, finish: "tool-calls" })
+
+    const rows = turns(db, { sessionID: "s", limit: 5 })
+    expect(rows).toHaveLength(5)
+    expect(rows.map((row) => row.promptAt)).toEqual([60_100, 50_100, 40_100, 30_100, 20_100])
+    // The gap is to the previous turn (10 s), not to the synthetic 100 ms before.
+    expect(rows[0]!.promptGapMs).toBe(10_000)
+    db.close()
   })
 
   test("reports the turn's weighted rate over its steps", () => {

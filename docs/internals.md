@@ -302,8 +302,11 @@ the composer line. The rules it keeps are:
   nothing is written on a response, because the response carries nothing the
   views read.
 - **Reads are index-driven.** Every range filter compares the expression the
-  `steps_at` index covers, the per-prompt history is bounded to the last few
-  prompts, and the line and the sidebar never scan a session's whole history.
+  `steps_at` index covers, and the per-prompt history starts from the newest
+  prompts. It widens only until it holds the requested number of finished
+  turns, so a session with enough history stays bounded; a session with fewer
+  finished turns can walk its history once. The line never scans a session's
+  whole history.
 - **The TUI reads, and reads at most 300 ms apart.** The panel and the sidebar
   share one read-only connection, a burst of step events is coalesced into one
   rebuild, and each view is memoised; the file's own numbers (`dbInfo`) are only

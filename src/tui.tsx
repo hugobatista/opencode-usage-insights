@@ -52,7 +52,7 @@ export type Options = {
   labels?: Partial<LineLabels> | undefined
   /** Show the per-prompt history in the session sidebar (default true). */
   sidebar?: boolean | undefined
-  /** How many turns the sidebar history shows (default 5). */
+  /** How many turns the sidebar history shows (default 8). */
   sidebarTurns?: number | undefined
   /**
    * Show the `/usage` statistics panel and its command (default true).
@@ -336,7 +336,7 @@ export default Plugin.define({
           <TurnsSidebar
             sessionID={input.sessionID}
             ctx={ctx}
-            deps={{ db, refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 5)) }}
+            deps={{ db, refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 8)) }}
             options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, estimates: pricing }}
           />
         ),

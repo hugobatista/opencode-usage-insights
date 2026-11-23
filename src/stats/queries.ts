@@ -662,7 +662,7 @@ export type TurnUsage = {
   /** Creation time of the prompt that opened the turn, when it was recorded. */
   promptAt: number | undefined
   endAt: number | undefined
-  /** Time between the previous prompt of the session and this turn's prompt. */
+  /** Time between the previous finished turn's prompt and this turn's prompt. */
   promptGapMs: number | undefined
   providerID: string | undefined
   modelID: string | undefined
@@ -748,139 +748,159 @@ function stepMessage(row: TurnStepRow): AssistantMessage {
  * before them; a turn whose last step asked for tools is dropped, because it is
  * still running — the same rule the telemetry line follows.
  *
- * For one session the read is bounded by a window: only the steps at or after
- * the `limit`-th newest prompt are loaded, so a session with tens of thousands
- * of steps costs the same as a short one. The extra prompt is kept as the
- * reference the oldest returned turn measures its gap against.
+ * For one session the read is bounded by a window of the newest prompts. The
+ * window grows until it holds `limit` finished turns: a prompt can be empty
+ * (the host records a synthetic system-reminder next to the user prompt) and
+ * the newest turn can still be running, so a fixed one-prompt margin is not
+ * enough. `complete` means the window covers every prompt of the session.
  */
 export function turns(
   db: Database,
   options?: { sessionID?: string | undefined; range?: Range | undefined; filters?: Filters | undefined; limit?: number | undefined },
 ): TurnUsage[] {
-  const limit = options?.limit ?? 50
+  const requested = options?.limit ?? 50
+  const limit = Number.isFinite(requested) ? Math.max(0, Math.floor(requested)) : 50
   const filter = buildWhere(options?.range, options?.filters)
-  const clauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
-  const params: (number | string)[] = [...filter.params]
+  const baseClauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
+  const baseParams: (number | string)[] = [...filter.params]
   if (options?.sessionID !== undefined) {
-    clauses.push("session_id = ?")
-    params.push(options.sessionID)
-  }
-  const floor = options?.sessionID === undefined ? undefined : promptFloor(db, options.sessionID, limit + 1)
-  if (floor !== undefined) {
-    clauses.push(`${STEP_TIME} >= ?`)
-    params.push(floor)
-  }
-  const steps = db
-    .query(
-      `SELECT message_id, session_id, provider_id, model_id, variant,
-              input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost, list_cost,
-              created_at, streamed_at, recorded_at, completed_at, finish
-         FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
-        ORDER BY session_id, ${STEP_TIME}, message_id`,
-    )
-    .all(...params) as TurnStepRow[]
-
-  const promptClause = options?.sessionID === undefined ? "" : `WHERE session_id = ?${floor === undefined ? "" : " AND created_at >= ?"}`
-  const promptParams = options?.sessionID === undefined ? [] : floor === undefined ? [options.sessionID] : [options.sessionID, floor]
-  const promptRows = db
-    .query(`SELECT session_id, created_at FROM prompts ${promptClause} ORDER BY session_id, created_at`)
-    .all(...promptParams) as { session_id: string; created_at: number | null }[]
-
-  const promptsBySession = new Map<string, number[]>()
-  for (const row of promptRows) {
-    if (row.created_at === null) continue
-    const list = promptsBySession.get(row.session_id) ?? []
-    list.push(row.created_at)
-    promptsBySession.set(row.session_id, list)
+    baseClauses.push("session_id = ?")
+    baseParams.push(options.sessionID)
   }
 
-  const result: TurnUsage[] = []
-  let sessionID: string | undefined
-  let bucket: TurnStepRow[] = []
-  let promptIndex = -2
-  let promptAt: number | undefined
-  let previousPromptAt: number | undefined
+  /** Read the turns inside the given prompt window, newest first. */
+  function read(promptCount: number): { rows: TurnUsage[]; complete: boolean } {
+    const clauses = [...baseClauses]
+    const params = [...baseParams]
+    const floor = options?.sessionID === undefined ? undefined : promptFloor(db, options.sessionID, promptCount)
+    if (floor !== undefined) {
+      clauses.push(`${STEP_TIME} >= ?`)
+      params.push(floor)
+    }
+    const steps = db
+      .query(
+        `SELECT message_id, session_id, provider_id, model_id, variant,
+                input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost, list_cost,
+                created_at, streamed_at, recorded_at, completed_at, finish
+           FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
+          ORDER BY session_id, ${STEP_TIME}, message_id`,
+      )
+      .all(...params) as TurnStepRow[]
 
-  function close(): void {
-    const last = bucket[bucket.length - 1]
-    if (last === undefined || !turnFinished(last.finish)) {
+    const promptClause = options?.sessionID === undefined ? "" : `WHERE session_id = ?${floor === undefined ? "" : " AND created_at >= ?"}`
+    const promptParams = options?.sessionID === undefined ? [] : floor === undefined ? [options.sessionID] : [options.sessionID, floor]
+    const promptRows = db
+      .query(`SELECT session_id, created_at FROM prompts ${promptClause} ORDER BY session_id, created_at`)
+      .all(...promptParams) as { session_id: string; created_at: number | null }[]
+
+    const promptsBySession = new Map<string, number[]>()
+    for (const row of promptRows) {
+      if (row.created_at === null) continue
+      const list = promptsBySession.get(row.session_id) ?? []
+      list.push(row.created_at)
+      promptsBySession.set(row.session_id, list)
+    }
+
+    const result: TurnUsage[] = []
+    let sessionID: string | undefined
+    let bucket: TurnStepRow[] = []
+    let promptIndex = -2
+    let promptAt: number | undefined
+
+    function close(): void {
+      const last = bucket[bucket.length - 1]
+      if (last === undefined || !turnFinished(last.finish)) {
+        bucket = []
+        return
+      }
+      const totals = emptyUsage()
+      for (const row of bucket) addUsage(totals, stepUsage(row))
+      const drops: TurnDrop[] = []
+      let reference: AssistantMessage | undefined
+      for (const row of bucket) {
+        const message = stepMessage(row)
+        const drop = cacheDrop(reference, message)
+        if (drop !== undefined) {
+          drops.push({ messageID: row.message_id, tokens: drop, gapMs: stepGap(reference, message) })
+        }
+        reference = message
+      }
+      const providerID = last.provider_id ?? undefined
+      const modelID = last.model_id ?? undefined
+      const variant = last.variant ?? undefined
+      let produced = 0
+      let window = 0
+      for (const row of bucket) {
+        if (row.created_at === null || row.streamed_at === null || row.streamed_at <= row.created_at) continue
+        produced += (row.output_tokens ?? 0) + (row.reasoning_tokens ?? 0)
+        window += row.streamed_at - row.created_at
+      }
+      const previous = result.length > 0 && result[result.length - 1]!.sessionID === last.session_id ? result[result.length - 1] : undefined
+      result.push({
+        sessionID: last.session_id,
+        promptAt,
+        endAt: last.completed_at ?? last.created_at ?? last.recorded_at,
+        // The gap is against the previous *turn*, not the previous prompt row:
+        // a synthetic system-reminder prompt can sit between two user turns.
+        promptGapMs: promptAt !== undefined && previous?.promptAt !== undefined ? Math.max(0, promptAt - previous.promptAt) : undefined,
+        providerID,
+        modelID,
+        variant,
+        providerChanged: previous?.providerID !== undefined && providerID !== undefined && previous.providerID !== providerID,
+        modelChanged:
+          previous !== undefined &&
+          previous.providerID === providerID &&
+          `${previous.modelID ?? ""}#${previous.variant ?? ""}` !== `${modelID ?? ""}#${variant ?? ""}`,
+        steps: bucket.length,
+        latest: stepUsage(last),
+        totals,
+        drops,
+        finish: last.finish ?? undefined,
+        tps: tokensPerSecond(produced, 0, window),
+      })
       bucket = []
-      return
     }
-    const totals = emptyUsage()
-    for (const row of bucket) addUsage(totals, stepUsage(row))
-    const drops: TurnDrop[] = []
-    let reference: AssistantMessage | undefined
-    for (const row of bucket) {
-      const message = stepMessage(row)
-      const drop = cacheDrop(reference, message)
-      if (drop !== undefined) {
-        drops.push({ messageID: row.message_id, tokens: drop, gapMs: stepGap(reference, message) })
+
+    for (const row of steps) {
+      if (row.session_id !== sessionID) {
+        close()
+        sessionID = row.session_id
+        promptIndex = -2
+        promptAt = undefined
       }
-      reference = message
+      const time = row.created_at ?? row.recorded_at
+      const prompts = promptsBySession.get(row.session_id) ?? []
+      let index = -1
+      for (let candidate = prompts.length - 1; candidate >= 0; candidate -= 1) {
+        if ((prompts[candidate] ?? Number.POSITIVE_INFINITY) <= time) {
+          index = candidate
+          break
+        }
+      }
+      if (index !== promptIndex) {
+        close()
+        promptIndex = index
+        promptAt = index >= 0 ? prompts[index] : undefined
+      }
+      bucket.push(row)
     }
-    const providerID = last.provider_id ?? undefined
-    const modelID = last.model_id ?? undefined
-    const variant = last.variant ?? undefined
-    let produced = 0
-    let window = 0
-    for (const row of bucket) {
-      if (row.created_at === null || row.streamed_at === null || row.streamed_at <= row.created_at) continue
-      produced += (row.output_tokens ?? 0) + (row.reasoning_tokens ?? 0)
-      window += row.streamed_at - row.created_at
-    }
-    const previous = result.length > 0 && result[result.length - 1]!.sessionID === last.session_id ? result[result.length - 1] : undefined
-    result.push({
-      sessionID: last.session_id,
-      promptAt,
-      endAt: last.completed_at ?? last.created_at ?? last.recorded_at,
-      promptGapMs: promptAt !== undefined && previousPromptAt !== undefined ? Math.max(0, promptAt - previousPromptAt) : undefined,
-      providerID,
-      modelID,
-      variant,
-      providerChanged: previous?.providerID !== undefined && providerID !== undefined && previous.providerID !== providerID,
-      modelChanged:
-        previous !== undefined &&
-        previous.providerID === providerID &&
-        `${previous.modelID ?? ""}#${previous.variant ?? ""}` !== `${modelID ?? ""}#${variant ?? ""}`,
-      steps: bucket.length,
-      latest: stepUsage(last),
-      totals,
-      drops,
-      finish: last.finish ?? undefined,
-      tps: tokensPerSecond(produced, 0, window),
-    })
-    bucket = []
+    close()
+
+    // Once the window reaches a prompt at or before the range's start, no older
+    // prompt can be the newest one before a step inside the range: the window
+    // already covers every turn the range can contain.
+    const reachedRangeStart = options?.range?.from !== undefined && floor !== undefined && floor <= options.range.from
+    return { rows: result.reverse(), complete: floor === undefined || reachedRangeStart }
   }
 
-  for (const row of steps) {
-    if (row.session_id !== sessionID) {
-      close()
-      sessionID = row.session_id
-      promptIndex = -2
-      promptAt = undefined
-      previousPromptAt = undefined
-    }
-    const time = row.created_at ?? row.recorded_at
-    const prompts = promptsBySession.get(row.session_id) ?? []
-    let index = -1
-    for (let candidate = prompts.length - 1; candidate >= 0; candidate -= 1) {
-      if ((prompts[candidate] ?? Number.POSITIVE_INFINITY) <= time) {
-        index = candidate
-        break
-      }
-    }
-    if (index !== promptIndex) {
-      close()
-      promptIndex = index
-      promptAt = index >= 0 ? prompts[index] : undefined
-      previousPromptAt = index >= 1 ? prompts[index - 1] : undefined
-    }
-    bucket.push(row)
+  let promptCount = Math.max(1, limit + 1)
+  for (;;) {
+    const { rows, complete } = read(promptCount)
+    if (rows.length >= limit || complete) return rows.slice(0, limit)
+    const next = promptCount * 2 + 1
+    if (!Number.isFinite(next) || next <= promptCount) return rows.slice(0, limit)
+    promptCount = next
   }
-  close()
-
-  return result.reverse().slice(0, limit)
 }
 
 /**

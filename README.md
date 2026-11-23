@@ -86,7 +86,7 @@ To pass [options](#configuration), use the object form:
 ```jsonc
 {
   "plugins": [
-    { "package": "opencode-usage-insights", "options": { "sidebarTurns": 5 } }
+    { "package": "opencode-usage-insights", "options": { "sidebarTurns": 8 } }
   ]
 }
 ```
@@ -360,7 +360,7 @@ Options apply to both parts (each side reads the ones it needs):
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `pricing` | `"auto"` | `"off"` disables list-price estimates everywhere: no new `list_cost` records, no `≈` on the line, in the panel or in the sidebar, and no historical backfill. Charged money is unaffected. |
 | `sidebar` | `true` | Show the session summary and the per-prompt history — cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
-| `sidebarTurns` | `5` | How many turns the sidebar history shows. |
+| `sidebarTurns` | `8` | How many turns the sidebar history shows. The host sidebar scrolls; raise it for a longer history. |
 | `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
 | `fields` | see below | Toggle line segments. |
 | `labels` | see below | Override line labels (the plugin is English-only by default). |
