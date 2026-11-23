@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite"
-import { recordEvent, recordPrompt, recordStep, upsertSession } from "./stats/db"
+import { recordEvent, recordPrompt, recordStep, recordUsage, upsertSession } from "./stats/db"
 import { COMPACTION_KIND } from "./stats/queries"
 import type { PriceFn } from "./pricing"
 
@@ -31,6 +31,8 @@ export type TokenUsageLike = {
 export type RecorderEventData = {
   sessionID?: string | undefined
   assistantMessageID?: string | undefined
+  /** Host usage source: `generate`, `compaction` or `title`. */
+  source?: string | undefined
   inboxID?: string | undefined
   item?: { type?: string | undefined } | undefined
   started?: number | undefined
@@ -47,6 +49,8 @@ export type RecorderEventData = {
 }
 
 export type RecorderEvent = {
+  /** Host event ID: the idempotency key for usage and compaction rows. */
+  id?: string | undefined
   type: string
   created?: number | undefined
   data?: RecorderEventData | undefined
@@ -302,12 +306,44 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
         recordPendingStep(data.assistantMessageID, data, data.finish ?? "error", at)
         return
       }
+      case "session.usage.recorded": {
+        // A `generate` usage is the assistant step this recorder already stores
+        // from `session.step.ended`; recording it again would double count it.
+        // Compaction and title generations have no step of their own, and the
+        // host includes them in the session's own cost, so they are kept apart
+        // for the views that report a complete total.
+        if (sessionID === undefined) return
+        const source = typeof data.source === "string" ? data.source : undefined
+        if (source === undefined || source === "generate") return
+        const id =
+          typeof event.id === "string" && event.id !== "" ? event.id : `${sessionID}:${source}:${at}:${data.cost ?? 0}`
+        write(() =>
+          recordUsage(db, {
+            id,
+            sessionID,
+            source,
+            at,
+            cost: data.cost,
+            input: data.tokens?.input,
+            output: data.tokens?.output,
+            reasoning: data.tokens?.reasoning,
+            cacheRead: data.tokens?.cache?.read,
+            cacheWrite: data.tokens?.cache?.write,
+          }),
+        )
+        return
+      }
       case "session.compaction.ended": {
         if (sessionID === undefined) return
+        // The host event ID makes a replay a no-op. Older recorders left it
+        // NULL, which is why the migration dedupes historical rows separately.
+        const messageID =
+          typeof event.id === "string" && event.id !== "" ? event.id : `compaction:${sessionID}:${at}`
         write(() =>
           recordEvent(db, {
             sessionID,
             kind: COMPACTION_KIND,
+            messageID,
             at,
             data: { reason: data.reason, model: data.model, tokens: data.tokens, cost: data.cost },
           }),

@@ -219,6 +219,45 @@ list no longer contains as `NULL`, so `e` can be retried after the list changes.
 `pricing: "off"` stops new estimates, hides stored ones in the line, panel and
 sidebar, and disables the backfill. It does not delete the column.
 
+## Non-step usage
+
+The host also publishes `session.usage.recorded` with `source: "compaction"` or
+`source: "title"` for generation that has no assistant step of its own. The
+recorder stores it in the `usage` table (`id` = host event ID, `session_id`,
+`source`, `at`, `cost`, and the token buckets). The primary key makes a
+replayed event a no-op; the compaction event itself is stored in `events` for
+the cache-loss reason and keyed by its own host ID.
+
+The host includes this usage in the session's own `cost` and token totals, so
+the views that claim to describe a whole selection include its cost: the
+`overview`, the `periods` buckets and the session rows. The overview names the
+part as `other`; a session row names it on its detail line. Tokens and the
+cache views stay step-based (the `input`/`cache_read` columns are summed over
+steps only), because the non-step record carries no model and no cache
+comparison.
+
+The `models`, `providers` and `turns` rows stay step-based: the host's non-step
+usage record carries no model, and a title generation has none at all, so
+attributing the money to a model would invent an identity. The `sess` segment is
+unaffected: it already reads the host's session total, which includes this
+usage; the estimate half is still `SUM(list_cost)` over steps, so nothing is
+added twice.
+
+This is host money, not a list-price estimate, so `pricing: "off"` does not hide
+it. A database written by an older plugin is healed at open: the stored
+compaction events already carry `cost` and `tokens`, so a migration recovers
+them with a stable synthetic ID. Title usage was never stored anywhere before
+the upgrade and stays missing; the line keeps showing the host's whole session
+total meanwhile.
+
+### Event idempotency
+
+An event with a host ID is stored with `message_id`; a partial unique index
+(`kind, message_id`) turns a replay into `INSERT OR IGNORE`. A migration
+deduplicates compaction rows an older recorder inserted on every delivery
+before the index is created, so the event count and any cost read from the
+table stay honest.
+
 ## Privacy and security
 
 The plugin is local by construction: no network client, no subprocess, no
@@ -228,7 +267,9 @@ user's own state directory.
 **What is stored.** Per step: timings, token counts, charged cost and the
 list-price estimate when the host reported `$0`, the provider/model/variant it
 ran as, the finish reason, the session and parent ids, and the session's title
-and working directory as the host reports them.
+and working directory as the host reports them. Per compaction or title
+generation: the host event ID, its source, time, cost and token counts. Prompt
+text and generated text are never stored, including for those records.
 **Prompts and responses are not stored**: the recorder reads event payloads for
 numbers and identifiers and keeps nothing else — no message text, no tool
 arguments, no file contents, no environment variables.

@@ -238,7 +238,7 @@ export function Panel(props: {
       props.ctx.ui.toast.show({ message: "the recorder is writing: try again in a moment", variant: "warning" })
     } else {
       props.ctx.ui.toast.show({
-        message: `pruned ${result.steps} steps · ${result.prompts} prompts · ${result.events} compactions`,
+        message: `pruned ${result.steps} steps · ${result.prompts} prompts · ${result.events} compactions · ${result.usage} other usage`,
         variant: "success",
       })
     }

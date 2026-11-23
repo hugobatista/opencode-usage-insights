@@ -11,14 +11,16 @@ import {
   recordEvent,
   recordPrompt,
   recordStep,
+  recordUsage,
   upsertSession,
   type StepRecord,
 } from "../src/stats/db"
-import { cacheDropsOf, cachePairs, latencyOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
+import { cacheDropsOf, cachePairs, latencyOf, periodsOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
 import {
   cacheHitRatio,
   filterOptions,
   models,
+  otherUsageRows,
   overview,
   percentile,
   sessionListCost,
@@ -440,6 +442,63 @@ describe("turns", () => {
     expect(turns(db, { sessionID: "s1", range: { from: 5_000 } }).map((row) => row.promptAt)).toEqual([5_000])
     expect(turns(db, { limit: 1 })).toHaveLength(1)
     expect(turns(db, { limit: 1 })[0]!.sessionID).toBe("s2")
+  })
+})
+
+describe("non-step usage", () => {
+  test("adds compaction/title money to the overview, sessions and periods", () => {
+    const db = freshDb()
+    recordStep(db, {
+      messageID: "a",
+      sessionID: "s1",
+      providerID: "p",
+      modelID: "m",
+      input: 100,
+      cost: 0.1,
+      createdAt: 1_000,
+      completedAt: 1_001,
+      finish: "stop",
+      recordedAt: 1_000,
+    })
+    recordUsage(db, { id: "u1", sessionID: "s1", source: "compaction", at: 2_000, cost: 0.02 })
+    recordUsage(db, { id: "u2", sessionID: "s1", source: "title", at: 3_000, cost: 0.01 })
+
+    const total = overview(db)
+    expect(total.cost).toBeCloseTo(0.13, 12)
+    expect(total.otherCost).toBeCloseTo(0.03, 12)
+    const session = sessions(db)[0]!
+    expect(session.cost).toBeCloseTo(0.13, 12)
+    expect(session.otherCost).toBeCloseTo(0.03, 12)
+    const periods = periodsOf(stepRows(db), "day", otherUsageRows(db))
+    expect(periods).toHaveLength(1)
+    expect(periods[0]!.usage.cost).toBeCloseTo(0.13, 12)
+    expect(periods[0]!.otherCost).toBeCloseTo(0.03, 12)
+    // A model filter cannot attribute usage the host reports without a model:
+    // the step cost stands alone rather than inventing an attribution.
+    expect(overview(db, undefined, { modelID: "m" }).cost).toBeCloseTo(0.1, 12)
+
+    db.close()
+  })
+
+  test("degrades when an older database has no usage table", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "a", sessionID: "s1", providerID: "p", modelID: "m", input: 100, cost: 0.1, createdAt: 1_000, completedAt: 1_001, finish: "stop", recordedAt: 1_000 })
+    db.exec("DROP TABLE usage")
+    expect(overview(db).cost).toBeCloseTo(0.1, 12)
+    expect(sessions(db)[0]!.cost).toBeCloseTo(0.1, 12)
+    expect(otherUsageRows(db)).toEqual([])
+    db.close()
+  })
+
+  test("keeps a period that only has non-step usage", () => {
+    const db = freshDb()
+    recordUsage(db, { id: "u1", sessionID: "s1", source: "compaction", at: 1_000, cost: 0.02 })
+    const periods = periodsOf([], "day", otherUsageRows(db))
+    expect(periods).toHaveLength(1)
+    expect(periods[0]!.steps).toBe(0)
+    expect(periods[0]!.usage.cost).toBeCloseTo(0.02, 12)
+    expect(periods[0]!.otherCost).toBeCloseTo(0.02, 12)
+    db.close()
   })
 })
 

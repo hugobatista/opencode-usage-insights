@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { buildPanel, defaultSort, detailLabel, nextSort, sortKeys, type PanelRequest } from "../src/panel-build"
 import { PANEL_VIEWS, sanitizeSettings, type PanelLine, type PanelView } from "../src/panel-data"
-import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
+import { openStatsDb, recordPrompt, recordStep, recordUsage, upsertSession } from "../src/stats/db"
 import { dbInfo, type DbInfo } from "../src/stats/maintenance"
 
 /**
@@ -331,6 +331,33 @@ describe("list-price estimates", () => {
     const db = estimatedDb()
     expect(text(buildPanel(request(db, { view: "models" })))).toContain("≈$0.0042")
     expect(text(buildPanel(request(db, { view: "models", estimates: false })))).not.toContain("≈")
+    db.close()
+  })
+})
+
+describe("non-step usage", () => {
+  test("overview, sessions and periods include compaction/title money", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, {
+      messageID: "a",
+      sessionID: "s1",
+      providerID: "p",
+      modelID: "m",
+      input: 100,
+      cost: 0.1,
+      createdAt: BASE,
+      completedAt: BASE + 1_000,
+      finish: "stop",
+    })
+    recordUsage(db, { id: "u1", sessionID: "s1", source: "compaction", at: BASE + 2_000, cost: 0.02 })
+    const overviewText = text(buildPanel(request(db, { view: "overview" })))
+    expect(overviewText).toContain("$0.1200")
+    expect(overviewText).toContain("other")
+    expect(overviewText).toContain("$0.0200")
+    const sessionsText = text(buildPanel(request(db, { view: "sessions" })))
+    expect(sessionsText).toContain("$0.1200")
+    expect(sessionsText).toContain("other $0.0200")
+    expect(text(buildPanel(request(db, { view: "periods" })))).toContain("$0.1200")
     db.close()
   })
 })

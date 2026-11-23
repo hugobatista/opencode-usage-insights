@@ -32,7 +32,7 @@ import {
 import { exportNdjson, importNdjson, openStatsDb } from "../src/stats/db"
 import { dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
 import { defaultDbPath, resolveDbPath } from "../src/stats/paths"
-import { models, overview, sessions } from "../src/stats/queries"
+import { models, otherUsage, otherUsageRows, overview, sessions } from "../src/stats/queries"
 
 type Args = {
   view: PanelView | "all"
@@ -166,7 +166,9 @@ if (args.prune !== undefined) {
     process.exit(2)
   }
   const result = pruneOlderThan(db, now - args.prune * 24 * 60 * 60 * 1000)
-  console.log(`pruned ${count(result.steps, "step")} · ${count(result.prompts, "prompt")} · ${count(result.events, "compaction event")}`)
+  console.log(
+    `pruned ${count(result.steps, "step")} · ${count(result.prompts, "prompt")} · ${count(result.events, "compaction event")} · ${count(result.usage, "other usage record")}`,
+  )
 }
 if (args.vacuum) {
   const result = vacuum(db, path)
@@ -192,6 +194,7 @@ if (args.json) {
   const pairs = cachePairs(db, { range, filters })
   const data = {
     overview: overview(db, range, filters),
+    otherUsage: otherUsage(db, range, filters),
     models: models(db, range, filters),
     providers: providerSummaryOf(steps),
     providerModels: providerBreakdownOf(steps),
@@ -203,7 +206,7 @@ if (args.json) {
       ttl: ttlEvidenceOf(pairs),
       gap: gapReportOf(pairs),
     },
-    periods: periodsOf(steps, args.granularity),
+    periods: periodsOf(steps, args.granularity, otherUsageRows(db, range, filters)),
     latency: { overall: latencyOf(steps), byModel: latencyGroupsOf(steps, "model"), byProvider: latencyGroupsOf(steps, "provider") },
     sessions: sessions(db, { range, filters, limit: 50 }),
     coverage: coverageOf(db, { range, filters }),

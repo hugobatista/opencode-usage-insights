@@ -89,6 +89,108 @@ export function sessionListCost(db: Database, sessionID: string): number {
   return row?.listCost ?? 0
 }
 
+/**
+ * Money the host reported with no assistant step behind it: a compaction
+ * summary or a generated title. It is part of the session's own cost, so the
+ * totals that claim to describe a session include it.
+ */
+export type OtherUsage = {
+  /** Host usage records behind the number. */
+  entries: number
+  cost: number
+}
+
+export const EMPTY_OTHER: OtherUsage = { entries: 0, cost: 0 }
+
+/** True when the database has the table the non-step usage lives in. */
+function hasUsageTable(db: Database): boolean {
+  try {
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage'").get() !== null
+  } catch {
+    return false
+  }
+}
+
+/**
+ * `WHERE` for non-step usage. A model or provider filter cannot be honored:
+ * the host usage record carries neither, so including it under a filter would
+ * attribute money to a model that did not earn it. A session filter can: the
+ * row is the session's.
+ */
+function otherWhere(
+  range: Range | undefined,
+  filters?: Filters | undefined,
+): { where: string; params: (string | number)[] } | undefined {
+  if (filters?.modelID !== undefined && filters.modelID !== "") return undefined
+  if (filters?.modelKey !== undefined && filters.modelKey !== "") return undefined
+  if (filters?.provider !== undefined && filters.provider !== "") return undefined
+  const span = rangeWhere(range, "at")
+  const clauses = span.where === "" ? [] : [span.where.slice("WHERE ".length)]
+  const params: (string | number)[] = [...span.params]
+  if (filters?.sessionID !== undefined && filters.sessionID !== "") {
+    clauses.push("session_id = ?")
+    params.push(filters.sessionID)
+  }
+  return { where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "", params }
+}
+
+/** Non-step usage in the selection. */
+export function otherUsage(db: Database, range?: Range | undefined, filters?: Filters | undefined): OtherUsage {
+  const filter = otherWhere(range, filters)
+  if (filter === undefined || !hasUsageTable(db)) return { ...EMPTY_OTHER }
+  try {
+    const row = db
+      .query(`SELECT COUNT(*) AS entries, COALESCE(SUM(cost), 0) AS cost FROM usage ${filter.where}`)
+      .get(...filter.params) as { entries: number | null; cost: number | null } | null
+    return { entries: row?.entries ?? 0, cost: row?.cost ?? 0 }
+  } catch {
+    return { ...EMPTY_OTHER }
+  }
+}
+
+/** Non-step usage per session, for the session rows. */
+export function otherUsageBySession(db: Database, range?: Range | undefined, filters?: Filters | undefined): Map<string, OtherUsage> {
+  const out = new Map<string, OtherUsage>()
+  const filter = otherWhere(range, filters)
+  if (filter === undefined || !hasUsageTable(db)) return out
+  try {
+    const rows = db
+      .query(
+        `SELECT session_id AS sessionID, COUNT(*) AS entries, COALESCE(SUM(cost), 0) AS cost
+           FROM usage ${filter.where}
+          GROUP BY session_id`,
+      )
+      .all(...filter.params) as Array<{ sessionID: string; entries: number | null; cost: number | null }>
+    for (const row of rows) out.set(row.sessionID, { entries: row.entries ?? 0, cost: row.cost ?? 0 })
+  } catch {
+    // An older database has no usage table: step totals alone are still valid.
+  }
+  return out
+}
+
+export type OtherUsageRow = {
+  sessionID: string
+  at: number
+  cost: number
+}
+
+/**
+ * Non-step usage as one row per host record, so calendar buckets can fold it
+ * into their periods with the same local-time rule the steps use.
+ */
+export function otherUsageRows(db: Database, range?: Range | undefined, filters?: Filters | undefined): OtherUsageRow[] {
+  const filter = otherWhere(range, filters)
+  if (filter === undefined || !hasUsageTable(db)) return []
+  const where = filter.where === "" ? "WHERE at IS NOT NULL" : `${filter.where} AND at IS NOT NULL`
+  try {
+    return db
+      .query(`SELECT session_id AS sessionID, at, cost FROM usage ${where} ORDER BY at`)
+      .all(...filter.params) as OtherUsageRow[]
+  } catch {
+    return []
+  }
+}
+
 type UsageRow = {
   steps: number | null
   input: number | null
@@ -197,6 +299,8 @@ export function cacheHitRatio(usage: Pick<Usage, "input" | "cached" | "cacheWrit
 export type Overview = Usage & {
   sessions: number
   prompts: number
+  /** Compaction/title money included in `cost`, when the range has any. */
+  otherCost?: number | undefined
   firstAt: number | undefined
   lastAt: number | undefined
   cacheHitRatio: number | undefined
@@ -228,10 +332,16 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
   const promptRow = db.query(`SELECT COUNT(*) AS prompts FROM prompts ${prompts.where}`).get(...prompts.params) as { prompts: number } | null
 
   const usage = usageFrom(row ?? { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 })
+  const other = otherUsage(db, range, filters)
   return {
     ...usage,
+    // The host's session cost includes compactions and titles; a total that
+    // claims to describe the selection has to include them too. Tokens stay
+    // step-based so the cache views keep comparing like with like.
+    cost: usage.cost + other.cost,
     sessions: row?.sessions ?? 0,
     prompts: promptRow?.prompts ?? 0,
+    otherCost: other.cost,
     firstAt: row?.firstAt ?? undefined,
     lastAt: row?.lastAt ?? undefined,
     cacheHitRatio: cacheHitRatio(usage),
@@ -405,6 +515,8 @@ export type SessionUsage = Usage & {
   providers: string[]
   models: string[]
   prompts: number
+  /** Compaction/title money included in `cost`, when the session has any. */
+  otherCost?: number | undefined
   firstAt: number | undefined
   lastAt: number | undefined
   cacheHitRatio: number | undefined
@@ -465,10 +577,15 @@ export function sessions(
     last_at: number | null
   })[]
 
+  // The host's session cost includes compactions and titles; the session row
+  // has to include them too, or it disagrees with the line's `sess` segment.
+  const other = otherUsageBySession(db, range, options?.filters)
   return rows.map((row) => {
     const usage = usageFrom(row)
+    const extra = other.get(row.session_id)?.cost ?? 0
     return {
       ...usage,
+      cost: usage.cost + extra,
       sessionID: row.session_id,
       parentID: row.parent_id ?? undefined,
       title: row.title ?? undefined,
@@ -476,6 +593,7 @@ export function sessions(
       providers: row.providers ? row.providers.split(",").filter(Boolean) : [],
       models: row.models ? row.models.split(",").filter(Boolean) : [],
       prompts: row.prompts ?? 0,
+      otherCost: extra,
       firstAt: row.first_at ?? undefined,
       lastAt: row.last_at ?? undefined,
       cacheHitRatio: cacheHitRatio(usage),

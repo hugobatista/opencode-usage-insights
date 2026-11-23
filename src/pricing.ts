@@ -81,11 +81,18 @@ export function priceTable(models: readonly ModelInfoLike[] | undefined): PriceT
     const tiers: PriceTier[] = []
     for (const cost of model.cost) {
       if (cost === null || cost === undefined) continue
-      const size = cost.tier?.size
-      const tier =
-        cost.tier !== undefined && typeof size === "number" && Number.isFinite(size) && size >= 0
-          ? { ...(cost.tier.type !== undefined ? { type: cost.tier.type } : {}), size }
-          : undefined
+      let tier: PriceTier["tier"]
+      if (cost.tier !== undefined) {
+        const size = cost.tier.size
+        // A tier without a usable size is not a base price: the host finds no
+        // applicable entry for it and records zero. Treating it as the untiered
+        // fallback would invent a price. Only an entry with no `tier` at all is
+        // the base price. A negative size is kept: the host compares against it
+        // like any other number, so mirroring the comparison is the honest
+        // behaviour even though a real catalog never produces one.
+        if (typeof size !== "number" || !Number.isFinite(size)) continue
+        tier = { ...(cost.tier.type !== undefined ? { type: cost.tier.type } : {}), size }
+      }
       tiers.push({
         ...(tier !== undefined ? { tier } : {}),
         input: money(cost.input),

@@ -298,9 +298,46 @@ describe("recorder robustness", () => {
     const { db, recorder } = harness()
     recorder.handleEvent({ type: "session.execution.succeeded", created: NOW, data: { sessionID: "s1" } })
     recorder.handleEvent({ type: "session.execution.failed", created: NOW, data: { sessionID: "s1" } })
-    recorder.handleEvent({ type: "session.usage.recorded", created: NOW, data: { sessionID: "s1", tokens: { input: 5 } } })
+    recorder.handleEvent({ type: "session.usage.recorded", created: NOW, data: { sessionID: "s1", source: "generate", tokens: { input: 5 } } })
     recorder.handleEvent({ type: "session.model.selected", created: NOW, data: { sessionID: "s1", model: MODEL } })
     expect(db.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 0 })
+    expect(db.query("SELECT COUNT(*) AS n FROM usage").get()).toEqual({ n: 0 })
+    db.close()
+  })
+})
+
+describe("recorder non-step usage", () => {
+  test("stores compaction and title usage, ignores generate and replays", () => {
+    const { db, recorder } = harness()
+    // `generate` is the assistant step: storing it as well would double count.
+    recorder.handleEvent({ id: "e1", type: "session.usage.recorded", created: 100, data: { sessionID: "s1", source: "generate", cost: 0.5 } })
+    recorder.handleEvent({
+      id: "e2",
+      type: "session.usage.recorded",
+      created: 200,
+      data: { sessionID: "s1", source: "compaction", cost: 0.02, tokens: { input: 10, output: 2, cache: { read: 5 } } },
+    })
+    // The host replayed the same event: the primary key makes it a no-op.
+    recorder.handleEvent({
+      id: "e2",
+      type: "session.usage.recorded",
+      created: 200,
+      data: { sessionID: "s1", source: "compaction", cost: 0.02, tokens: { input: 10, output: 2, cache: { read: 5 } } },
+    })
+    recorder.handleEvent({ id: "e3", type: "session.usage.recorded", created: 300, data: { sessionID: "s1", source: "title", cost: 0.01 } })
+    expect(db.query("SELECT id, source, cost, input_tokens, output_tokens, cache_read FROM usage ORDER BY id").all()).toEqual([
+      { id: "e2", source: "compaction", cost: 0.02, input_tokens: 10, output_tokens: 2, cache_read: 5 },
+      { id: "e3", source: "title", cost: 0.01, input_tokens: 0, output_tokens: 0, cache_read: 0 },
+    ])
+    db.close()
+  })
+
+  test("keeps one compaction event when the host replays it", () => {
+    const { db, recorder } = harness()
+    const event = { id: "c1", type: "session.compaction.ended", created: 100, data: { sessionID: "s1", reason: "auto", cost: 0.02, tokens: { input: 10 } } }
+    recorder.handleEvent(event)
+    recorder.handleEvent(event)
+    expect(db.query("SELECT kind, message_id FROM events").all()).toEqual([{ kind: "compaction", message_id: "c1" }])
     db.close()
   })
 })

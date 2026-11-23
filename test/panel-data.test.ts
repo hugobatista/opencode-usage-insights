@@ -281,6 +281,12 @@ describe("overviewLines", () => {
     expect(text(hidden)).toContain(`${padCell("cost", 11)}$0`)
   })
 
+  test("shows the compaction/title part of a complete cost total", () => {
+    const lines = overviewLines({ usage: overview({ cost: 0.45, otherCost: 0.03 }), session: undefined, range: "all" }, 100)
+    expect(text(lines)).toContain(`${padCell("cost", 11)}$0.4500`)
+    expect(text(lines)).toContain(`${padCell("other", 11)}$0.0300 comp/title`)
+  })
+
   test("adds reasoning, first/last and a session block when available", () => {
     const lines = overviewLines(
       {
@@ -496,6 +502,33 @@ describe("sessionsLines", () => {
     expect(text(lines)).toContain("/project")
     expect(text(lines)).toContain("$1.25")
     expect(text(lines)).toContain("96%")
+  })
+
+  test("includes non-step usage in the session cost and names it", () => {
+    const row: SessionUsage = {
+      sessionID: "ses_other",
+      parentID: undefined,
+      title: "Other usage",
+      directory: "/project",
+      providers: ["opencode-go"],
+      models: ["m"],
+      prompts: 1,
+      firstAt: undefined,
+      lastAt: undefined,
+      steps: 2,
+      input: 1_000,
+      cached: 0,
+      cacheWrite: 0,
+      output: 10,
+      reasoning: 0,
+      cost: 1.28,
+      listCost: 0,
+      otherCost: 0.03,
+      cacheHitRatio: 0,
+    }
+    const body = text(sessionsLines([row], 100))
+    expect(body).toContain("$1.28")
+    expect(body).toContain("other $0.0300")
   })
 
   test("marks an estimated session cost and hides it when pricing is off", () => {

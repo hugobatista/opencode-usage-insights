@@ -38,7 +38,9 @@ the machine.
 - **The record** (server part): every assistant step with tokens, charged cost,
   the list-price estimate when the host reported `$0`, timings, finish reason,
   the configured provider and model it ran through, and its session and parent
-  ids; prompts, session lifecycle and compaction events too.
+  ids; prompts, session lifecycle and compaction events too; and the host's
+  `session.usage.recorded` for compactions and title generations, which have no
+  assistant step of their own.
 - **Portable data** (from a checkout): `bun run report --ndjson` exports the
   whole database, and `--import` merges it back on another machine.
 - **Observational by design**: the plugin never rewrites prompts, requests or
@@ -118,7 +120,7 @@ turn finishes, and `/usage` (alias `/insights`) opens the panel.
 | `in 85.4k (1.62M), cached 1.53M, out 3.7k, cost $0.21` | `in` is the uncached part of the prompt (fresh input + cache writes), the parenthesised value the whole prompt — shown only when the two differ — `cached` its cached part, `out` everything generated (visible output + reasoning), and `cost` what the turn was billed. With several steps the segment reads `3 steps · …` and reports the step the turn ended with (`latest`) for the tokens, while the cost is always the turn's own — every step is paid for; `turnTotals: "sum"` adds every step's tokens instead. |
 | `cost $0.21` | Money, not tokens: a turn sums every step's cost whatever the token view shows. A cost of zero is left out, so a free model reads as free. `fields.cost: false` hides it. |
 | `cost ≈ $0.21` | A **list-price estimate**, not money charged. When the host reports `cost: 0` for a paid model (OpenCode 2.2.0+ with an OpenCode Go subscription), the plugin prices the step from the host's model list. A turn mixing covered and paid steps keeps both parts visible: `cost $0.12 + ≈ $3.40`. `pricing: "off"` hides estimates everywhere; `fields.cost: false` hides both. |
-| `sess in 2.1M (14.5M), cached 12.4M, out 88k, cost $1.90` | The session totals: tokens and charged money come from the host, and the list estimate comes from the steps the plugin recorded. A Go session reads `cost ≈ $3.40`; a session mixing charged and covered steps keeps both parts, `cost $0.12 + ≈ $3.40`. |
+| `sess in 2.1M (14.5M), cached 12.4M, out 88k, cost $1.90` | The session totals: tokens and charged money come from the host (including its compaction and title generations), and the list estimate comes from the steps the plugin recorded. A Go session reads `cost ≈ $3.40`; a session mixing charged and covered steps keeps both parts, `cost $0.12 + ≈ $3.40`. |
 | `⚠ cache expired (−11.7k)` | Yellow. The prompt cache read fell by that many tokens against a comparable previous step; `×N` when several steps in the turn lost cache. |
 
 The turn segment carries no label by default — the numbers are the turn's, and
@@ -209,6 +211,26 @@ A worked example, using the prices of `opencode-go/deepseek-v4.1-flash`
 = $0.004215282
 ```
 
+### Compactions and titles
+
+The host also reports usage with no assistant step behind it:
+`session.usage.recorded` with `source: "compaction"` or `source: "title"`. It is
+part of the session's own `cost`, and the plugin stores it in the `usage` table,
+keyed by the host event ID so a replay never counts twice.
+
+Its cost is added to the **overview**, **periods** and **sessions** totals — the
+same money the host already includes in the session. The `models`, `providers`
+and `turns` rows stay step-based: the host's non-step usage record carries no
+model, so attributing the money to one would invent an identity. The overview
+shows the part as an `other` row, and a session row names it under its title.
+
+This is host money, not a list-price estimate, so `pricing: "off"` does not hide
+it. A database written by an older plugin is healed at open: the stored
+compaction events already carry `cost` and `tokens`, and a migration recovers
+them. Title usage recorded before the upgrade was never stored anywhere and
+stays missing; the line's `sess` segment (which reads the host's own session
+total) keeps covering the whole session meanwhile.
+
 What each surface shows:
 
 | Situation | Line | Panel |
@@ -216,6 +238,7 @@ What each surface shows:
 | Charged | `cost $0.12` | `$0.12` |
 | Subscription-covered (host `0`, host model price known) | `cost ≈ $3.40` | `≈$3.40` |
 | Mixed (some charged, some covered) | `cost $0.12 + ≈ $3.40` | overview `$0.12 + ≈ $3.40`; table cell `≈$3.52` (charged + estimate) |
+| Compaction/title (host `session.usage.recorded`) | included in the host's `sess` total | overview `other $0.0042`; session and period cost include it |
 | Known free model | cost omitted | `$0` |
 | Price unknown | cost omitted | `$0` |
 
@@ -228,11 +251,14 @@ The server loads its model list in the background, refreshes it on
 `model.updated` and keeps the previous table if a refresh fails; the TUI
 invalidates its table on the same event and refreshes it on a coarse TTL.
 
-For a session, the charged total is the host's; the estimate is
-`SUM(list_cost)` over the steps the plugin recorded. If the plugin started
-recording in the middle of a session, the estimate covers only the recorded
-steps; the charged total still follows the host. When the database is
-unavailable, the line falls back to the host's charged total with no estimate.
+For a session, the charged total is the host's (including its compaction and
+title generations); the estimate is `SUM(list_cost)` over the steps the plugin
+recorded. The overview, periods and session rows additionally add the host's
+non-step usage cost; the line's `sess` segment already has it in the host's
+total, so it is not added twice. If the plugin started recording in the middle
+of a session, the estimate covers only the recorded steps; the charged total
+still follows the host. When the database is unavailable, the line falls back to
+the host's charged total with no estimate.
 
 The `db` view counts the `$0` steps that have no known price yet. `e` retries
 them with today's host model list: free models become `0`, models still in that
@@ -285,15 +311,15 @@ durable storage, so the panel reopens where it was left.
 
 | View | Answers |
 | --- | --- |
-| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many models and providers were observed, and how many steps lack a model or a completion — a zero elsewhere is only trustworthy when this is complete). |
-| `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **providers it ran through** and how often it switched model or provider — with the cache a provider switch cost. `enter` opens the per-provider detail. |
-| `providers` | **Which configured provider ran each model**: one row per provider, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. Steps recorded without a provider (a model that was never observed) are dimmed and cannot be drilled into. |
+| `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost (with an `other` row naming the compaction/title part), an activity sparkline, a `this session` block and a **data coverage** block (how many models and providers were observed, and how many steps lack a model or a completion — a zero elsewhere is only trustworthy when this is complete). |
+| `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **providers it ran through** and how often it switched model or provider — with the cache a provider switch cost. Cost is assistant steps only; `enter` opens the per-provider detail. |
+| `providers` | **Which configured provider ran each model**: one row per provider, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. Cost is assistant steps only. `enter` lists every model it served. Steps recorded without a provider (a model that was never observed) are dimmed and cannot be drilled into. |
 | `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time**, reuse kept per provider, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
-| `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost — with a sparkline per metric and a totals row. `enter` lists the providers of a period. |
+| `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost (including compaction/title usage) — with a sparkline per metric and a totals row. `enter` lists the providers of a period. |
 | `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per provider when a model is filtered). `n < 5` is dimmed. |
-| `sessions` | Each session with steps, prompts, tokens, `hit`, cost, its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
-| `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line. `a` widens it to every session, titled. |
-| `db` | Where the file lives, what it holds and how much of it is old. The retention table lists, per preset (`30`/`90`/`365` days), how many steps a prune would remove and the cutoff date it prunes from — pick one with `↑`/`↓` and `enter` prunes it (a confirmation first); `v` gives the space back. It also counts the `$0` steps with no list estimate; `e` backfills them at today's list price. |
+| `sessions` | Each session with steps, prompts, tokens, `hit`, cost (including compaction/title usage, named on the detail line), its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
+| `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line. Cost is assistant steps only. `a` widens it to every session, titled. |
+| `db` | Where the file lives, what it holds and how much of it is old. The retention table lists, per preset (`30`/`90`/`365` days), how many steps a prune would remove and the cutoff date it prunes from — pick one with `↑`/`↓` and `enter` prunes it (a confirmation first), removing the steps' compaction/title usage with them; `v` gives the space back. It also counts the `$0` steps with no list estimate; `e` backfills them at today's list price. |
 
 The panel sums the stored per-step buckets over the selected range, so a number
 read in one place means the same in the other: `prompt` is everything the

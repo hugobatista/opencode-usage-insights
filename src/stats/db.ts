@@ -20,7 +20,7 @@ import { isToken, sanitizeLabel, TEXT_LIMIT } from "../text"
  *   that gives up quickly instead of holding the recorder up.
  */
 
-export const SCHEMA_VERSION = 10
+export const SCHEMA_VERSION = 11
 
 /** Longest title or path kept: a label on a line, not a document. */
 const LABEL_LIMIT = 4 * TEXT_LIMIT
@@ -88,10 +88,30 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_session ON events(session_id, at);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, at);
+
+-- Usage the host reports with no assistant step of its own: the compaction
+-- summarisation and the session-title generation. The host publishes it as
+-- session.usage.recorded with a source other than generate, and includes it in
+-- the session's own cost/token totals. Primary key is the host event ID, so a
+-- replayed event never counts twice.
+CREATE TABLE IF NOT EXISTS usage (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  at INTEGER,
+  cost REAL NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0,
+  cache_write INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS usage_session_at ON usage(session_id, at);
+CREATE INDEX IF NOT EXISTS usage_at ON usage(at);
 `
 
 /** Tables carried by `exportNdjson` / `importNdjson`, in import-safe order. */
-export const TABLES = ["sessions", "prompts", "events", "steps"] as const
+export const TABLES = ["sessions", "prompts", "events", "steps", "usage"] as const
 
 export type TableName = (typeof TABLES)[number]
 
@@ -137,6 +157,24 @@ export type EventRecord = {
   data?: unknown
 }
 
+/**
+ * Usage with no assistant step behind it (a compaction or a title generation).
+ * `id` is the host event ID: it is the primary key, so a replay is ignored
+ * instead of counted again.
+ */
+export type UsageRecord = {
+  id: string
+  sessionID: string
+  source: string
+  at?: number | undefined
+  cost?: number | undefined
+  input?: number | undefined
+  output?: number | undefined
+  reasoning?: number | undefined
+  cacheRead?: number | undefined
+  cacheWrite?: number | undefined
+}
+
 export type SessionRecord = {
   sessionID: string
   parentID?: string | undefined
@@ -154,6 +192,25 @@ function jsonText(value: unknown): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Numeric fields arrive from the host event stream, which the plugin treats as
+ * untrusted: a single `NaN` bound to a NOT NULL column makes SQLite reject the
+ * whole statement, and the recorder's defensive catch would then silently lose
+ * the step. Every number is therefore forced into a finite, non-negative value
+ * before it reaches the database.
+ */
+function finite(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function tokenCount(value: unknown): number {
+  return Math.max(0, Math.floor(finite(value)))
+}
+
+function timestamp(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
 }
 
 /**
@@ -209,12 +266,81 @@ function addMissing(db: Database): void {
 }
 
 /**
- * Bring an existing file up to date: drop what no view reads, then add what a
- * newer recorder writes. Both steps are idempotent.
+ * Older recorders inserted a compaction event on every delivery, and the host
+ * replays events on reconnect: the same compaction can be stored several times.
+ * Keep one row per exact duplicate before the unique key is installed, so the
+ * event count and any future cost aggregation stay honest.
+ */
+function dedupeEvents(db: Database): void {
+  const table = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'").get()
+  if (table === null) return
+  db.exec(`DELETE FROM events
+            WHERE kind = 'compaction' AND message_id IS NULL
+              AND rowid NOT IN (
+                SELECT MIN(rowid) FROM events
+                 WHERE kind = 'compaction' AND message_id IS NULL
+                 GROUP BY session_id, at, data
+              )`)
+  db.exec(`DELETE FROM events
+            WHERE message_id IS NOT NULL
+              AND rowid NOT IN (
+                SELECT MIN(rowid) FROM events
+                 WHERE message_id IS NOT NULL
+                 GROUP BY kind, message_id
+              )`)
+}
+
+/**
+ * A host event ID identifies one event: a replay must not insert a second row.
+ * The index is partial because historical rows carry no ID.
+ */
+function addEventKey(db: Database): void {
+  const table = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'").get()
+  if (table === null) return
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS events_kind_message ON events(kind, message_id) WHERE message_id IS NOT NULL")
+}
+
+/**
+ * Older recorders kept only the compaction event, never `session.usage.recorded`.
+ * The event's payload already carries the cost and tokens, so recovering it
+ * makes the fix retroactive for compactions. A row gets a stable synthetic ID;
+ * `INSERT OR IGNORE` makes the recovery idempotent. Only historical rows
+ * (`message_id IS NULL`) are considered: from this version on the recorder
+ * stores the usage event itself, and backfilling again would count it twice.
+ */
+function backfillCompactionUsage(db: Database): void {
+  const tables = new Set(
+    (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name),
+  )
+  if (!tables.has("events") || !tables.has("usage")) return
+  db.exec(`INSERT OR IGNORE INTO usage (
+             id, session_id, source, at, cost,
+             input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write
+           )
+           SELECT 'compaction:' || rowid, session_id, 'compaction', at,
+                  MAX(0, COALESCE(CAST(json_extract(data, '$.cost') AS REAL), 0)),
+                  MAX(0, CAST(COALESCE(json_extract(data, '$.tokens.input'), 0) AS INTEGER)),
+                  MAX(0, CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS INTEGER)),
+                  MAX(0, CAST(COALESCE(json_extract(data, '$.tokens.reasoning'), 0) AS INTEGER)),
+                  MAX(0, CAST(COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS INTEGER)),
+                  MAX(0, CAST(COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS INTEGER))
+             FROM events
+            WHERE kind = 'compaction' AND message_id IS NULL AND at IS NOT NULL AND data IS NOT NULL
+              AND json_valid(data)`)
+}
+
+/**
+ * Bring an existing file up to date: drop what no view reads, add what a newer
+ * recorder writes, repair the event log a replayed write duplicated, and
+ * recover the compaction usage older versions left in the event payload. Every
+ * step is idempotent.
  */
 function migrate(db: Database): void {
   dropUnused(db)
   addMissing(db)
+  dedupeEvents(db)
+  backfillCompactionUsage(db)
+  addEventKey(db)
 }
 
 /**
@@ -315,6 +441,11 @@ export function openStatsDbWrite(path: string): Database {
  * absent instead of becoming a grouping key.
  */
 export function recordStep(db: Database, record: StepRecord): void {
+  const cost = Math.max(0, finite(record.cost))
+  const listCost =
+    cost <= 0 && typeof record.listCost === "number" && Number.isFinite(record.listCost) && record.listCost >= 0
+      ? record.listCost
+      : null
   db.query(
     `INSERT INTO steps (
        message_id, session_id, parent_id, provider_id, model_id, variant,
@@ -352,21 +483,46 @@ export function recordStep(db: Database, record: StepRecord): void {
     $providerID: record.providerID !== undefined && isToken(record.providerID) ? record.providerID : null,
     $modelID: record.modelID ?? null,
     $variant: record.variant ?? null,
-    $input: record.input ?? 0,
-    $output: record.output ?? 0,
-    $reasoning: record.reasoning ?? 0,
-    $cacheRead: record.cacheRead ?? 0,
-    $cacheWrite: record.cacheWrite ?? 0,
-    $cost: record.cost ?? 0,
-    $listCost:
-      (record.cost ?? 0) <= 0 && record.listCost !== undefined && Number.isFinite(record.listCost) && record.listCost >= 0
-        ? record.listCost
-        : null,
-    $createdAt: record.createdAt ?? null,
-    $streamedAt: record.streamedAt ?? null,
-    $completedAt: record.completedAt ?? null,
+    $input: tokenCount(record.input),
+    $output: tokenCount(record.output),
+    $reasoning: tokenCount(record.reasoning),
+    $cacheRead: tokenCount(record.cacheRead),
+    $cacheWrite: tokenCount(record.cacheWrite),
+    $cost: cost,
+    $listCost: listCost,
+    $createdAt: timestamp(record.createdAt),
+    $streamedAt: timestamp(record.streamedAt),
+    $completedAt: timestamp(record.completedAt),
     $finish: record.finish === undefined ? null : sanitizeLabel(record.finish, 64),
-    $recordedAt: record.recordedAt ?? Date.now(),
+    $recordedAt: timestamp(record.recordedAt) ?? Date.now(),
+  })
+}
+
+/**
+ * Insert usage that has no assistant step of its own. The host event ID is the
+ * primary key: a replayed event is ignored, so the totals never double count a
+ * compaction or a title generation delivered more than once.
+ */
+export function recordUsage(db: Database, record: UsageRecord): void {
+  if (typeof record.id !== "string" || record.id === "") return
+  if (typeof record.sessionID !== "string" || record.sessionID === "") return
+  db.query(
+    `INSERT INTO usage (
+       id, session_id, source, at, cost, input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write
+     ) VALUES (
+       $id, $sessionID, $source, $at, $cost, $input, $output, $reasoning, $cacheRead, $cacheWrite
+     ) ON CONFLICT(id) DO NOTHING`,
+  ).run({
+    $id: record.id,
+    $sessionID: record.sessionID,
+    $source: sanitizeLabel(record.source, 64),
+    $at: timestamp(record.at) ?? Date.now(),
+    $cost: Math.max(0, finite(record.cost)),
+    $input: tokenCount(record.input),
+    $output: tokenCount(record.output),
+    $reasoning: tokenCount(record.reasoning),
+    $cacheRead: tokenCount(record.cacheRead),
+    $cacheWrite: tokenCount(record.cacheWrite),
   })
 }
 
@@ -378,19 +534,19 @@ export function recordPrompt(db: Database, record: PromptRecord): void {
   ).run({
     $sessionID: record.sessionID,
     $messageID: record.messageID,
-    $createdAt: record.createdAt ?? null,
+    $createdAt: timestamp(record.createdAt),
   })
 }
 
 export function recordEvent(db: Database, record: EventRecord): void {
   db.query(
-    `INSERT INTO events (session_id, kind, message_id, at, data)
+    `INSERT OR IGNORE INTO events (session_id, kind, message_id, at, data)
      VALUES ($sessionID, $kind, $messageID, $at, $data)`,
   ).run({
     $sessionID: record.sessionID,
     $kind: sanitizeLabel(record.kind, 64),
     $messageID: record.messageID ?? null,
-    $at: record.at ?? Date.now(),
+    $at: timestamp(record.at) ?? Date.now(),
     $data: jsonText(record.data),
   })
 }
@@ -412,8 +568,8 @@ export function upsertSession(db: Database, record: SessionRecord): void {
     // are displayed, so neither may carry control characters into a terminal.
     $directory: record.directory === undefined ? null : sanitizeLabel(record.directory, LABEL_LIMIT),
     $title: record.title === undefined ? null : sanitizeLabel(record.title, LABEL_LIMIT),
-    $startedAt: record.startedAt ?? null,
-    $updatedAt: record.updatedAt ?? null,
+    $startedAt: timestamp(record.startedAt),
+    $updatedAt: timestamp(record.updatedAt),
   })
 }
 
@@ -525,6 +681,25 @@ export function importNdjson(db: Database, text: string): number {
       }
     }
     if (!importable) continue
+    // The database's money rule is an invariant, not a convention: a step that
+    // was charged has no list estimate. A hand-written or foreign dump may
+    // carry both, which every cost total would then add twice. Negative token
+    // counts and costs are nonsense and would poison the sums.
+    const tokenNames = ["input_tokens", "output_tokens", "reasoning_tokens", "cache_read", "cache_write"]
+    for (const name of tokenNames) {
+      const index = names.indexOf(name)
+      if (index !== -1 && typeof values[index] === "number") values[index] = Math.max(0, Math.floor(values[index] as number))
+    }
+    const costIndex = names.indexOf("cost")
+    if (costIndex !== -1 && typeof values[costIndex] === "number") {
+      const cost = Math.max(0, values[costIndex] as number)
+      values[costIndex] = cost
+      const listIndex = names.indexOf("list_cost")
+      if (table === "steps" && cost > 0 && listIndex !== -1) {
+        names.splice(listIndex, 1)
+        values.splice(listIndex, 1)
+      }
+    }
     const placeholders = names.map(() => "?").join(", ")
     db.query(`INSERT OR IGNORE INTO ${table} (${names.join(", ")}) VALUES (${placeholders})`).run(...values)
     imported += 1

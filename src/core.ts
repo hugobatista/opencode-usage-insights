@@ -485,7 +485,11 @@ function trimZeros(value: string): string {
 }
 
 export function formatCost(value: number): string {
-  if (value <= 0) return "$0"
+  if (!Number.isFinite(value) || value <= 0) return "$0"
+  // Four decimals is the display precision below a dollar; a real, positive
+  // amount that rounds to `$0.0000` would read as free, so it is shown as a
+  // bound instead. This keeps a tiny list estimate distinguishable from zero.
+  if (value < 0.00005) return "<$0.0001"
   if (value < 1) return `$${value.toFixed(4)}`
   return `$${value.toFixed(2)}`
 }

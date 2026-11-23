@@ -84,6 +84,23 @@ describe("costOf", () => {
     expect(costOf(prices, GO, { input: 1_001 })).toBeCloseTo((1_001 * 2) / 1_000_000, 12)
   })
 
+  test("compares a negative tier size the way the host does", () => {
+    const prices = table([{ tier: { type: "context", size: -1 }, input: 2, output: 4, cache: { read: 0, write: 0 } }])
+    // The host's `prompt > size` is true for every non-negative prompt, so the
+    // tier applies; a real catalog never produces this, but the mirror is exact.
+    expect(costOf(prices, GO, { input: 1_000 })).toBeCloseTo((1_000 * 2) / 1_000_000, 12)
+  })
+
+  test("does not treat a tier with an unusable size as the base price", () => {
+    const prices = table([{ tier: { type: "context" }, input: 5, output: 5, cache: { read: 0, write: 0 } }])
+    // The host finds no applicable entry for this shape and records zero; the
+    // plugin reports no estimate instead of inventing the tier price.
+    expect(costOf(prices, GO, { input: 1_000 })).toBeUndefined()
+    // A valid base entry next to the malformed one is still the fallback.
+    const mixed = table([{ tier: { type: "context" }, input: 5, output: 5, cache: { read: 0, write: 0 } }, { input: 1, output: 2, cache: { read: 0, write: 0 } }])
+    expect(costOf(mixed, GO, { input: 1_000 })).toBeCloseTo(0.001, 12)
+  })
+
   test("does not price an unknown model", () => {
     const prices = table([{ input: 1, output: 2, cache: { read: 0, write: 0 } }])
     expect(costOf(prices, { providerID: "opencode", modelID: "other" }, { input: 1_000 })).toBeUndefined()

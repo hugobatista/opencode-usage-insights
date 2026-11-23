@@ -24,7 +24,19 @@ import {
   type LatencyGroupRow,
   type SwitchRow,
 } from "./stats/aggregates"
-import { childSessionIDs, modelKey, models, overview, sessionUsageOf, sessions, spend, STEP_TIME, turns, type Filters } from "./stats/queries"
+import {
+  childSessionIDs,
+  modelKey,
+  models,
+  otherUsageRows,
+  overview,
+  sessionUsageOf,
+  sessions,
+  spend,
+  STEP_TIME,
+  turns,
+  type Filters,
+} from "./stats/queries"
 import type { DbInfo } from "./stats/maintenance"
 import {
   cacheLines,
@@ -202,7 +214,13 @@ function build(request: PanelRequest): PanelLine[] {
       )
     }
     case "periods":
-      return periodLines(periodsOf(stepRows(db, { range, filters }), request.granularity), width, request.granularity, 40, estimates)
+      return periodLines(
+        periodsOf(stepRows(db, { range, filters }), request.granularity, otherUsageRows(db, range, filters)),
+        width,
+        request.granularity,
+        40,
+        estimates,
+      )
     case "latency": {
       // One read of the timings serves the overall block and the group table.
       const timings = timingRows(db, { range, filters })

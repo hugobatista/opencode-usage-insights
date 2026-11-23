@@ -30,6 +30,7 @@ import {
   percentile,
   type Filters,
   type LatencyStats,
+  type OtherUsageRow,
   type Range,
   type Usage,
 } from "./queries"
@@ -792,6 +793,8 @@ export type PeriodRow = {
   sessions: number
   usage: Usage
   cache: CacheStats
+  /** Compaction/title money included in `usage.cost`, when the period has any. */
+  otherCost?: number | undefined
 }
 
 /** ISO-8601 week number and its Monday, in local time. */
@@ -822,12 +825,22 @@ export function periodStart(at: number, granularity: PeriodGranularity): { key: 
   return { key, label: key, start: start.getTime() }
 }
 
-/** Totals per local calendar day, week or month, oldest first. */
-export function periodsOf(rows: readonly StepRow[], granularity: PeriodGranularity): PeriodRow[] {
-  const out: PeriodRow[] = []
+/**
+ * Totals per local calendar day, week or month, oldest first.
+ *
+ * `otherRows` are the host's non-step usage records (compaction and title
+ * generations). Their cost is added to the bucket they fall in, because the
+ * session's own total includes it; the token buckets stay step-based.
+ */
+export function periodsOf(
+  rows: readonly StepRow[],
+  granularity: PeriodGranularity,
+  otherRows: readonly OtherUsageRow[] = [],
+): PeriodRow[] {
+  const byKey = new Map<string, PeriodRow>()
   for (const [key, steps] of groupBy(rows, (step) => periodStart(step.at, granularity).key)) {
     const period = periodStart(steps[0]!.at, granularity)
-    out.push({
+    byKey.set(key, {
       key,
       label: period.label,
       at: period.start,
@@ -837,5 +850,27 @@ export function periodsOf(rows: readonly StepRow[], granularity: PeriodGranulari
       cache: cacheStatsOfSteps(steps),
     })
   }
-  return out.sort((left, right) => left.at - right.at)
+  for (const [key, group] of groupBy(otherRows, (row) => periodStart(row.at, granularity).key)) {
+    const cost = group.reduce((sum, row) => sum + row.cost, 0)
+    const existing = byKey.get(key)
+    if (existing !== undefined) {
+      existing.usage.cost += cost
+      existing.otherCost = (existing.otherCost ?? 0) + cost
+      continue
+    }
+    // A period with a compaction or title but no assistant step still has a
+    // cost and a session: it must not disappear from the calendar.
+    const period = periodStart(group[0]!.at, granularity)
+    byKey.set(key, {
+      key,
+      label: period.label,
+      at: period.start,
+      steps: 0,
+      sessions: new Set(group.map((row) => row.sessionID)).size,
+      usage: { ...usageOf([]), cost },
+      cache: cacheStatsOfSteps([]),
+      otherCost: cost,
+    })
+  }
+  return [...byKey.values()].sort((left, right) => left.at - right.at)
 }

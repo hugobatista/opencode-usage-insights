@@ -9,6 +9,8 @@ import {
   formatDuration,
   formatLine,
   formatLineSegments,
+  formatMoney,
+  formatSpend,
   formatTokens,
   isNoiseDrop,
   stepEnd,
@@ -471,6 +473,16 @@ describe("formatCost", () => {
     expect(formatCost(0)).toBe("$0")
     expect(formatCost(0.0231)).toBe("$0.0231")
     expect(formatCost(2.5)).toBe("$2.50")
+  })
+
+  test("shows a bound instead of rounding a real amount to zero", () => {
+    // The display precision is four decimals; `$0.0000` would read as free.
+    expect(formatCost(0.00004)).toBe("<$0.0001")
+    expect(formatMoney(0, 0.00004)).toBe("≈ <$0.0001")
+    expect(formatSpend(0, 0.00004)).toBe("≈<$0.0001")
+    // A value that cannot be money at all is not printed as `$NaN`.
+    expect(formatCost(Number.NaN)).toBe("$0")
+    expect(formatCost(Number.POSITIVE_INFINITY)).toBe("$0")
   })
 })
 

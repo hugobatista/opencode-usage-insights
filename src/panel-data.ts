@@ -422,6 +422,8 @@ export function helpLines(width: number): PanelLine[] {
     { text: "  out       everything generated: visible output + reasoning" },
     { text: "  reasoning part of `out`" },
     { text: "  cost      money, not tokens: a turn sums every step; $0 is left out" },
+    { text: "  other     compaction/title usage: money with no assistant step;" },
+    { text: "            overview, periods and sessions include it; model rows do not" },
     { text: "  ≈         list-price estimate for steps the host reported as $0;" },
     { text: "            `$0.12 + ≈ $3.40` keeps charged and estimated money apart" },
     { text: "  wall      request → completed step · stream request → last chunk" },
@@ -463,6 +465,11 @@ function usagePairs(usage: Overview | SessionUsage | undefined, estimates = true
   ]
   if (buckets.reasoning > 0) pairs.push(["reasoning", formatTokens(buckets.reasoning)])
   pairs.push(["cost", (estimates ? formatMoney(buckets.cost, buckets.listCost) : undefined) ?? formatCost(buckets.cost)])
+  // The cost total includes compaction and title generations, which have no
+  // step of their own. The row keeps that part visible instead of hiding it in
+  // a total the step views cannot explain.
+  const other = usage.otherCost ?? 0
+  if (other > 0) pairs.push(["other", `${formatCost(other)} comp/title`])
   // The selection's average throughput, the same number the sidebar's session
   // block shows.
   if ("tps" in usage && usage.tps !== undefined) pairs.push(["tps", formatTps(usage.tps)])
@@ -1059,7 +1066,13 @@ export function sessionsLines(
       tone: child ? "muted" : "base",
       row: { kind: "session", value: row.sessionID },
     })
-    const details = [row.directory ?? "", row.models.length > 1 ? count(row.models.length, "model") : ""].filter((part) => part !== "").join(" · ")
+    const details = [
+      row.directory ?? "",
+      row.models.length > 1 ? count(row.models.length, "model") : "",
+      (row.otherCost ?? 0) > 0 ? `other ${formatCost(row.otherCost!)}` : "",
+    ]
+      .filter((part) => part !== "")
+      .join(" · ")
     lines.push({ text: truncate(`${" ".repeat(child ? 2 : 0)}  ${details}`, width), tone: "muted" })
   }
   if (options?.rollup !== undefined && options.rollup.subagentSteps > 0) {
@@ -1107,7 +1120,7 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
   lines.push({ text: "clean up", tone: HEADER_TONE })
   // The retention rows are the only selectable lines here, so the hint says how
   // to pick one and what Enter does: the row is a cutoff, not a count.
-  lines.push({ text: truncate("  ↑↓ pick a retention · enter prunes the steps older than it (asks first) · v gives the space back", width), tone: "muted" })
+  lines.push({ text: truncate("  ↑↓ pick a retention · enter prunes the steps and their other usage (asks first) · v gives the space back", width), tone: "muted" })
   if (data.estimates !== false) {
     lines.push({
       text: truncate(

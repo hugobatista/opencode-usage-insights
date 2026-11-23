@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { openStatsDb, recordEvent, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
+import { openStatsDb, recordEvent, recordPrompt, recordStep, recordUsage, upsertSession } from "../src/stats/db"
 import { backfillListCost, dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
 
 const DAY = 24 * 60 * 60 * 1000
@@ -23,6 +23,8 @@ function seed(): Database {
   recordPrompt(db, { sessionID: "s1", messageID: "p_new", createdAt: NOW - DAY })
   recordEvent(db, { sessionID: "s1", kind: "compaction", at: NOW - 120 * DAY })
   recordEvent(db, { sessionID: "s1", kind: "compaction", at: NOW - DAY })
+  recordUsage(db, { id: "u_old", sessionID: "s1", source: "compaction", at: NOW - 150 * DAY, cost: 0.02 })
+  recordUsage(db, { id: "u_new", sessionID: "s1", source: "title", at: NOW - DAY, cost: 0.01 })
   return db
 }
 
@@ -32,6 +34,7 @@ describe("dbInfo", () => {
     const info = dbInfo(db, ":memory:", NOW)
     expect(info.tables.find((table) => table.name === "steps")!.rows).toBe(3)
     expect(info.tables.find((table) => table.name === "prompts")!.rows).toBe(2)
+    expect(info.tables.find((table) => table.name === "usage")!.rows).toBe(2)
     expect(info.firstAt).toBe(NOW - 200 * DAY)
     expect(info.lastAt).toBe(NOW - 2 * DAY)
     expect(info.removable).toEqual([
@@ -65,13 +68,15 @@ describe("pruneOlderThan", () => {
   test("removes the steps, prompts and compactions older than the cutoff", () => {
     const db = seed()
     const result = pruneOlderThan(db, NOW - 30 * DAY)
-    expect(result).toEqual({ steps: 2, prompts: 1, events: 1 })
+    expect(result).toEqual({ steps: 2, prompts: 1, events: 1, usage: 1 })
     const steps = (db.query("SELECT message_id FROM steps").all() as { message_id: string }[]).map((row) => row.message_id)
     expect(steps).toEqual(["recent"])
     const prompts = (db.query("SELECT message_id FROM prompts").all() as { message_id: string }[]).map((row) => row.message_id)
     expect(prompts).toEqual(["p_new"])
     const events = (db.query("SELECT at FROM events").all() as { at: number }[]).map((row) => row.at)
     expect(events).toEqual([NOW - DAY])
+    const usage = (db.query("SELECT id FROM usage").all() as { id: string }[]).map((row) => row.id)
+    expect(usage).toEqual(["u_new"])
     db.close()
   })
 
@@ -87,13 +92,21 @@ describe("pruneOlderThan", () => {
     expect(result.steps).toBe(5_200)
     expect(db.query("SELECT message_id FROM steps").all()).toEqual([{ message_id: "kept" }])
     // A second pass finds nothing: the loop stops on an empty batch.
-    expect(pruneOlderThan(db, NOW - 30 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0 })
+    expect(pruneOlderThan(db, NOW - 30 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0, usage: 0 })
+    db.close()
+  })
+
+  test("degrades when an older database has no usage table", () => {
+    const db = seed()
+    db.exec("DROP TABLE usage")
+    expect(dbInfo(db, ":memory:", NOW).tables.find((table) => table.name === "usage")!.rows).toBe(0)
+    expect(pruneOlderThan(db, NOW - 30 * DAY).usage).toBe(0)
     db.close()
   })
 
   test("is a no-op when nothing is older than the cutoff", () => {
     const db = seed()
-    expect(pruneOlderThan(db, NOW - 400 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0 })
+    expect(pruneOlderThan(db, NOW - 400 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0, usage: 0 })
     db.close()
   })
 })

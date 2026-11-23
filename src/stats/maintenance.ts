@@ -44,10 +44,21 @@ function size(path: string): number {
   }
 }
 
+/** True when the database carries a table, without throwing on an older file. */
+function hasTable(db: Database, name: string): boolean {
+  try {
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null
+  } catch {
+    return false
+  }
+}
+
 export function dbInfo(db: Database, path: string, now = Date.now()): DbInfo {
   const tables: TableSize[] = TABLES.map((table) => ({
     name: table,
-    rows: (db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n,
+    // A reader can meet a database the recorder has not upgraded yet; a missing
+    // table is zero rows, not a panel that cannot open.
+    rows: hasTable(db, table) ? (db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n : 0,
   }))
   const window = db.query(`SELECT MIN(${STEP_TIME}) AS first, MAX(${STEP_TIME}) AS last FROM steps`).get() as {
     first: number | null
@@ -82,6 +93,8 @@ export type PruneResult = {
   steps: number
   prompts: number
   events: number
+  /** Compaction/title usage records deleted with the steps they belong to. */
+  usage: number
 }
 
 /**
@@ -95,7 +108,7 @@ export type PruneResult = {
  */
 const PRUNE_BATCH = 5_000
 
-function deleteBatched(db: Database, table: "steps" | "prompts" | "events", where: string, cutoff: number): number {
+function deleteBatched(db: Database, table: "steps" | "prompts" | "events" | "usage", where: string, cutoff: number): number {
   // Table names and the WHERE clause are constants of this module: no value
   // from outside is ever interpolated into the statement.
   const statement = db.query(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} LIMIT ${PRUNE_BATCH})`)
@@ -118,6 +131,7 @@ export function pruneOlderThan(db: Database, cutoff: number): PruneResult {
     steps: deleteBatched(db, "steps", `${STEP_TIME} < ?`, cutoff),
     prompts: deleteBatched(db, "prompts", "created_at IS NOT NULL AND created_at < ?", cutoff),
     events: deleteBatched(db, "events", "at IS NOT NULL AND at < ?", cutoff),
+    usage: hasTable(db, "usage") ? deleteBatched(db, "usage", "at IS NOT NULL AND at < ?", cutoff) : 0,
   }
 }
 

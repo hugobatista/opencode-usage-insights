@@ -11,6 +11,7 @@ import {
   openStatsDbWrite,
   recordEvent,
   recordStep,
+  recordUsage,
   upsertSession,
 } from "../src/stats/db"
 
@@ -262,6 +263,94 @@ describe("writing", () => {
     expect(row.kind).toBe("compaction[2J")
     db.close()
   })
+
+  test("keeps a step whose numbers are not finite", () => {
+    const db = openStatsDb(":memory:")
+    // A NaN bound to a NOT NULL column would make SQLite reject the whole row;
+    // the recorder would swallow the error and lose the step's tokens, model
+    // and timing with it. The values are sanitized, not the row dropped.
+    recordStep(db, {
+      messageID: "n1",
+      sessionID: "ses",
+      cost: Number.NaN,
+      input: Number.NaN,
+      output: -5,
+      cacheRead: Number.POSITIVE_INFINITY,
+      createdAt: Number.NaN,
+      recordedAt: BASE,
+    })
+    expect(db.query("SELECT cost, input_tokens, output_tokens, cache_read, created_at FROM steps WHERE message_id = 'n1'").get()).toEqual({
+      cost: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read: 0,
+      created_at: null,
+    })
+    db.close()
+  })
+
+  test("records non-step usage once per host event", () => {
+    const db = openStatsDb(":memory:")
+    recordUsage(db, { id: "u1", sessionID: "ses", source: "compaction", at: BASE, cost: 0.02, input: 10, output: 2 })
+    // A replay carries the same host event ID: it must not add a second row.
+    recordUsage(db, { id: "u1", sessionID: "ses", source: "compaction", at: BASE, cost: 0.02, input: 10, output: 2 })
+    recordUsage(db, { id: "u2", sessionID: "ses", source: "title", at: BASE + 1, cost: 0.01 })
+    expect(db.query("SELECT id, source, cost FROM usage ORDER BY id").all()).toEqual([
+      { id: "u1", source: "compaction", cost: 0.02 },
+      { id: "u2", source: "title", cost: 0.01 },
+    ])
+    db.close()
+  })
+
+  test("ignores a replayed event with the same host ID", () => {
+    const db = openStatsDb(":memory:")
+    recordEvent(db, { sessionID: "ses", kind: "compaction", messageID: "ev1", at: BASE })
+    recordEvent(db, { sessionID: "ses", kind: "compaction", messageID: "ev1", at: BASE })
+    expect(db.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 1 })
+    db.close()
+  })
+})
+
+describe("event migration", () => {
+  test("keeps one copy of a compaction an older recorder stored on every replay", () => {
+    const directory = tempDir("event-dedupe")
+    const path = join(directory, "usage.db")
+    try {
+      const first = openStatsDb(path)
+      // Older recorders had no event ID and inserted a row on every delivery.
+      for (let index = 0; index < 3; index += 1) {
+        first
+          .query("INSERT INTO events (session_id, kind, at, data) VALUES ('ses', 'compaction', ?, ?)")
+          .run(BASE, '{"reason":"auto","cost":0.02,"tokens":{"input":10,"output":2}}')
+      }
+      // A row written by this version already has its `usage` record: the
+      // migration must not backfill it a second time.
+      first
+        .query("INSERT INTO events (session_id, kind, message_id, at, data) VALUES ('ses', 'compaction', 'new', ?, ?)")
+        .run(BASE + 1, '{"reason":"auto","cost":0.05,"tokens":{"input":20,"output":4}}')
+      // A malformed payload must not make the migration (and plugin startup)
+      // fail: the recovery skips it, the event itself is kept.
+      first.query("INSERT INTO events (session_id, kind, at, data) VALUES ('ses', 'compaction', ?, 'not json')").run(BASE + 2)
+      first.close()
+      const second = openStatsDb(path)
+      expect(second.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: 3 })
+      const indexes = (second.query("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map((row) => row.name)
+      expect(indexes).toContain("events_kind_message")
+      // The old compaction payload carried its cost and tokens: the migration
+      // recovers them for the totals instead of leaving them in the event only.
+      // The row that already has a host ID is not recovered again.
+      expect(second.query("SELECT source, cost, input_tokens, output_tokens FROM usage").all()).toEqual([
+        { source: "compaction", cost: 0.02, input_tokens: 10, output_tokens: 2 },
+      ])
+      // Reopening is idempotent: the synthetic ID is stable.
+      second.close()
+      const third = openStatsDb(path)
+      expect(third.query("SELECT COUNT(*) AS n FROM usage").get()).toEqual({ n: 1 })
+      third.close()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("importNdjson", () => {
@@ -314,6 +403,22 @@ describe("importNdjson", () => {
     importNdjson(db, JSON.stringify({ table: "sessions", row: { session_id: "imp", title: huge } }))
     const row = db.query("SELECT title FROM sessions WHERE session_id = 'imp'").get() as { title: string }
     expect(row.title.length).toBeLessThan(5_000)
+    db.close()
+  })
+
+  test("enforces the charged/estimated invariant and non-negative counters", () => {
+    const db = target()
+    const dump = [
+      JSON.stringify({ table: "steps", row: { message_id: "i1", session_id: "imp", cost: 0.5, list_cost: 9, input_tokens: -3, recorded_at: BASE } }),
+      JSON.stringify({ table: "usage", row: { id: "u1", session_id: "imp", source: "compaction", at: BASE, cost: -1, input_tokens: -2 } }),
+    ].join("\n")
+    expect(importNdjson(db, dump)).toBe(2)
+    expect(db.query("SELECT cost, list_cost, input_tokens FROM steps WHERE message_id = 'i1'").get()).toEqual({
+      cost: 0.5,
+      list_cost: null,
+      input_tokens: 0,
+    })
+    expect(db.query("SELECT cost, input_tokens FROM usage WHERE id = 'u1'").get()).toEqual({ cost: 0, input_tokens: 0 })
     db.close()
   })
 
