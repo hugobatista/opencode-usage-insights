@@ -11,6 +11,7 @@ import {
   gapReportOf,
   latencyGroupsOf,
   latencyOf,
+  periodEnd,
   periodsOf,
   stepRows,
   switchesOf,
@@ -25,6 +26,7 @@ import {
   type SwitchRow,
 } from "./stats/aggregates"
 import {
+  buildWhere,
   childSessionIDs,
   modelKey,
   models,
@@ -169,7 +171,7 @@ function build(request: PanelRequest): PanelLine[] {
           session: sessionUsage,
           ...(children.length > 0 ? { subagents: children } : {}),
           range: request.range,
-          activity: activityOf(db, range, now),
+          activity: activityOf(db, range, filters, now),
           coverage: coverageOf(db, { range, filters }),
           estimates,
         },
@@ -213,14 +215,13 @@ function build(request: PanelRequest): PanelLine[] {
         width,
       )
     }
-    case "periods":
-      return periodLines(
-        periodsOf(stepRows(db, { range, filters }), request.granularity, otherUsageRows(db, range, filters)),
-        width,
-        request.granularity,
-        40,
-        estimates,
-      )
+    case "periods": {
+      const rows = periodsOf(stepRows(db, { range, filters }), request.granularity, otherUsageRows(db, range, filters))
+      // Summing the per-period distinct session counts counts a session once
+      // per period; the total row uses the range's own distinct count.
+      const sessions = overview(db, range, filters).sessions
+      return periodLines(rows, width, request.granularity, 40, estimates, sessions)
+    }
     case "latency": {
       // One read of the timings serves the overall block and the group table.
       const timings = timingRows(db, { range, filters })
@@ -350,14 +351,22 @@ function buildDetail(
     ]
   }
   if (row.kind === "period") {
-    // The bucket is one row of the period report: the same query, one row kept.
+    // The bucket is one row of the period report: the providers must be the
+    // ones of this bucket, not of the whole range the report was built from.
     const periods = periodsOf(stepRows(db, { range, filters }), request.granularity)
     const period = periods.find((entry) => entry.key === row.value)
+    // The detail is the intersection of the bucket and the range the report
+    // was built for; a period at the edge of a bounded range must not pull in
+    // the steps that the range excluded.
+    const from = period === undefined ? 0 : Math.max(period.at, range?.from ?? period.at)
+    const to =
+      period === undefined ? 0 : Math.min(periodEnd(period.at, request.granularity), range?.to ?? Number.POSITIVE_INFINITY)
+    const steps = period === undefined ? [] : stepRows(db, { range: { from, to }, filters })
     return [
       head,
       { text: `${formatCount(period?.steps ?? 0)} steps`, tone: "muted" },
       { text: "", tone: "muted" },
-      ...providerSummaryLines(providerSummaryOf(stepRows(db, { range, filters })), width, 40, estimates),
+      ...providerSummaryLines(providerSummaryOf(steps), width, 40, estimates),
       { text: "", tone: "muted" },
       back,
     ]
@@ -374,10 +383,17 @@ function percent(value: number | undefined): string {
 // ---------------------------------------------------------------------------
 
 function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean, estimates = true): ReturnType<typeof models> {
-  const sign = desc ? -1 : 1
+  // `desc` is the user-facing direction: descending means the larger value
+  // comes first. The comparator reads `pick(right) - pick(left)`, so the
+  // multiplier must be +1 for descending, not -1.
+  const sign = desc ? 1 : -1
   const pick = (model: (typeof rows)[number]): number => {
     if (sort === "cached") return model.totals.cached
-    if (sort === "out") return model.totals.output
+    if (sort === "hit") {
+      const prompt = model.totals.input + model.totals.cached + model.totals.cacheWrite
+      return prompt > 0 ? model.totals.cached / prompt : -1
+    }
+    if (sort === "out") return model.totals.output + model.totals.reasoning
     if (sort === "cost") return estimates ? spend(model.totals) : model.totals.cost
     return model.totals.steps
   }
@@ -385,7 +401,10 @@ function sortModels(rows: ReturnType<typeof models>, sort: string, desc: boolean
 }
 
 function sortProviders(rows: readonly ProviderSummary[], sort: string, desc: boolean, estimates = true): ProviderSummary[] {
-  const sign = desc ? -1 : 1
+  // `desc` is the user-facing direction: descending means the larger value
+  // comes first. The comparator reads `pick(right) - pick(left)`, so the
+  // multiplier must be +1 for descending, not -1.
+  const sign = desc ? 1 : -1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "cached") return row.cache.cached
     if (sort === "hit") return row.cache.hit ?? -1
@@ -398,7 +417,10 @@ function sortProviders(rows: readonly ProviderSummary[], sort: string, desc: boo
 }
 
 function sortLatency(rows: readonly LatencyGroupRow[], sort: string, desc: boolean): LatencyGroupRow[] {
-  const sign = desc ? -1 : 1
+  // `desc` is the user-facing direction: descending means the larger value
+  // comes first. The comparator reads `pick(right) - pick(left)`, so the
+  // multiplier must be +1 for descending, not -1.
+  const sign = desc ? 1 : -1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "tps") return row.tps.p50 ?? -1
     if (sort === "wall") return row.wall.p50 ?? -1
@@ -408,7 +430,10 @@ function sortLatency(rows: readonly LatencyGroupRow[], sort: string, desc: boole
 }
 
 function sortSessions(rows: ReturnType<typeof sessions>, sort: string, desc: boolean, estimates = true): ReturnType<typeof sessions> {
-  const sign = desc ? -1 : 1
+  // `desc` is the user-facing direction: descending means the larger value
+  // comes first. The comparator reads `pick(right) - pick(left)`, so the
+  // multiplier must be +1 for descending, not -1.
+  const sign = desc ? 1 : -1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "steps") return row.steps
     if (sort === "cached") return row.cached
@@ -419,10 +444,13 @@ function sortSessions(rows: ReturnType<typeof sessions>, sort: string, desc: boo
 }
 
 function sortTurns(rows: ReturnType<typeof turns>, sort: string, desc: boolean, estimates = true): ReturnType<typeof turns> {
-  const sign = desc ? -1 : 1
+  // `desc` is the user-facing direction: descending means the larger value
+  // comes first. The comparator reads `pick(right) - pick(left)`, so the
+  // multiplier must be +1 for descending, not -1.
+  const sign = desc ? 1 : -1
   const pick = (row: (typeof rows)[number]): number => {
     if (sort === "cost") return estimates ? spend(row.totals) : row.totals.cost
-    if (sort === "tokens") return row.totals.cached + row.totals.input + row.totals.output
+    if (sort === "tokens") return row.totals.cached + row.totals.input + row.totals.cacheWrite + row.totals.output + row.totals.reasoning
     return row.endAt ?? 0
   }
   return [...rows].sort((left, right) => sign * (pick(right) - pick(left)))
@@ -458,10 +486,21 @@ function topCacheModels(pairs: readonly PairRow[]): CacheModelRow[] {
  * range reads as roughly 48 bars, and always from a fixed ladder so the axis is
  * stable between refreshes.
  */
-function activityOf(db: Database, range: { from?: number | undefined; to?: number | undefined } | undefined, now: number): number[] {
-  // All time has no lower bound: span the recorded window instead of starting
+function activityOf(
+  db: Database,
+  range: { from?: number | undefined; to?: number | undefined } | undefined,
+  filters: Filters | undefined,
+  now: number,
+): number[] {
+  // The sparkline is part of the filtered overview: a session or model view
+  // must not draw the activity of every other session. The range and filters
+  // are the same ones the step aggregates use.
+  const filter = buildWhere(range, filters, STEP_TIME)
+  // All time has no lower bound: span the filtered window instead of starting
   // at the epoch, or the sparkline would be one bar of data and 46 of nothing.
-  const earliest = db.query(`SELECT MIN(${STEP_TIME}) AS at FROM steps`).get() as { at: number | null } | null
+  const earliest = db.query(`SELECT MIN(${STEP_TIME}) AS at FROM steps ${filter.where}`).get(...filter.params) as {
+    at: number | null
+  } | null
   const from = range?.from ?? earliest?.at ?? 0
   const to = range?.to ?? now
   const span = Math.max(1, to - from)
@@ -469,12 +508,11 @@ function activityOf(db: Database, range: { from?: number | undefined; to?: numbe
   const bucket = ladder.find((size) => span / size <= 48) ?? ladder[ladder.length - 1]!
   const rows = db
     .query(
-      `SELECT CAST(COALESCE(created_at, recorded_at) / ? AS INTEGER) AS bucket, COUNT(*) AS steps
-         FROM steps
-        WHERE COALESCE(created_at, recorded_at) >= ?
+      `SELECT CAST(${STEP_TIME} / ? AS INTEGER) AS bucket, COUNT(*) AS steps
+         FROM steps ${filter.where}
         GROUP BY bucket ORDER BY bucket`,
     )
-    .all(bucket, from) as { bucket: number; steps: number }[]
+    .all(bucket, ...filter.params) as { bucket: number; steps: number }[]
   if (rows.length === 0) return []
   const first = Math.floor(from / bucket)
   const last = rows[rows.length - 1]!.bucket

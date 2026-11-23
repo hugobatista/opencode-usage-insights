@@ -274,7 +274,13 @@ function groupedRows(db: Database, options?: Options): GroupedRow[] {
 
 /** The three measures a latency report is made of. */
 function timingOf(step: StepRow): { wall: number | undefined; stream: number | undefined; tps: number | undefined } {
-  const wall = step.createdAt !== undefined && step.completedAt !== undefined ? step.completedAt - step.createdAt : undefined
+  // A clock adjustment can stamp a step as completed before it was created.
+  // A negative wall time is not a latency; it would also drag the percentiles
+  // down, so the window is clamped at zero.
+  const wall =
+    step.createdAt !== undefined && step.completedAt !== undefined
+      ? Math.max(0, step.completedAt - step.createdAt)
+      : undefined
   const stream =
     step.createdAt !== undefined && step.streamedAt !== undefined && step.streamedAt > step.createdAt ? step.streamedAt - step.createdAt : undefined
   return { wall, stream, tps: tokensPerSecond(step.output + step.reasoning, step.createdAt, step.streamedAt) }
@@ -732,7 +738,15 @@ function groupValues(steps: readonly StepRow[]): { cache: CacheStats; tps: numbe
 
 function providerOf(steps: readonly StepRow[], models: string): Omit<ProviderSummary, "provider"> & { provider: string | undefined } {
   const values = groupValues(steps)
-  const times = steps.map((step) => step.at)
+  // A long-lived provider can hold a million steps. Spreading that into
+  // `Math.min`/`Math.max` exceeds the call-stack argument limit, so the bounds
+  // are folded instead.
+  let firstAt: number | undefined
+  let lastAt: number | undefined
+  for (const step of steps) {
+    if (firstAt === undefined || step.at < firstAt) firstAt = step.at
+    if (lastAt === undefined || step.at > lastAt) lastAt = step.at
+  }
   return {
     provider: steps[0]!.providerID,
     models: models.split("\u0000"),
@@ -741,8 +755,8 @@ function providerOf(steps: readonly StepRow[], models: string): Omit<ProviderSum
     cache: values.cache,
     tps: values.tps,
     wall: values.wall,
-    firstAt: times.length > 0 ? Math.min(...times) : undefined,
-    lastAt: times.length > 0 ? Math.max(...times) : undefined,
+    firstAt,
+    lastAt,
   }
 }
 
@@ -806,6 +820,14 @@ export function isoWeek(date: Date): { year: number; week: number; monday: Date 
   firstThursday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7) + 3)
   const week = 1 + Math.round((thursday.getTime() - firstThursday.getTime()) / (7 * 24 * 60 * 60 * 1000))
   return { year: thursday.getFullYear(), week, monday }
+}
+
+/** Local end (exclusive) of the period that starts at `at`. */
+export function periodEnd(at: number, granularity: PeriodGranularity): number {
+  const date = new Date(at)
+  if (granularity === "month") return new Date(date.getFullYear(), date.getMonth() + 1, 1).getTime()
+  if (granularity === "week") return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 7).getTime()
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).getTime()
 }
 
 /** Key, label and local start of the period `at` falls in. */

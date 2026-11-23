@@ -144,6 +144,41 @@ describe("buildPanel", () => {
     db.close()
   })
 
+  test("models: sorting by hit uses the hit column, not the step count", () => {
+    const db = openStatsDb(":memory:")
+    for (const [id, at] of [
+      ["l1", BASE],
+      ["l2", BASE + MIN],
+    ] as const) {
+      recordStep(db, {
+        messageID: id,
+        sessionID: "s1",
+        providerID: "p",
+        modelID: "low-hit",
+        input: 100,
+        createdAt: at,
+        completedAt: at + 1,
+        finish: "stop",
+      })
+    }
+    recordStep(db, {
+      messageID: "h1",
+      sessionID: "s1",
+      providerID: "p",
+      modelID: "high-hit",
+      cacheRead: 100,
+      createdAt: BASE + 2 * MIN,
+      completedAt: BASE + 2 * MIN + 1,
+      finish: "stop",
+    })
+    const first = buildPanel(request(db, { view: "models", sort: "hit", sortDesc: true })).find(
+      (line) => line.row?.kind === "model",
+    )!
+    // The buggy fallback sorted by steps and put low-hit (two steps) first.
+    expect(first.row!.value).toBe("high-hit")
+    db.close()
+  })
+
   test("providers: one row per provider, with the models it served", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "providers" }))
@@ -190,6 +225,64 @@ describe("buildPanel", () => {
     db.close()
   })
 
+  test("periods: the detail lists the providers of that bucket", () => {
+    const db = openStatsDb(":memory:")
+    const DAY = 24 * 60 * 60 * 1_000
+    recordStep(db, {
+      messageID: "a",
+      sessionID: "s1",
+      providerID: "p-one",
+      modelID: "m",
+      input: 10,
+      createdAt: BASE,
+      completedAt: BASE + 1_000,
+      finish: "stop",
+    })
+    recordStep(db, {
+      messageID: "b",
+      sessionID: "s2",
+      providerID: "p-two",
+      modelID: "m",
+      input: 10,
+      createdAt: BASE + DAY,
+      completedAt: BASE + DAY + 1_000,
+      finish: "stop",
+    })
+    const days = buildPanel(request(db, { view: "periods", granularity: "day" }))
+    // Rows are newest first: the first one is the second day, p-two.
+    const first = days.find((line) => line.row?.kind === "period")!
+    const detail = buildPanel(request(db, { view: "periods", granularity: "day", detail: first.row }))
+    expect(text(detail)).toContain("p-two")
+    expect(text(detail)).not.toContain("p-one")
+    db.close()
+  })
+
+  test("periods: the total counts a session once, not once per bucket", () => {
+    const db = openStatsDb(":memory:")
+    for (const [messageID, at] of [
+      ["a", BASE],
+      ["b", BASE + 2 * 24 * 60 * MIN],
+    ] as const) {
+      recordStep(db, {
+        messageID,
+        sessionID: "s1",
+        providerID: "p",
+        modelID: "m",
+        input: 10,
+        createdAt: at,
+        completedAt: at + 1_000,
+        finish: "stop",
+        recordedAt: at,
+      })
+    }
+    const lines = buildPanel(request(db, { view: "periods", granularity: "day" }))
+    const total = lines.find((line) => line.text.startsWith("total"))!
+    // Columns: period (12), steps (7), sess (7), … separated by single spaces.
+    expect(total.text.slice(13, 20).trim()).toBe("2") // steps, both days
+    expect(total.text.slice(21, 28).trim()).toBe("1") // one session, not two
+    db.close()
+  })
+
   test("latency: overall percentiles and a breakdown by the group that matters", () => {
     const db = seed()
     const lines = buildPanel(request(db, { view: "latency" }))
@@ -208,6 +301,35 @@ describe("buildPanel", () => {
     expect(text(lines)).toContain("↳ Subagent")
     expect(text(lines)).toContain("subagents")
     expect(text(lines)).toContain("hit")
+    db.close()
+  })
+
+  test("sessions: the default sort is newest first", () => {
+    const db = openStatsDb(":memory:")
+    recordStep(db, { messageID: "a", sessionID: "s1", providerID: "p", modelID: "m", input: 10, createdAt: BASE, completedAt: BASE + 1, finish: "stop" })
+    recordStep(db, { messageID: "b", sessionID: "s2", providerID: "p", modelID: "m", input: 10, createdAt: BASE + MIN, completedAt: BASE + MIN + 1, finish: "stop" })
+    const first = buildPanel(request(db, { view: "sessions" })).find((line) => line.row?.kind === "session")!
+    expect(first.row!.value).toBe("s2")
+    db.close()
+  })
+
+  test("turns: the default sort is newest first", () => {
+    const db = openStatsDb(":memory:")
+    recordPrompt(db, { sessionID: "s1", messageID: "p1", createdAt: BASE })
+    recordPrompt(db, { sessionID: "s1", messageID: "p2", createdAt: BASE + MIN })
+    recordStep(db, { messageID: "a1", sessionID: "s1", providerID: "p", modelID: "m1", input: 10, createdAt: BASE + 1, completedAt: BASE + 2, finish: "stop" })
+    recordStep(db, {
+      messageID: "a2",
+      sessionID: "s1",
+      providerID: "p",
+      modelID: "m2",
+      input: 10,
+      createdAt: BASE + MIN + 1,
+      completedAt: BASE + MIN + 2,
+      finish: "stop",
+    })
+    const first = buildPanel(request(db, { view: "turns" })).find((line) => line.row?.kind === "turn")!
+    expect(first.text).toContain("m2")
     db.close()
   })
 

@@ -162,14 +162,32 @@ export function transcriptTail(messages: readonly TranscriptMessage[], count: nu
   return segments
 }
 
+/**
+ * A token count or a timestamp read from a host message: `undefined` for a
+ * timestamp that is not a finite number, zero for a count that is not. The
+ * recorder applies the same rule before SQLite; doing it here keeps the live
+ * line on the same footing when a payload is malformed.
+ */
+function countOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
+function amountOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+function stampOf(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
 export function tokenCounts(message: AssistantMessage): { input: number; output: number; reasoning: number; read: number; write: number } {
   const tokens = message.tokens
   return {
-    input: tokens?.input ?? 0,
-    output: tokens?.output ?? 0,
-    reasoning: tokens?.reasoning ?? 0,
-    read: tokens?.cache?.read ?? 0,
-    write: tokens?.cache?.write ?? 0,
+    input: countOf(tokens?.input),
+    output: countOf(tokens?.output),
+    reasoning: countOf(tokens?.reasoning),
+    read: countOf(tokens?.cache?.read),
+    write: countOf(tokens?.cache?.write),
   }
 }
 
@@ -182,8 +200,8 @@ export function totalize(steps: readonly AssistantMessage[]): Totals {
     totals.output += counts.output
     totals.reasoning += counts.reasoning
     totals.cacheWrite += counts.write
-    totals.cost += step.cost ?? 0
-    totals.listCost += step.listCost ?? 0
+    totals.cost += amountOf(step.cost)
+    totals.listCost += amountOf(step.listCost)
   }
   return totals
 }
@@ -199,17 +217,17 @@ export function identityKey(model: ModelRefLike | undefined): string | undefined
 }
 
 export function cacheRead(message: AssistantMessage | undefined): number {
-  return message?.tokens?.cache?.read ?? 0
+  return countOf(message?.tokens?.cache?.read)
 }
 
 export function stepCreated(message: AssistantMessage | undefined): number | undefined {
-  return message?.time?.created
+  return stampOf(message?.time?.created)
 }
 
 export function stepEnd(message: AssistantMessage | undefined): number | undefined {
   const time = message?.time
   if (!time) return undefined
-  return time.completed ?? time.streamed ?? time.created
+  return stampOf(time.completed) ?? stampOf(time.streamed) ?? stampOf(time.created)
 }
 
 /**
@@ -255,8 +273,8 @@ export function stepGap(reference: AssistantMessage | undefined, current: Assist
  * messages do not record.
  */
 export function stepStreamMs(message: AssistantMessage): number | undefined {
-  const created = message.time?.created
-  const streamed = message.time?.streamed
+  const created = stampOf(message.time?.created)
+  const streamed = stampOf(message.time?.streamed)
   if (created === undefined || streamed === undefined || streamed <= created) return undefined
   return streamed - created
 }
@@ -270,8 +288,8 @@ export function stepStreamMs(message: AssistantMessage): number | undefined {
  * recorder (which stores it per step) and the latency view.
  */
 export function tokensPerSecond(produced: number, from: number | undefined, to: number | undefined): number | undefined {
-  if (from === undefined || to === undefined || to <= from) return undefined
-  if (produced <= 0) return undefined
+  if (from === undefined || to === undefined || !Number.isFinite(from) || !Number.isFinite(to) || to <= from) return undefined
+  if (!Number.isFinite(produced) || produced <= 0) return undefined
   return (produced / (to - from)) * 1000
 }
 
@@ -338,7 +356,7 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
   return {
     endAt: stepEnd(lastStep),
     startAt: stepCreated(settled[0] ?? lastStep),
-    promptAt: last.prompt?.time?.created,
+    promptAt: stampOf(last.prompt?.time?.created),
     promptGapMs: promptGap(last.prompt, previous?.prompt),
     providerID: provider,
     modelID: lastStep.model?.id,
@@ -356,8 +374,8 @@ export function computeTurn(messages: readonly TranscriptMessage[], session?: To
 }
 
 function promptGap(current: TranscriptMessage | undefined, previous: TranscriptMessage | undefined): number | undefined {
-  const now = current?.time?.created
-  const before = previous?.time?.created
+  const now = stampOf(current?.time?.created)
+  const before = stampOf(previous?.time?.created)
   if (now === undefined || before === undefined) return undefined
   return Math.max(0, now - before)
 }
@@ -449,12 +467,14 @@ export const DEFAULT_FIELDS: LineFields = {
 }
 
 export function formatClock(ms: number): string {
+  if (!Number.isFinite(ms)) return "--:--"
   const date = new Date(ms)
   const pad = (value: number) => String(value).padStart(2, "0")
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms)) return "–"
   const totalSeconds = Math.max(0, Math.floor(ms / 1000))
   const seconds = totalSeconds % 60
   const minutes = Math.floor(totalSeconds / 60) % 60
@@ -467,7 +487,7 @@ export function formatDuration(ms: number): string {
 }
 
 export function formatTokens(value: number): string {
-  const n = Math.max(0, Math.round(value))
+  const n = Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0
   if (n < 1_000) return String(n)
   if (n < 999_500) {
     const k = n / 1_000

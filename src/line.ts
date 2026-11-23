@@ -149,17 +149,27 @@ function toModelRef(model: RuntimeModelRef | undefined): { providerID: string; i
  * Session-wide accumulated usage: the host's tokens and charged cost, plus the
  * list-price estimate the plugin recorded for the session's steps.
  */
+/** A count from a host payload: finite, non-negative and integral. */
+function countOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
+/** A money amount from a host payload. */
+function amountOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
 export function sessionTotals(info: RuntimeSessionInfo | undefined, listCost = 0): Totals | undefined {
   if (info === undefined) return undefined
   const tokens = info.tokens
   return {
-    input: tokens?.input ?? 0,
-    cached: tokens?.cache?.read ?? 0,
-    output: tokens?.output ?? 0,
-    reasoning: tokens?.reasoning ?? 0,
-    cacheWrite: tokens?.cache?.write ?? 0,
-    cost: info.cost ?? 0,
-    listCost,
+    input: countOf(tokens?.input),
+    cached: countOf(tokens?.cache?.read),
+    output: countOf(tokens?.output),
+    reasoning: countOf(tokens?.reasoning),
+    cacheWrite: countOf(tokens?.cache?.write),
+    cost: amountOf(info.cost),
+    listCost: amountOf(listCost),
     steps: 0,
   }
 }

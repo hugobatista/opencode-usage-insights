@@ -188,6 +188,24 @@ describe("token accounting", () => {
     expect(totals).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, listCost: 0, steps: 1 })
   })
 
+  test("totalize ignores non-finite token and cost values", () => {
+    const totals = totalize([
+      {
+        type: "assistant",
+        id: "a1",
+        tokens: {
+          input: Number.NaN,
+          output: -5,
+          reasoning: Number.POSITIVE_INFINITY,
+          cache: { read: Number.NaN, write: -2 },
+        },
+        cost: Number.NaN,
+        listCost: Number.NEGATIVE_INFINITY,
+      },
+    ])
+    expect(totals).toEqual({ input: 0, cached: 0, output: 0, reasoning: 0, cacheWrite: 0, cost: 0, listCost: 0, steps: 1 })
+  })
+
   test("identityKey includes the variant when present", () => {
     expect(identityKey({ providerID: "opencode", id: "m" })).toBe("opencode/m")
     expect(identityKey({ providerID: "opencode", id: "m", variant: "max" })).toBe("opencode/m#max")
@@ -450,6 +468,10 @@ describe("formatDuration", () => {
     expect(formatDuration(47_520_000)).toBe("13h12m")
     expect(formatDuration(90_000_000)).toBe("1d1h")
   })
+  test("does not print a malformed duration", () => {
+    expect(formatDuration(Number.NaN)).toBe("–")
+    expect(formatDuration(Number.POSITIVE_INFINITY)).toBe("–")
+  })
 })
 
 describe("formatTokens", () => {
@@ -465,6 +487,11 @@ describe("formatTokens", () => {
     expect(formatTokens(1_530_000)).toBe("1.53M")
     expect(formatTokens(12_400_000)).toBe("12.4M")
     expect(formatTokens(150_000_000)).toBe("150M")
+  })
+
+  test("a malformed count is zero, not a NaN string", () => {
+    expect(formatTokens(Number.NaN)).toBe("0")
+    expect(formatTokens(Number.POSITIVE_INFINITY)).toBe("0")
   })
 })
 
@@ -490,6 +517,10 @@ describe("formatClock", () => {
   test("renders local wall clock as HH:MM:SS", () => {
     expect(formatClock(new Date(2026, 9, 15, 14, 32, 7).getTime())).toBe("14:32:07")
     expect(formatClock(new Date(2026, 9, 15, 3, 4, 5).getTime())).toBe("03:04:05")
+  })
+
+  test("does not print a malformed clock", () => {
+    expect(formatClock(Number.NaN)).toBe("--:--")
   })
 })
 
@@ -696,5 +727,11 @@ describe("tokensPerSecond", () => {
     expect(tokensPerSecond(100, 1_500, 1_500)).toBeUndefined()
     expect(tokensPerSecond(100, 1_600, 1_500)).toBeUndefined()
     expect(tokensPerSecond(0, 1_000, 1_500)).toBeUndefined()
+  })
+
+  test("refuses non-finite inputs", () => {
+    expect(tokensPerSecond(Number.NaN, 1_000, 1_500)).toBeUndefined()
+    expect(tokensPerSecond(100, Number.NaN, 1_500)).toBeUndefined()
+    expect(tokensPerSecond(100, 1_000, Number.NaN)).toBeUndefined()
   })
 })

@@ -15,7 +15,16 @@ import {
   upsertSession,
   type StepRecord,
 } from "../src/stats/db"
-import { cacheDropsOf, cachePairs, latencyOf, periodsOf, stepRows, ttlEvidenceOf } from "../src/stats/aggregates"
+import {
+  cacheDropsOf,
+  cachePairs,
+  latencyOf,
+  periodEnd,
+  periodStart,
+  periodsOf,
+  stepRows,
+  ttlEvidenceOf,
+} from "../src/stats/aggregates"
 import {
   cacheHitRatio,
   filterOptions,
@@ -171,6 +180,16 @@ describe("stats queries", () => {
     expect(usage.cacheHitRatio).toBeCloseTo(313_500 / (313_500 + 2_550 + 1_200), 10)
   })
 
+  test("overview counts the prompts of the session it was asked about", () => {
+    const db = seed()
+    // s1 has four prompts, s2 one; a session block must not show the global
+    // count, and the range still applies on top of the session.
+    expect(overview(db, undefined, { sessionID: "s1" }).prompts).toBe(4)
+    expect(overview(db, undefined, { sessionID: "s2" }).prompts).toBe(1)
+    expect(overview(db, { from: 0, to: 1_600_000 }, { sessionID: "s1" }).prompts).toBe(2)
+    db.close()
+  })
+
   test("overview reports the weighted streaming rate", () => {
     const db = freshDb()
     recordStep(db, { messageID: "r1", sessionID: "s", output: 100, createdAt: 0, streamedAt: 1_000, completedAt: 1_100 })
@@ -259,6 +278,26 @@ describe("stats queries", () => {
     expect(second!.modelID).toBe("m2")
     expect(second!.providers[0]!.providerID).toBe("github-copilot")
     expect(second!.totals.steps).toBe(3)
+  })
+
+  test("models ranks by every billed bucket, not only visible output", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "a", sessionID: "s", providerID: "p", modelID: "visible", input: 100, recordedAt: 1 })
+    recordStep(db, { messageID: "b", sessionID: "s", providerID: "p", modelID: "thinking", reasoning: 200, recordedAt: 1 })
+    recordStep(db, { messageID: "c", sessionID: "s", providerID: "p", modelID: "writing", cacheWrite: 300, recordedAt: 1 })
+    // The old key summed input + cached + output only, which ranked a model
+    // with heavy reasoning or cache writes below one with more visible output.
+    expect(models(db).map((row) => row.modelID)).toEqual(["writing", "thinking", "visible"])
+    db.close()
+  })
+
+  test("a step completed before it was created has a zero wall time", () => {
+    const db = freshDb()
+    recordStep(db, { messageID: "a", sessionID: "s", providerID: "p", modelID: "m", createdAt: 2_000, completedAt: 1_000, recordedAt: 1 })
+    // A clock adjustment is not a negative latency, and a negative sample would
+    // drag the p50/p90/p99 down.
+    expect(latencyOf(stepRows(db)).wall.p50).toBe(0)
+    db.close()
   })
 
   test("models groups the same model under every provider that ran it", () => {
@@ -360,6 +399,14 @@ describe("stats queries", () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]!.sessionID).toBe("s2")
     expect(rows[0]!.steps).toBe(3)
+    expect(rows[0]!.prompts).toBe(1)
+  })
+
+  test("sessions counts only the prompts that fall in the range", () => {
+    // s1 has four prompts; only p4 (2.5m) is in this window.
+    const s1 = sessions(seed(), { range: { from: 2_000_000, to: 2_700_000 } }).find((row) => row.sessionID === "s1")!
+    expect(s1.steps).toBe(2)
+    expect(s1.prompts).toBe(1)
   })
 
   test("filterOptions lists the models and the providers actually observed", () => {
@@ -442,6 +489,20 @@ describe("turns", () => {
     expect(turns(db, { sessionID: "s1", range: { from: 5_000 } }).map((row) => row.promptAt)).toEqual([5_000])
     expect(turns(db, { limit: 1 })).toHaveLength(1)
     expect(turns(db, { limit: 1 })[0]!.sessionID).toBe("s2")
+  })
+})
+
+describe("calendar periods", () => {
+  test("starts and ends on the local day, ISO week and month boundaries", () => {
+    const jan15 = new Date(2026, 0, 15).getTime()
+    const jan12 = new Date(2026, 0, 12).getTime() // a Monday
+    expect(periodStart(jan15, "month").key).toBe("2026-01")
+    expect(periodEnd(jan15, "month")).toBe(new Date(2026, 1, 1).getTime())
+    // 2026-01-01 is a Thursday, so 12 January is in ISO week 3.
+    expect(periodStart(jan12, "week").key).toBe("2026-W03")
+    expect(periodEnd(jan12, "week")).toBe(new Date(2026, 0, 19).getTime())
+    expect(periodStart(jan15, "day").key).toBe("2026-01-15")
+    expect(periodEnd(jan15, "day")).toBe(new Date(2026, 0, 16).getTime())
   })
 })
 

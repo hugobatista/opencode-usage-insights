@@ -329,7 +329,19 @@ export function overview(db: Database, range?: Range, filters?: Filters): Overvi
     | null
 
   const prompts = rangeWhere(range, "created_at")
-  const promptRow = db.query(`SELECT COUNT(*) AS prompts FROM prompts ${prompts.where}`).get(...prompts.params) as { prompts: number } | null
+  const promptClauses = prompts.where === "" ? [] : [prompts.where.slice("WHERE ".length)]
+  const promptParams: (string | number)[] = [...prompts.params]
+  // The session block asks for one session: a prompt has no model, so the
+  // session filter is the one that can be honored here. Ignoring it counted
+  // every prompt in the range, including those of other sessions.
+  if (filters?.sessionID !== undefined && filters.sessionID !== "") {
+    promptClauses.push("session_id = ?")
+    promptParams.push(filters.sessionID)
+  }
+  const promptWhere = promptClauses.length > 0 ? `WHERE ${promptClauses.join(" AND ")}` : ""
+  const promptRow = db.query(`SELECT COUNT(*) AS prompts FROM prompts ${promptWhere}`).get(...promptParams) as {
+    prompts: number
+  } | null
 
   const usage = usageFrom(row ?? { steps: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, cost: 0, listCost: 0 })
   const other = otherUsage(db, range, filters)
@@ -426,8 +438,14 @@ function addUsage(target: Usage, source: Usage): void {
   target.listCost += source.listCost
 }
 
-function billedTokens(usage: Pick<Usage, "input" | "cached" | "output">): number {
-  return usage.input + usage.cached + usage.output
+/**
+ * Every bucket a provider bills for: the whole prompt (fresh input, cache
+ * reads and writes) plus visible output and reasoning. Leaving `cacheWrite`
+ * or `reasoning` out ranked a model with heavy cache writes or thinking below
+ * one with more visible output, which is not what "most tokens" means.
+ */
+function billedTokens(usage: Pick<Usage, "input" | "cached" | "cacheWrite" | "output" | "reasoning">): number {
+  return usage.input + usage.cached + usage.cacheWrite + usage.output + usage.reasoning
 }
 
 export type TimelineBucket = { at: number } & Usage
@@ -532,6 +550,20 @@ export function sessions(
   const limit = options?.limit ?? 20
   const clauses = filter.where === "" ? [] : [filter.where.slice("WHERE ".length)]
   const params: (number | string)[] = [...filter.params]
+  // The session row is for a range, so its prompt count has to be for that
+  // range too: a 7-day row must not show the prompts of the session's whole
+  // history. The placeholders sit in the SELECT list, before the WHERE ones.
+  const promptRange: string[] = []
+  const promptParams: number[] = []
+  if (range?.from !== undefined) {
+    promptRange.push("p.created_at >= ?")
+    promptParams.push(range.from)
+  }
+  if (range?.to !== undefined) {
+    promptRange.push("p.created_at < ?")
+    promptParams.push(range.to)
+  }
+  const promptClause = promptRange.length > 0 ? ` AND ${promptRange.join(" AND ")}` : ""
   if (options?.sessionIDs !== undefined) {
     // A specific set of sessions (the subagents of one session): the group by
     // then reads one index range per session instead of every step recorded.
@@ -544,7 +576,7 @@ export function sessions(
       `SELECT st.session_id, s.title, s.directory, s.parent_id,
               GROUP_CONCAT(DISTINCT st.provider_id) AS providers,
               GROUP_CONCAT(DISTINCT st.model_id) AS models,
-              (SELECT COUNT(*) FROM prompts p WHERE p.session_id = st.session_id) AS prompts,
+              (SELECT COUNT(*) FROM prompts p WHERE p.session_id = st.session_id${promptClause}) AS prompts,
               COUNT(*) AS steps,
               COALESCE(SUM(st.input_tokens), 0) AS input,
               COALESCE(SUM(st.cache_read), 0) AS cached,
@@ -563,6 +595,7 @@ export function sessions(
        LIMIT ?`,
     )
     .all(
+      ...promptParams,
       ...params,
       limit,
     ) as (UsageRow & {
@@ -743,7 +776,7 @@ export function turns(
               input_tokens, cache_read, cache_write, output_tokens, reasoning_tokens, cost, list_cost,
               created_at, streamed_at, recorded_at, completed_at, finish
          FROM steps ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
-        ORDER BY session_id, ${STEP_TIME}`,
+        ORDER BY session_id, ${STEP_TIME}, message_id`,
     )
     .all(...params) as TurnStepRow[]
 

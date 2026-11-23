@@ -172,37 +172,41 @@ export function sanitizeSettings(raw: Partial<PanelSettings> | undefined): Panel
 // ---------------------------------------------------------------------------
 
 export function formatPercent(value: number | undefined, digits = 1): string {
-  return value === undefined ? "–" : `${(value * 100).toFixed(digits)}%`
+  if (value === undefined || !Number.isFinite(value)) return "–"
+  return `${(value * 100).toFixed(digits)}%`
 }
 
 export function formatCount(value: number): string {
-  return Math.round(value).toLocaleString("en-US")
+  return Number.isFinite(value) ? Math.round(value).toLocaleString("en-US") : "–"
 }
 
 export function formatMs(value: number | undefined): string {
-  if (value === undefined) return "–"
-  if (value < 1_000) return `${Math.round(value)}ms`
-  if (value < 60_000) return `${(value / 1_000).toFixed(1)}s`
-  return formatDuration(value)
+  if (value === undefined || !Number.isFinite(value)) return "–"
+  const ms = Math.max(0, value)
+  if (ms < 1_000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1_000).toFixed(1)}s`
+  return formatDuration(ms)
 }
 
 export function formatTps(value: number | undefined): string {
-  return value === undefined ? "–" : `${value.toFixed(1)}/s`
+  if (value === undefined || !Number.isFinite(value) || value < 0) return "–"
+  return `${value.toFixed(1)}/s`
 }
 
 /** A rate that has to fit a sidebar: whole numbers from 10 up. */
 export function formatTpsCompact(value: number | undefined): string {
-  if (value === undefined) return "–"
+  if (value === undefined || !Number.isFinite(value) || value < 0) return "–"
   return value >= 10 ? `${Math.round(value)}/s` : `${value.toFixed(1)}/s`
 }
 
 /** Idle gaps are read at a glance: seconds, minutes, hours, days. */
 export function formatGap(value: number | undefined): string {
-  if (value === undefined) return "–"
-  if (value < 60_000) return `${Math.round(value / 1_000)}s`
-  if (value < 3_600_000) return `${Math.round(value / 60_000)}m`
-  if (value < 86_400_000) return `${(value / 3_600_000).toFixed(1)}h`
-  return `${(value / 86_400_000).toFixed(1)}d`
+  if (value === undefined || !Number.isFinite(value)) return "–"
+  const gap = Math.max(0, value)
+  if (gap < 60_000) return `${Math.round(gap / 1_000)}s`
+  if (gap < 3_600_000) return `${Math.round(gap / 60_000)}m`
+  if (gap < 86_400_000) return `${(gap / 3_600_000).toFixed(1)}h`
+  return `${(gap / 86_400_000).toFixed(1)}d`
 }
 
 /** Cut a value to the width, dropping control characters first. */
@@ -887,7 +891,14 @@ export function cacheLines(
 // Periods
 // ---------------------------------------------------------------------------
 
-export function periodLines(rows: readonly PeriodRow[], width: number, granularity: PeriodGranularity, limit = 40, estimates = true): PanelLine[] {
+export function periodLines(
+  rows: readonly PeriodRow[],
+  width: number,
+  granularity: PeriodGranularity,
+  limit = 40,
+  estimates = true,
+  totalSessions?: number,
+): PanelLine[] {
   const lines: PanelLine[] = []
   const totals = rows.reduce(
     (sum, row) => {
@@ -944,7 +955,9 @@ export function periodLines(rows: readonly PeriodRow[], width: number, granulari
       [
         "total",
         formatCount(totals.steps),
-        ...(withSessions ? [formatCount(totals.sessions)] : []),
+        // A session active in several periods is one session, not one per
+        // period: the total row uses the range's distinct count when given.
+        ...(withSessions ? [formatCount(totalSessions ?? totals.sessions)] : []),
         formatTokens(overall.prompt),
         formatTokens(overall.cached),
         formatPercent(overall.hit, 0),
