@@ -5,38 +5,40 @@
 [![Lint](https://img.shields.io/github/actions/workflow/status/hugobatista/opencode-usage-insights/lint.yml?label=Lint)](https://github.com/hugobatista/opencode-usage-insights/actions/workflows/lint.yml)
 [![npm](https://img.shields.io/npm/v/opencode-usage-insights.svg)](https://www.npmjs.com/package/opencode-usage-insights)
 
-OpenCode plugin for one question the host cannot answer: **which provider is
-actually serving each model** — and what that costs. It shows a telemetry line
-above the composer after every finished turn and records every assistant step
-in a local SQLite file, read back through an interactive `/usage` panel.
+**See what each turn costs.** OpenCode reports the cost of each request, but the
+TUI no longer shows it. This plugin puts cost back in view: a telemetry line
+after every turn, the session's running spend in the sidebar, and an interactive
+`/usage` panel with charged cost, list-price estimates, tokens, prompt-cache
+reuse and latency.
 
 ![The telemetry line after a turn](docs/images/line.png)
 
-Everything stays local: one SQLite file under the OpenCode state directory,
-written by the server-side recorder and read by the TUI.
+Everything stays local: no prompts or responses are stored, and nothing leaves
+the machine.
 
 ## What it does
 
-- **The line** (`session.composer.top`): end time, the gap since the previous
-  prompt, the provider and model that ran the turn, turn and session token
-  totals, and warnings when the prompt cache or the provider identity changed.
-  It belongs to finished work, so it stays hidden while a turn is running.
+- **The line** (`session.composer.top`): what the turn cost, the tokens and
+  prompt cache behind it, when it ended, the gap since the previous prompt, the
+  model and configured provider, and warnings when the prompt cache or the
+  provider changed. It belongs to finished work, so it stays hidden while a
+  turn is running.
 - **The `/usage` panel**: nine keyboard-driven views — `overview`, `models`,
   `providers`, `cache`, `periods`, `latency`, `sessions`, `turns`,
   `db` — over five ranges (`session`, `today`, `7d`, `30d`, `all`), with
   drill-downs, sorting, filters and state remembered between openings.
   `/usage models 7d`, `/usage providers 30d`, `/usage turns 7d`.
-- **The session sidebar**: the session's own totals and its last turns, in the
-  same buckets as the line. Three lines per turn — when and through which
+- **The session sidebar**: the session's running spend and its last turns, in
+  the same buckets as the line. Three lines per turn — when and through which
   provider, the prompt volumes, then `hit · tok/s · cost` — plus the model at
   both ends of the block and on any turn that changed it, so the history reads
   whether it is the whole session or a window of a long one:
   `16:54 opencode-go` / `deepseek-v4.1-flash max` /
   `in 1.7k (427.3k) · out 1.06k` / `hit 99.7% · 1.2k/s · $0.0006`.
-- **The record** (server entry): every assistant step with tokens, charged cost,
-  the list-price estimate when the host reported `$0`,
-  timings, finish reason, the provider and model it ran as, and its session and
-  parent ids; prompts, session lifecycle and compaction events too.
+- **The record** (server part): every assistant step with tokens, charged cost,
+  the list-price estimate when the host reported `$0`, timings, finish reason,
+  the configured provider and model it ran through, and its session and parent
+  ids; prompts, session lifecycle and compaction events too.
 - **Portable data** (from a checkout): `bun run report --ndjson` exports the
   whole database, and `--import` merges it back on another machine.
 - **Observational by design**: the plugin never rewrites prompts, requests or
@@ -62,21 +64,17 @@ The plugin is published on npm as `opencode-usage-insights`.
 opencode plugin add opencode-usage-insights
 ```
 
-Or add the package to `~/.config/opencode/opencode.jsonc` (server entry) and
-`~/.config/opencode/cli.json` (TUI entry):
+This adds one entry to the global `opencode.json(c)`. That entry loads both
+parts: the server recorder and the TUI contributions. A TUI-only package goes in
+`~/.config/opencode/cli.json`; this plugin has both parts, so `opencode.json(c)`
+is enough.
+
+If you prefer to edit the configuration yourself:
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-usage-insights"]
-}
-```
-
-```jsonc
-// ~/.config/opencode/cli.json
-{
-  "$schema": "https://opencode.ai/v2/cli.json",
   "plugins": ["opencode-usage-insights"]
 }
 ```
@@ -100,11 +98,6 @@ and the TUI contributions (`src/tui.tsx`) from source:
 { "plugins": [{ "package": "/home/you/code/projects/opencode-usage-insights/src" }] }
 ```
 
-```jsonc
-// ~/.config/opencode/cli.json
-{ "plugins": [{ "package": "/home/you/code/projects/opencode-usage-insights/src" }] }
-```
-
 Configuration changes reload on their own; after changing the plugin's source,
 restart the background service with `opencode service restart`.
 
@@ -121,7 +114,7 @@ turn finishes, and `/usage` (alias `/insights`) opens the panel.
 | --- | --- |
 | `14:32:07` | When the response ended (`completed`, else `streamed`, else `created`). |
 | `Δ 3m12s` | Time since the previous prompt of the same session. |
-| `opencode-go/deepseek-v4.1-flash max` | The identity of the turn: the provider the model ran through, as OpenCode is configured, and the model (the variant as a trailing word; `fields.model`/`fields.variant` hide either). Yellow with `changed` when the provider differs from the previous prompt, `model changed` when only the model does. |
+| `opencode-go/deepseek-v4.1-flash max` | The identity of the turn: the configured provider the model ran through and the model (the variant as a trailing word; `fields.model`/`fields.variant` hide either). Yellow with `changed` when the provider differs from the previous prompt, `model changed` when only the model does. |
 | `in 85.4k (1.62M), cached 1.53M, out 3.7k, cost $0.21` | `in` is the uncached part of the prompt (fresh input + cache writes), the parenthesised value the whole prompt — shown only when the two differ — `cached` its cached part, `out` everything generated (visible output + reasoning), and `cost` what the turn was billed. With several steps the segment reads `3 steps · …` and reports the step the turn ended with (`latest`) for the tokens, while the cost is always the turn's own — every step is paid for; `turnTotals: "sum"` adds every step's tokens instead. |
 | `cost $0.21` | Money, not tokens: a turn sums every step's cost whatever the token view shows. A cost of zero is left out, so a free model reads as free. `fields.cost: false` hides it. |
 | `cost ≈ $0.21` | A **list-price estimate**, not money charged. When the host reports `cost: 0` for a paid model (OpenCode 2.2.0+ with an OpenCode Go subscription), the plugin prices the step from the host's model list. A turn mixing covered and paid steps keeps both parts visible: `cost $0.12 + ≈ $3.40`. `pricing: "off"` hides estimates everywhere; `fields.cost: false` hides both. |
@@ -294,7 +287,7 @@ durable storage, so the panel reopens where it was left.
 | --- | --- |
 | `overview` | Steps, sessions, prompts, `in`/`cached`/`write`/`out`, `hit`, cost, an activity sparkline, a `this session` block and a **data coverage** block (how many models and providers were observed, and how many steps lack a model or a completion — a zero elsewhere is only trustworthy when this is complete). |
 | `models` | Every model with its cache (`hit` and the per-step `hit p50`), tokens, cost, the **providers it ran through** and how often it switched model or provider — with the cache a provider switch cost. `enter` opens the per-provider detail. |
-| `providers` | **Who ran the work**: one row per provider, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. Steps recorded without a provider (a model that was never observed) are dimmed and cannot be drilled into. |
+| `providers` | **Which configured provider ran each model**: one row per provider, with the models it served, steps, share, prompt, cached, `hit`, p50 throughput, wall time and cost. `enter` lists every model it served. Steps recorded without a provider (a model that was never observed) are dimmed and cannot be drilled into. |
 | `cache` | Reuse by model, losses grouped by reason (`expired`, `compaction`, `unknown`), **cache survival against idle time**, reuse kept per provider, the observed TTL bounds (`hits up to` / `drops from`) and the most recent losses. |
 | `periods` | Day, week or month totals — steps, sessions, `in`, `cached`, `write`, `hit`, `out`, cost — with a sparkline per metric and a totals row. `enter` lists the providers of a period. |
 | `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per provider when a model is filtered). `n < 5` is dimmed. |
@@ -310,16 +303,14 @@ A `cost` cell marked `≈` includes list-price estimates for steps the host
 reported as `$0`; the overview and the sidebar keep a mixed total in two parts
 (`$0.12 + ≈ $3.40`) so charged money is never mistaken for the estimate.
 
-The identity of a step is the **provider the model ran through** — `opencode`,
-`opencode-go`, `deepseek`, whatever the provider is called in the OpenCode
-configuration — and the model itself. That is what every view groups by, and it
-is also the whole answer available: a gateway such as OpenCode Console may
-re-route a request to another operator, but that upstream is not observable from
-the plugin, and the identity a request *would* have been routed to is not
-evidence of who ran it. The provider is: the same model through `deepseek` and
-through `opencode-go` are two rows, two caches and two latency profiles, and a
-switch between them forfeits the cache the previous one held (the switch counts
-and the cache losses in the `models` view count exactly that).
+The identity of a step is the **configured provider** the model ran through —
+`opencode`, `opencode-go`, `deepseek`, whatever the provider is called in the
+OpenCode configuration — and the model itself. That is what every view groups
+by. A gateway may route a request to another operator, but that upstream is not
+observable, so it is not guessed. The same model through `deepseek` and through
+`opencode-go` is two rows, two caches and two latency profiles, and a switch
+between them forfeits the cache the previous one held (the switch counts and the
+cache losses in the `models` view count exactly that).
 
 `tps`/`wall`/`stream` are produced tokens per streaming second / request to
 completed step / request to the last chunk. The sidebar's rate (per turn, and
@@ -334,12 +325,12 @@ panel's `?` overlay defines every number in place.
 
 ## Configuration
 
-Options apply to both entries (each side reads the ones it needs):
+Options apply to both parts (each side reads the ones it needs):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | `false` disables that side completely — no line, no panel, no recording. |
-| `db` | per-OS state path | SQLite path override. Must match between the server and TUI entries. |
+| `db` | per-OS state path | SQLite path override. Must match between the server and TUI parts. |
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `pricing` | `"auto"` | `"off"` disables list-price estimates everywhere: no new `list_cost` records, no `≈` on the line, in the panel or in the sidebar, and no historical backfill. Charged money is unaffected. |
 | `sidebar` | `true` | Show the session summary and the per-prompt history — cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
@@ -378,14 +369,15 @@ option overrides both. The file is private to the user: its directory is created
 `0700` and the file `0600` (POSIX), re-applied on every open. The TUI's views
 read through a read-only connection, so they never write, migrate or take the
 recorder's lock; prune, backfill and compact use a separate short-lived writer.
-The server entry applies schema migrations on open; after an upgrade, start it
+The server part applies schema migrations on open; after an upgrade, start it
 once before opening the panel if the file predates the new schema.
 
 Per step the database holds tokens, charged cost, the list-price estimate when
-the host reported `$0`, timings, finish reason, the provider and the model it ran
-as, and the session title and working directory. **Prompts and responses are not
-stored**, and nothing leaves the machine. The schema, the indexes, the identity
-rules and the security notes live in [docs/internals.md](docs/internals.md).
+the host reported `$0`, timings, finish reason, the configured provider and the
+model it ran through, and the session title and working directory. **Prompts and
+responses are not stored**, and nothing leaves the machine. The schema, the
+indexes, the identity rules and the security notes live in
+[docs/internals.md](docs/internals.md).
 
 ## CLI report
 
@@ -429,7 +421,7 @@ bun run docs:images  # re-render docs/images/*.png (needs ImageMagick)
 - `src/recorder.ts` — the event-stream state machine that fills the database.
 - `src/panel-build.ts`, `src/panel.tsx`, `src/sidebar.tsx` — panel assembly, the
   panel component, and the sidebar contribution.
-- `src/index.ts`, `src/tui.tsx` — the server and TUI entries.
+- `src/index.ts`, `src/tui.tsx` — the server and TUI parts.
 - `scripts/` — the demo, report, bench, platform-check and documentation-image
   CLIs, plus the two-entry `Bun.build`.
 

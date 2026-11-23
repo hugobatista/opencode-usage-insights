@@ -1,7 +1,7 @@
 {
   "name": "opencode-usage-insights",
   "version": "0.1.2",
-  "description": "OpenCode V2 plugin: a live turn telemetry line plus a persistent SQLite usage record, read back by an interactive /usage panel — models, providers, prompt cache, periods and latency.",
+  "description": "OpenCode V2 plugin that puts per-turn and per-session cost back in the TUI — charged cost, list-price estimates, tokens, prompt-cache reuse, latency and local history in a live line, sidebar and /usage panel.",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -28,7 +28,9 @@
     "observability",
     "token-usage",
     "cost-tracking",
-    "cache-affinity",
+    "cost-visibility",
+    "cost-estimation",
+    "local-first",
     "bun",
     "typescript"
   ],
