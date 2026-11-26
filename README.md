@@ -29,12 +29,14 @@ the machine.
   drill-downs, sorting, filters and state remembered between openings.
   `/usage models 7d`, `/usage providers 30d`, `/usage turns 7d`.
 - **The session sidebar**: the session's running spend and its last turns, in
-  the same buckets as the line. Three lines per turn — when and through which
-  provider, the prompt volumes, then `hit · tok/s · cost` — plus the model at
-  both ends of the block and on any turn that changed it, so the history reads
-  whether it is the whole session or a window of a long one:
-  `16:54 opencode-go` / `deepseek-v4.1-flash max` /
-  `in 1.7k (427.3k) · out 1.06k` / `hit 99.7% · 1.2k/s · $0.0006`.
+  the same buckets as the line. Three lines per turn — when, through which
+  provider and how long it took, the prompt volumes, then `hit · tok/s · cost`
+  — plus the model at both ends of the block and on any turn that changed it,
+  so the history reads whether it is the whole session or a window of a long
+  one: `16:54 opencode-go · 1m14s` / `deepseek-v4.1-flash max` /
+  `in 1.7k (427.3k) · out 1.06k` / `hit 99.7% · 1.2k/s · $0.0006`. The duration
+  is the turn's wall time, first request to last completion: tool waits inside
+  the turn count, idle time between turns does not.
 - **The record** (server part): every assistant step with tokens, charged cost,
   the list-price estimate when the host reported `$0`, timings, finish reason,
   the configured provider and model it ran through, and its session and parent
@@ -339,15 +341,18 @@ between them forfeits the cache the previous one held (the switch counts and the
 cache losses in the `models` view count exactly that).
 
 `tps`/`wall`/`stream` are produced tokens per streaming second / request to
-completed step / request to the last chunk. The sidebar's rate (per turn, and
-the session average on its totals) is the **weighted** one — produced tokens
-divided by the summed streaming windows — so it answers "how fast did this
-produce"; the `latency` view reports the p50 of the per-step rates instead, which
-answers "how fast is a typical step". A switch from one step to the next is not
-by itself a fault — moving to another model or provider is a deliberate choice —
-so the `models` view pairs the count with the cache the switch actually cost,
-which only a provider switch can: two models never share a cache to lose. The
-panel's `?` overlay defines every number in place.
+completed step / request to the last chunk. The sidebar's turn header shows the
+turn's wall time — the first request to the last completed step, so any tool
+wait inside the turn counts — while its rate is only the streaming window. The
+sidebar's rate (per turn, and the session average on its totals) is the
+**weighted** one — produced tokens divided by the summed streaming windows — so
+it answers "how fast did this produce"; the `latency` view reports the p50 of
+the per-step rates instead, which answers "how fast is a typical step". A
+switch from one step to the next is not by itself a fault — moving to another
+model or provider is a deliberate choice — so the `models` view pairs the count
+with the cache the switch actually cost, which only a provider switch can: two
+models never share a cache to lose. The panel's `?` overlay defines every
+number in place.
 
 ## Configuration
 
@@ -359,7 +364,7 @@ Options apply to both parts (each side reads the ones it needs):
 | `db` | per-OS state path | SQLite path override. Must match between the server and TUI parts. |
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `pricing` | `"auto"` | `"off"` disables list-price estimates everywhere: no new `list_cost` records, no `≈` on the line, in the panel or in the sidebar, and no historical backfill. Charged money is unaffected. |
-| `sidebar` | `true` | Show the session summary and the per-prompt history — cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
+| `sidebar` | `true` | Show the session summary and the per-prompt history — turn duration, cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
 | `sidebarTurns` | `8` | How many turns the sidebar history shows. The host sidebar scrolls; raise it for a longer history. |
 | `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
 | `fields` | see below | Toggle line segments. |

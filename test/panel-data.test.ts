@@ -719,6 +719,7 @@ describe("turnsLines", () => {
     sessionID: "s1",
     promptAt: 1_000,
     endAt: 1_500,
+    durationMs: 500,
     promptGapMs: 1_000,
     providerID: "opencode-go",
     modelID: "deepseek-v4.1-flash",
@@ -773,11 +774,11 @@ describe("turnsLines", () => {
     // the oldest anchors the window.
     expect(lines).toHaveLength(8)
     expect(lines.map((line) => line.text)).toEqual([
-      `${formatClock(1_500).slice(0, 5)} opencode-go`,
+      `${formatClock(1_500).slice(0, 5)} opencode-go · 500ms`,
       "  deepseek-v4.1-flash max",
       "  in 1.62k (427.3k) · out 1.06k",
       "  hit 99.6% · 50/s · $0.0100",
-      `${formatClock(1_500).slice(0, 5)} opencode-go`,
+      `${formatClock(1_500).slice(0, 5)} opencode-go · 500ms`,
       "  deepseek-v4.1-flash max",
       "  in 1.62k (427.3k) · out 1.06k",
       "  hit 99.6% · 50/s · $0.0100",
@@ -801,7 +802,7 @@ describe("turnsLines", () => {
     expect(lines[2]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
     // The middle turn is neither an edge nor a change: three lines only.
     expect(lines).toHaveLength(11)
-    expect(lines[4]!.text).toBe(`${formatClock(1_500).slice(0, 5)} opencode-go`)
+    expect(lines[4]!.text).toBe(`${formatClock(1_500).slice(0, 5)} opencode-go · 500ms`)
     expect(lines[5]!.text).toBe("  in 1.62k (427.3k) · out 1.06k")
     expect(lines[8]!.text).toBe("  glm-5.3-flash")
   })
@@ -814,12 +815,20 @@ describe("turnsLines", () => {
 
   test("sidebarLines drops the volumes that do not fit, never the rate", () => {
     const lines = sidebarLines([turn({ steps: 2 })], { budget: 20 })
+    // The header is too narrow for the duration: the provider stays, the clock
+    // and duration do not fit together.
+    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} opencode-go`)
     expect(lines[3]!.text).toBe("  hit 99.6% · 50/s")
+  })
+
+  test("sidebarLines leaves the duration out when the turn has no timing", () => {
+    const lines = sidebarLines([turn({ durationMs: undefined })], { budget: 34 })
+    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} opencode-go`)
   })
 
   test("sidebarLines warns when the provider changed", () => {
     const lines = sidebarLines([turn({ providerChanged: true, providerID: "deepseek", modelID: "deepseek-flash", variant: undefined })], { budget: 34 })
-    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} deepseek`)
+    expect(lines[0]!.text).toBe(`${formatClock(1_500).slice(0, 5)} deepseek · 500ms`)
     expect(lines[0]!.tone).toBe("warning")
     expect(lines[1]!.text).toBe("  deepseek-flash")
   })

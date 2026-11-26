@@ -1266,7 +1266,8 @@ export function sessionSummaryLines(usage: Overview, budget = 34, estimates = tr
 
 /**
  * The sidebar history: a compact block per turn — when and through which
- * provider, then the prompt volumes, then the cache hit, the rate and the cost.
+ * provider and how long it took, then the prompt volumes, then the cache hit,
+ * the rate and the cost.
  *
  * The model gets a line of its own at both ends of the block and on every turn
  * that changed it. The ends matter because the reader cannot tell whether a
@@ -1294,9 +1295,12 @@ export function sidebarLines(rows: readonly TurnUsage[], options?: LineFormatOpt
     const hit = formatPercent(display.prompt > 0 ? display.cached / display.prompt : undefined).replace(/\.0%$/, "%")
     const tps = turn.tps === undefined ? undefined : formatTpsCompact(turn.tps)
     const suffix = turn.drops.length > 0 ? " · ⚠" : ""
-    // Three compact lines: when and through what, the prompt volumes, then what
-    // the turn cost — in tokens per second and in money — and how much of the
-    // prompt came from cache.
+    // Three compact lines: when and through what, for how long, the prompt
+    // volumes, then what the turn cost — in tokens per second and in money —
+    // and how much of the prompt came from cache. The duration is dropped
+    // before the provider when the sidebar is too narrow for both.
+    const header = `${clock} ${provider}`
+    const timed = turn.durationMs === undefined ? undefined : `${header} · ${formatMs(turn.durationMs)}`
     const volumes = [
       `  ${labels.input} ${input} (${prompt}) · ${labels.output} ${output}`,
       `  ${labels.input} ${input} · ${labels.output} ${output}`,
@@ -1308,7 +1312,7 @@ export function sidebarLines(rows: readonly TurnUsage[], options?: LineFormatOpt
       `  ${tps === undefined ? "" : `${tps} · `}${cost}${suffix}`,
       `  hit ${hit}${suffix}`,
     ]
-    lines.push({ text: truncate(`${clock} ${provider}`, budget), tone: turn.providerChanged ? "warning" : "base" })
+    lines.push({ text: truncate(timed !== undefined && timed.length <= budget ? timed : header, budget), tone: turn.providerChanged ? "warning" : "base" })
     // The model appears at both ends of the block (the newest turn is the state
     // now, the oldest anchors the window) and on every turn that changed it: the
     // provider alone cannot say which model actually ran.

@@ -662,6 +662,12 @@ export type TurnUsage = {
   /** Creation time of the prompt that opened the turn, when it was recorded. */
   promptAt: number | undefined
   endAt: number | undefined
+  /**
+   * Wall time of the turn's execution: the first step's request to the last
+   * step's completion. Tool-call gaps inside the turn are included; time spent
+   * queued before the first request is not.
+   */
+  durationMs: number | undefined
   /** Time between the previous finished turn's prompt and this turn's prompt. */
   promptGapMs: number | undefined
   providerID: string | undefined
@@ -836,10 +842,15 @@ export function turns(
         window += row.streamed_at - row.created_at
       }
       const previous = result.length > 0 && result[result.length - 1]!.sessionID === last.session_id ? result[result.length - 1] : undefined
+      const endAt = last.completed_at ?? last.created_at ?? last.recorded_at
+      // A turn starts when the first request goes out; a step recorded without
+      // its own start stamp falls back to the prompt that opened the turn.
+      const firstAt = bucket[0]?.created_at ?? promptAt
       result.push({
         sessionID: last.session_id,
         promptAt,
-        endAt: last.completed_at ?? last.created_at ?? last.recorded_at,
+        endAt,
+        durationMs: firstAt !== undefined && endAt > firstAt ? endAt - firstAt : undefined,
         // The gap is against the previous *turn*, not the previous prompt row:
         // a synthetic system-reminder prompt can sit between two user turns.
         promptGapMs: promptAt !== undefined && previous?.promptAt !== undefined ? Math.max(0, promptAt - previous.promptAt) : undefined,

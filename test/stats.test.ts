@@ -450,14 +450,26 @@ describe("turns", () => {
     const single = rows.find((row) => row.promptAt === 5_000)!
     expect(single.promptGapMs).toBe(4_000)
     expect(single.endAt).toBe(5_200)
+    expect(single.durationMs).toBe(100)
     expect(single.latest).toMatchObject({ input: 300, cached: 200, output: 60 })
     const loop = rows.find((row) => row.promptAt === 1_000)!
     expect(loop.steps).toBe(2)
     expect(loop.promptGapMs).toBeUndefined()
     expect(loop.endAt).toBe(1_600)
+    // First request to last completion: the tool-call gap between the steps is
+    // part of the turn's wall time.
+    expect(loop.durationMs).toBe(500)
     expect(loop.totals).toMatchObject({ input: 120, cached: 1_900, output: 60, steps: 2 })
     expect(loop.latest).toMatchObject({ input: 100, cached: 900 })
     expect(loop.drops).toEqual([{ messageID: "a2", tokens: 100, gapMs: 300 }])
+  })
+
+  test("falls back to the prompt when the first step has no start stamp", () => {
+    const db = freshDb()
+    recordPrompt(db, { sessionID: "s", messageID: "p", createdAt: 1_000 })
+    recordStep(db, { messageID: "a", sessionID: "s", completedAt: 3_000, finish: "stop" })
+    expect(turns(db)[0]!.durationMs).toBe(2_000)
+    db.close()
   })
 
   test("limit counts finished turns, not empty prompt rows", () => {
