@@ -22,14 +22,14 @@ the Desktop GUI never open the file: they call the server's usage RPC.
 Every write is an upsert keyed by message id, which makes recording idempotent:
 replayed events, restarts and re-imports never duplicate rows.
 
-Tables: `sessions`, `prompts`, `steps`, `events` and `meta` (the schema
-version). The `steps` table is the interesting one: `message_id` (primary key),
+Tables: `sessions`, `prompts`, `steps`, `events`, `usage` and `meta` (the
+schema version). The `steps` table is the interesting one: `message_id` (primary key),
 `session_id`, `parent_id`, provider/model/variant, input/output/reasoning and
 cache-read/cache-write tokens, charged `cost`, list-price `list_cost`,
 `created_at`, `streamed_at`, `completed_at`, `finish` and `recorded_at`.
 `list_cost` is nullable on purpose: `NULL` means the step was charged or its
-price was unknown; `0` means the host's model list knows the model is free; a positive
-value is an estimate for a step the host reported as `$0`. Storing zero for a
+price was unknown; `0` means the host's model list knows the model is free; a
+positive value is an estimate for a step the host reported as `$0`. Storing zero for a
 free model keeps it out of the backfill's "needs an estimate" set without
 inventing money.
 
@@ -52,9 +52,9 @@ The file is private to the user: its directory is created `0700` and the file
 `0600` (POSIX), re-applied every time either is opened. Schema migrations run on
 the server's writer connection. The worker opens a read-only connection for the
 panel and the turn history — it can never write, never migrate and never hold
-the writer's lock — and prune, the list-price backfill and compact use a separate
-short-lived writer inside the worker with a 250 ms busy timeout, so maintenance
-fails fast with a message instead of stalling the recorder.
+the writer's lock — and prune, the list-price backfill and compact use a
+separate short-lived writer inside the worker with a 250 ms busy timeout, so
+maintenance fails fast with a message instead of stalling the recorder.
 
 ## The identity of a step
 
@@ -108,8 +108,8 @@ different rules on purpose:
   cost is the sum over its steps whatever the token view shows (`totalsText`
   takes the cost explicitly for that reason, never the `latest` step's share).
   For the session, the charged cost is the one the host reports; the list
-  estimate is `SUM(list_cost)` over the plugin's recorded steps, cached per
-  session and invalidated on every write event.
+  estimate is `SUM(list_cost)` over the plugin's recorded steps, fetched over
+  the RPC and cached by the client, invalidated on every write event.
 - **A zero cost is left out.** A free model reads as free instead of repeating
   `$0`; `fields.cost: false` hides both charged cost and estimate.
 - **A list estimate is labelled.** OpenCode 2.2.0 trusts a reported `cost: 0`
@@ -136,10 +136,10 @@ host's reported charge; the plugin does not recalculate it.
 
 | Surface | Source |
 | --- | --- |
-| Server recorder | `ctx.model.list()` → `ModelListOutput.data: ModelInfo[]` |
-| Live turn / backfill | `ctx.data.location.model.list(ctx.location)` → `ModelInfo[] \| undefined` |
+| Server recorder and backfill | `ctx.model.list()` → `ModelListOutput.data: ModelInfo[]` |
+| Live line (TUI/Desktop) | `data.location.model.list(location)` → `ModelInfo[] \| undefined` |
 | Panel, sidebar, NDJSON, CLI report | stored `steps.list_cost` |
-| `sess` segment | `SUM(list_cost)` from the database |
+| `sess` segment | `SUM(list_cost)` from the database, served over the RPC |
 
 Each `ModelInfo` carries the prices in `cost: ModelCost[]`, with
 `input`, `output`, `cache.read`, `cache.write` and an optional
@@ -207,9 +207,9 @@ because a model that was free when the step ran may not be free now.
 
 The session segment follows a split rule: its charged total is the host's, and
 its estimate is `SUM(list_cost)` over the plugin's recorded steps, fetched over
-the RPC and cached by the client, invalidated on every write event. If the plugin began recording in
-the middle of a session, that estimate covers only the recorded steps; the
-charged total still comes from the host. If the database is unavailable, the
+the RPC and cached by the client, invalidated on every write event. If the
+plugin began recording mid-session, the estimate covers only the recorded steps;
+the charged total still comes from the host. If the database is unavailable, the
 line falls back to the host total with no estimate.
 
 The backfill only considers steps with a provider, a model and at least one
@@ -299,8 +299,8 @@ arguments, no file contents, no environment variables.
 
 ## Performance
 
-The plugin sits on paths the host waits for: the recorder's event handlers and
-the composer line. The rules it keeps are:
+The plugin sits on paths the host waits for: the recorder's event handlers, the
+TUI line and the Desktop header badge. The rules it keeps are:
 
 - **Writes are small and rare.** A step is one upsert, written when it ends;
   nothing is written on a response, because the response carries nothing the
@@ -341,10 +341,11 @@ stopped using an index. `bun run bench` checks the budgets on 20k steps,
 ## Testing the clients
 
 The TUI harness is the same one the tests and the documentation images use. The
-Desktop line helpers have their own pure tests (`test/gui-line.test.ts`), and
-`test/server.test.ts` drives the real server RPC through the worker. `bun test`
-runs through `bunfig.toml`, which preloads `test/preload.ts`. Bun
-resolves the bare `solid-js` specifier to the package's server build, where
+Desktop line helpers have their own pure tests (`test/gui-line.test.ts`),
+`test/gui-bundle.test.ts` evaluates the built CJS bundle with the app's shared
+modules, and `test/server.test.ts` drives the real server RPC through the
+worker. `bun test` runs through `bunfig.toml`, which preloads `test/preload.ts`.
+Bun resolves the bare `solid-js` specifier to the package's server build, where
 signals do not track and render effects run once; the host resolves the client
 build (the one `@opentui/solid` uses internally). The preload points the
 specifier at the client build so the harness, the plugin and the renderer share
@@ -368,11 +369,11 @@ Two consequences for render tests:
 ```sh
 bun install
 bun run typecheck
+bun run build
 bun test              # whole suite, Linux
+bun run check:package
 bun run check:platform
 bun run bench --full  # budgets at 120k steps
-bun run build
-bun run check:package
 npm pack --dry-run
 ```
 

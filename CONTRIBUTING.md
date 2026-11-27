@@ -41,7 +41,7 @@ PRs that are too large to review efficiently will be asked to be split.
    ```
 5. **Make your changes** and validate before pushing:
    ```bash
-   bun run typecheck && bun test && bun run build && bun run check:package
+   bun run typecheck && bun run build && bun test && bun run check:package
    ```
 6. **Push and open a PR** against the `main` branch, filling in the PR template completely.
 
