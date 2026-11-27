@@ -57,6 +57,10 @@ export type PruneInput = {
   confirm: true
 }
 
+export type WipeInput = {
+  confirm: true
+}
+
 export type VacuumInput = {
   confirm: true
 }
@@ -83,7 +87,7 @@ const Tone = { type: "string", enum: ["base", "muted", "warning", "accent"] } as
 const PanelRowSchema = {
   type: "object",
   properties: {
-    kind: { type: "string", enum: ["model", "session", "period", "provider", "turn", "prune"] },
+    kind: { type: "string", enum: ["model", "session", "period", "provider", "turn", "prune", "wipe"] },
     value: { type: "string", maxLength: 500 },
     variant: { type: "string", maxLength: 200 },
   },
@@ -170,6 +174,19 @@ const PruneResultSchema = {
     usage: { type: "number" },
   },
   required: ["steps", "prompts", "events", "usage"],
+  additionalProperties: false,
+} as const
+
+const WipeResultSchema = {
+  type: "object",
+  properties: {
+    steps: { type: "number" },
+    prompts: { type: "number" },
+    events: { type: "number" },
+    usage: { type: "number" },
+    sessions: { type: "number" },
+  },
+  required: ["steps", "prompts", "events", "usage", "sessions"],
   additionalProperties: false,
 } as const
 
@@ -302,6 +319,16 @@ export const UsageInsights = Rpc.define({
         additionalProperties: false,
       },
       output: PruneResultSchema,
+      errors,
+    },
+    wipe: {
+      input: {
+        type: "object",
+        properties: { confirm: { type: "boolean", enum: [true] } },
+        required: ["confirm"],
+        additionalProperties: false,
+      },
+      output: WipeResultSchema,
       errors,
     },
     vacuum: {

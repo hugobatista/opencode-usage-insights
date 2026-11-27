@@ -211,9 +211,9 @@ does not move the TUI panel, and vice versa.
 ### The server side
 
 The server part registers the usage RPC and starts a **database worker**. The worker owns a read-only SQLite connection for the panel and the
-turn history, and opens a short write connection for `prune`, `vacuum` and
-`backfill`. Panel queries therefore never block the agent's event loop, and the
-TUI does not open SQLite either: it works against a local or a remote server.
+turn history, and opens a short write connection for `prune`, `wipe`, `vacuum`
+and `backfill`. Panel queries therefore never block the agent's event loop, and
+the TUI does not open SQLite either: it works against a local or a remote server.
 
 The worker starts lazily on the first usage request (the panel, the history or
 the header badge estimate). If it cannot start (for example in a development
@@ -297,7 +297,7 @@ a help overlay that repeats the keys and defines every number.
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move the cursor; the row under it is highlighted. |
 | `pageup` `pagedown` / `home` `end` | Move by ten rows / to the first or last row. |
-| `enter` | Drill into the row: a model → the providers it ran through and their latency; a provider → the models it served and its latency; a session → its turns; a period → the providers of the period. In `db`, prune the steps recorded before the selected retention's cutoff date (asks first). |
+| `enter` | Drill into the row: a model → the providers it ran through and their latency; a provider → the models it served and its latency; a session → its turns; a period → the providers of the period. In `db`, prune the steps recorded before the selected retention's cutoff date, or wipe every recorded step, session and event from the last row (asks first). |
 | `backspace` | Go back from a drill-down. |
 | `1`–`9` / `[` `]` | Pick a view (`9` is `db`) / cycle views. |
 | `t` / `shift+t` | Next / previous range. |
@@ -327,7 +327,7 @@ durable storage, so the panel reopens where it was left.
 | `latency` | Wall time, streaming window and throughput as p50/p90/p99 overall and per model (per provider when a model is filtered). `n < 5` is dimmed. |
 | `sessions` | Each session with steps, prompts, tokens, `hit`, cost (including compaction/title usage, named on the detail line), its directory and how many models it used; subagent sessions are indented under their parent and rolled up. |
 | `turns` | The per-prompt history: one line per finished turn, rendered exactly like the live line. Cost is assistant steps only. `a` widens it to every session, titled. |
-| `db` | File name (full path with `exposePaths: true`), contents and age. The retention table lists `30`/`90`/`365`-day prunes with step counts and cutoff; `↑`/`↓` + `enter` prunes (asks first), `v` reclaims space. It counts `$0` steps without an estimate; `e` backfills at today's list price. |
+| `db` | File name (full path with `exposePaths: true`), contents and age. The retention table lists `30`/`90`/`365`-day prunes with step counts and cutoff; `↑`/`↓` + `enter` prunes from a cutoff, and the row below the table wipes every recorded step, session and event (both ask first). `v` reclaims space. It counts `$0` steps without an estimate; `e` backfills at today's list price. |
 
 The panel sums the stored per-step buckets over the selected range, so a number
 read in one place means the same in the other: `prompt` is everything the
@@ -373,7 +373,7 @@ Options apply to all three parts (each side reads the ones it needs):
 | `sidebar` | `true` | TUI-only: show the session summary and the per-prompt history in the session sidebar. The Desktop history is the Turns insights tab. |
 | `sidebarTurns` | `8` | How many turns the TUI sidebar and the Desktop Turns insights tab show (`1`–`50`; values outside are clamped). |
 | `panel` | `true` | Show the `/usage` statistics panel and its command in the TUI and Desktop. `false` keeps the line and the history. |
-| `maintenance` | `true` | Allow the RPC to prune, vacuum and backfill. Set `false` on servers reachable from other machines. |
+| `maintenance` | `true` | Allow the RPC to prune, wipe, vacuum and backfill. Set `false` on servers reachable from other machines. |
 | `exposePaths` | `false` | Return the absolute database path in the `db` view; the default returns only the file name. |
 | `fields` | see below | Toggle line segments. |
 | `labels` | see below | Override line labels (the plugin is English-only by default). |
@@ -431,8 +431,8 @@ errors). The plugin therefore applies least privilege at the surface:
 
 - **Read-only by default for queries.** `panel`, `turns`, `listCost`, `filters`
   and `dbInfo` run on the worker's read-only SQLite connection. The only writes
-  are `prune`, `vacuum` and `backfill`, gated by `maintenance` and an explicit
-  confirmation.
+  are `prune`, `wipe`, `vacuum` and `backfill`, gated by `maintenance` and an
+  explicit confirmation.
 - **No free-form access.** There is no SQL, path, import or export method. Inputs
   are validated by JSON Schema with closed objects, enums, length limits and
   numeric clamps; the service validates them again. SQL is parameterized.

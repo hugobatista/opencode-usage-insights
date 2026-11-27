@@ -98,7 +98,7 @@ export function createRecorder(db: Database, options?: RecorderOptions): Recorde
 
   /**
    * Ceiling on the writes kept while the database is busy. A maintenance
-   * operation (a prune, a vacuum) holds the write lock; waiting for it would
+   * operation (a prune, wipe or vacuum) holds the write lock; waiting for it would
    * stall the agent, and dropping the record would lose usage. The recorder
    * defers instead, retrying on the next event, and only a lock held for longer
    * than this many records takes a record with it.

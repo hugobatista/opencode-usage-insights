@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import type { Database } from "bun:sqlite"
 import type { LineFields, LineLabels, TurnTotalsView } from "./core"
-import { UsageInsights, type BackfillInput, type PanelInput, type PruneInput, type TurnsInput, type VacuumInput } from "./rpc"
+import { UsageInsights, type BackfillInput, type PanelInput, type PruneInput, type TurnsInput, type VacuumInput, type WipeInput } from "./rpc"
 import { costOf, priceTable, type PriceFn, type PriceTable } from "./pricing"
 import { createRecorder, type RecorderEvent } from "./recorder"
 import { createService, ServiceError } from "./service"
@@ -35,7 +35,7 @@ export type Options = {
    * `off` records charged money only; every client hides stored estimates.
    */
   pricing?: "auto" | "off" | undefined
-  /** Allow the RPC to prune, vacuum and backfill. Defaults to true. */
+  /** Allow the RPC to prune, wipe, vacuum and backfill. Defaults to true. */
   maintenance?: boolean | undefined
   /**
    * Return the absolute database path in the `db` view.
@@ -217,6 +217,13 @@ export default Plugin.define({
         prune: async (input, context) => {
           try {
             return await stats.request("prune", input as PruneInput)
+          } catch (error) {
+            return rpcFailure(context, error)
+          }
+        },
+        wipe: async (input, context) => {
+          try {
+            return await stats.request("wipe", input as WipeInput)
           } catch (error) {
             return rpcFailure(context, error)
           }

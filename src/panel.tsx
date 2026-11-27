@@ -140,7 +140,8 @@ export function Panel(props: {
     if (error() !== undefined && lines().length === 0) {
       return [{ text: `usage service unavailable: ${error()}`, tone: "warning" }]
     }
-    const visible = (line: PanelLine): boolean => props.maintenance !== false || line.row?.kind !== "prune"
+    const visible = (line: PanelLine): boolean =>
+      props.maintenance !== false || (line.row?.kind !== "prune" && line.row?.kind !== "wipe")
     return lines().filter(visible)
   })
 
@@ -202,6 +203,10 @@ export function Panel(props: {
       void prune(Number.parseInt(entry.row.value, 10))
       return
     }
+    if (entry.row.kind === "wipe") {
+      void wipe()
+      return
+    }
     setDetail(entry.row)
     setAnchor(undefined)
   }
@@ -251,6 +256,40 @@ export function Panel(props: {
     setTick((value) => value + 1)
     // A batched prune can have committed some batches before failing; the
     // sidebar reads the same server database but has no tick of its own.
+    props.deps.bump?.()
+  }
+
+  /** Delete every recorded row, after asking. */
+  async function wipe(): Promise<void> {
+    if (props.maintenance === false) {
+      props.ctx.ui.toast.show({ message: "database maintenance is disabled", variant: "warning" })
+      return
+    }
+    if (sessionRunning()) {
+      props.ctx.ui.toast.show({ message: "the session is running: wipe again when it is idle", variant: "warning" })
+      return
+    }
+    const info = database()
+    const steps = info?.tables.find((table) => table.name === "steps")?.rows ?? 0
+    const sessions = info?.tables.find((table) => table.name === "sessions")?.rows ?? 0
+    const confirmed = await props.ctx.ui.dialog.confirm({
+      title: "Wipe all recorded usage",
+      message: `${formatCount(steps)} steps and ${formatCount(sessions)} sessions would be deleted, with their prompts, compactions and other usage. This cannot be undone.`,
+      label: { confirm: "Wipe", cancel: "Keep" },
+    })
+    if (confirmed !== true) return
+    try {
+      const result = await api().wipe({ confirm: true })
+      props.ctx.ui.toast.show({
+        message: `wiped ${result.steps} steps · ${result.prompts} prompts · ${result.events} compactions · ${result.usage} other usage · ${result.sessions} sessions`,
+        variant: "success",
+      })
+    } catch (cause) {
+      props.ctx.ui.toast.show({ message: errorMessage(cause), variant: "warning" })
+    }
+    setAnchor(undefined)
+    setTick((value) => value + 1)
+    // A batched wipe can have committed some batches before failing.
     props.deps.bump?.()
   }
 

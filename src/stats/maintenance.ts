@@ -97,6 +97,11 @@ export type PruneResult = {
   usage: number
 }
 
+export type WipeResult = PruneResult & {
+  /** Session headings, which a wipe removes with the history they describe. */
+  sessions: number
+}
+
 /**
  * Rows deleted per transaction. A single delete of a long history holds the
  * write lock for the whole scan — measured at 1.3 s for 123k steps — and the
@@ -121,6 +126,18 @@ function deleteBatched(db: Database, table: "steps" | "prompts" | "events" | "us
   return removed
 }
 
+/** Delete every row of `table`, one bounded batch at a time. */
+function deleteAllBatched(db: Database, table: TableName): number {
+  const statement = db.query(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} LIMIT ${PRUNE_BATCH})`)
+  let removed = 0
+  for (;;) {
+    const changes = statement.run().changes
+    removed += changes
+    if (changes < PRUNE_BATCH) break
+  }
+  return removed
+}
+
 /**
  * Delete recorded usage older than `cutoff`. Steps, their prompts and the
  * compaction events that explain their cache losses go together: a compaction
@@ -132,6 +149,21 @@ export function pruneOlderThan(db: Database, cutoff: number): PruneResult {
     prompts: deleteBatched(db, "prompts", "created_at IS NOT NULL AND created_at < ?", cutoff),
     events: deleteBatched(db, "events", "at IS NOT NULL AND at < ?", cutoff),
     usage: hasTable(db, "usage") ? deleteBatched(db, "usage", "at IS NOT NULL AND at < ?", cutoff) : 0,
+  }
+}
+
+/**
+ * Delete every recorded row, keeping only the schema metadata. Sessions go
+ * with the history they describe: a session with no step is a heading no view
+ * can explain. Batched like a prune, so the recorder can interleave.
+ */
+export function wipeAll(db: Database): WipeResult {
+  return {
+    steps: deleteAllBatched(db, "steps"),
+    prompts: deleteAllBatched(db, "prompts"),
+    events: deleteAllBatched(db, "events"),
+    usage: hasTable(db, "usage") ? deleteAllBatched(db, "usage") : 0,
+    sessions: hasTable(db, "sessions") ? deleteAllBatched(db, "sessions") : 0,
   }
 }
 

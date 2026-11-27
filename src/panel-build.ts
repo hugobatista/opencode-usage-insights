@@ -109,6 +109,8 @@ export function detailLabel(row: PanelRow): string {
       return `provider ${row.value}`
     case "prune":
       return `prune older than ${row.value} days`
+    case "wipe":
+      return "wipe all recorded usage"
   }
 }
 

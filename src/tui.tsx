@@ -33,7 +33,7 @@ export type Options = {
   enabled?: boolean | undefined
   /** Server-side database path override; the TUI reads it through the RPC. */
   db?: string | undefined
-  /** Allow the panel's prune, vacuum and backfill actions. Defaults to true. */
+  /** Allow the panel's prune, wipe, vacuum and backfill actions. Defaults to true. */
   maintenance?: boolean | undefined
   /**
    * List-price estimates for steps the host reports as costing nothing.
@@ -216,7 +216,7 @@ export default Plugin.define({
       // so this function is recomputed on every streamed delta, and reading the
       // list there would be per-delta work for a line that is not shown.
       if (!sessionIdle(sessionID)) return undefined
-      // Track the shared write signal: a backfill or prune changes the session
+      // Track the shared write signal: a backfill, prune or wipe changes the session
       // estimate without changing the transcript, and the line must recompute.
       if (pricing) refresh()
       const messages = ctx.data.session.message.list(sessionID) as unknown as RuntimeMessage[]

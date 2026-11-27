@@ -52,7 +52,7 @@ The file is private to the user: its directory is created `0700` and the file
 `0600` (POSIX), re-applied every time either is opened. Schema migrations run on
 the server's writer connection. The worker opens a read-only connection for the
 panel and the turn history — it can never write, never migrate and never hold
-the writer's lock — and prune, the list-price backfill and compact use a
+the writer's lock — and prune, wipe, the list-price backfill and compact use a
 separate short-lived writer inside the worker with a 250 ms busy timeout, so
 maintenance fails fast with a message instead of stalling the recorder.
 
@@ -279,18 +279,18 @@ arguments, no file contents, no environment variables.
   `0600` (POSIX), re-applied on every open; on Windows the file inherits the
   user profile's ACL.
 - **A read-only reader.** The worker opens the database read-only, so panel and
-  history queries can never write, migrate or take the recorder's lock. Prune
-  and compact open a short-lived writer inside the worker with a 250 ms busy
-  timeout: a maintenance action that cannot take the lock tells the user and
-  stops, instead of stalling the request pipeline that records usage.
+  history queries can never write, migrate or take the recorder's lock. Prune,
+  wipe and compact open a short-lived writer inside the worker with a 250 ms
+  busy timeout: a maintenance action that cannot take the lock tells the user
+  and stops, instead of stalling the request pipeline that records usage.
 - **A bounded, validated RPC.** The TUI and the Desktop GUI read the worker
   through JSON-Schema-validated methods with closed objects, enums and clamps.
   There is no SQL, path, import or export method. Maintenance is gated by the
   `maintenance` option and an explicit confirmation; the worker runs every query
   off the server's event loop and the client queue is bounded while the worker
-  is in use. Reads have a 10 s watchdog; prune, vacuum and backfill get five
-  minutes because rewriting a large file is legitimately slower. The in-process
-  fallback shares the server's event loop and has no separate queue.
+  is in use. Reads have a 10 s watchdog; prune, wipe, vacuum and backfill get
+  five minutes because rewriting a large file is legitimately slower. The
+  in-process fallback shares the server's event loop and has no separate queue.
 - **Validated input.** Anything that reaches the database from outside — a
   provider id the host reports, a session title, an imported NDJSON dump — is
   validated as an identifier token or stripped of control characters and capped

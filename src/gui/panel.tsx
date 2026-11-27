@@ -77,7 +77,9 @@ export function UsagePanel(props: Props) {
   )
   const lines = createMemo(() =>
     (result.latest?.lines ?? []).filter(
-      (line) => line.hint !== true && (props.maintenance || line.row?.kind !== "prune"),
+      (line) =>
+        line.hint !== true &&
+        (props.maintenance || (line.row?.kind !== "prune" && line.row?.kind !== "wipe")),
     ),
   )
   const database = createMemo(() => result.latest?.database)
@@ -170,6 +172,43 @@ export function UsagePanel(props: Props) {
     props.bump()
   }
 
+  async function wipe(): Promise<void> {
+    if (sessionRunning()) {
+      toast(ctx.t("panel.title"), ctx.t("panel.busy"), "error")
+      return
+    }
+    const info = database()
+    const steps = info?.tables.find((table) => table.name === "steps")?.rows ?? 0
+    const sessions = info?.tables.find((table) => table.name === "sessions")?.rows ?? 0
+    const confirmed = await ctx.dialogs.confirm({
+      title: ctx.t("panel.confirmWipe"),
+      description: ctx.t("panel.confirmWipeDetail", { steps, sessions }),
+      confirm: ctx.t("panel.wipeConfirm"),
+      cancel: ctx.t("panel.cancel"),
+      danger: true,
+    })
+    if (!confirmed) return
+    try {
+      const result = await api().wipe({ confirm: true })
+      toast(
+        ctx.t("panel.wiped", {
+          steps: result.steps,
+          prompts: result.prompts,
+          events: result.events,
+          usage: result.usage,
+          sessions: result.sessions,
+        }),
+        undefined,
+        "success",
+      )
+      setBusy(false)
+    } catch (cause) {
+      setBusy(true)
+      toast(ctx.t("panel.title"), errorMessage(cause), "error")
+    }
+    props.bump()
+  }
+
   async function backfill(): Promise<void> {
     if (!props.pricing) {
       toast(ctx.t("panel.pricingOff"))
@@ -240,6 +279,10 @@ export function UsagePanel(props: Props) {
   const drill = (row: PanelRow): void => {
     if (row.kind === "prune") {
       void prune(Number.parseInt(row.value, 10))
+      return
+    }
+    if (row.kind === "wipe") {
+      void wipe()
       return
     }
     setDetail(row)
@@ -385,6 +428,9 @@ export function UsagePanel(props: Props) {
                   </ctx.ui.Button>
                 )}
               </For>
+              <ctx.ui.Button size="small" variant="danger" onClick={() => void wipe()}>
+                {ctx.t("panel.wipe")}
+              </ctx.ui.Button>
               <ctx.ui.Button size="small" variant="neutral" onClick={() => void vacuum()}>
                 {ctx.t("panel.vacuum")}
               </ctx.ui.Button>

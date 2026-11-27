@@ -185,20 +185,23 @@ Docs pass  07:20:31 · Δ 20m00s · opencode-go/deepseek-v4.1-flash · changed �
 /usage db
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 /tmp/usage-insights-demo-mFDbHx/usage.db
-0.0 MB + 0.4 MB wal · schema v10
+0.0 MB + 0.4 MB wal · schema v11
 
 what it holds
   sessions    3 rows
   prompts     6 rows
   events      0 rows
   steps       7 rows
+  usage       0 rows
   window      12/10/2026 → 15/10/2026
 
 clean up
-  ↑↓ pick a retention · enter prunes the steps older than it (asks first) · v gives the space back
+  ↑↓ pick a retention · enter prunes from its cutoff · the wipe row deletes everything (asks first)…
   list estimates  every $0 step has a price
 keep              prunes older than
 30 days          0 steps 16/09/2026
 90 days          0 steps 18/07/2026
 365 days         0 steps 16/10/2025
+
+  wipe everything · 7 steps · 3 sessions · cannot be undone
 ```

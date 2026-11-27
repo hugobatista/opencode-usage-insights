@@ -721,8 +721,8 @@ describe("rendering", () => {
       expect(first).toHaveLength(1)
       expect(first[0]!.attributes & TextAttributes.BOLD).toBe(TextAttributes.BOLD)
 
-      // The db view's retention rows are its only selectable lines; moving down
-      // must carry the cursor to the next one.
+      // The db view's retention rows are selectable; moving down must carry the
+      // cursor to the next one.
       harness.command("usage-insights.cursor.down")!.run()
       await setup.renderOnce()
       const second = highlighted()
@@ -830,6 +830,34 @@ describe("the db view's maintenance", () => {
       expect(harness.dialogs[0]!.message).toContain("would be deleted")
       expect(harness.toasts[0]?.message).toContain("pruned 1 steps")
       expect(stepIDs()).toEqual(["msg_new"])
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  test("wipes every recorded row from the picker, after asking", async () => {
+    seedOldAndNew()
+    const { harness, setup } = await openDbView("ses_panel_prune")
+    try {
+      // The wipe row follows the three retention rows.
+      for (let index = 0; index < 3; index += 1) harness.command("usage-insights.cursor.down")!.run()
+      harness.command("usage-insights.drill")!.run()
+      await Bun.sleep(1)
+      expect(harness.dialogs).toHaveLength(1)
+      expect(harness.dialogs[0]!.title).toBe("Wipe all recorded usage")
+      expect(harness.dialogs[0]!.message).toContain("This cannot be undone")
+      // Other tests share the database file, so the wiped count is whatever
+      // the picker offered, not just this fixture's two steps.
+      expect(harness.toasts[0]?.message).toContain("wiped")
+      expect(harness.toasts[0]?.message).toContain("sessions")
+      expect(stepIDs()).toEqual([])
+
+      const db = openStatsDb(resolveDbPath())
+      try {
+        expect((db.query("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n).toBe(0)
+      } finally {
+        db.close()
+      }
     } finally {
       await setup.dispose()
     }

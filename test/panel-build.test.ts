@@ -501,6 +501,13 @@ describe("the db view", () => {
     expect(body).toContain("list estimates")
     expect(lines.filter((line) => line.row?.kind === "prune").length).toBe(3)
     expect(body).toContain("365 days")
+    // The last selectable row deletes everything; it is not another cutoff.
+    const wipe = lines.find((line) => line.row?.kind === "wipe")
+    expect(wipe?.row?.value).toBe("all")
+    expect(wipe?.tone).toBe("warning")
+    expect(wipe?.text).toContain("wipe everything")
+    expect(wipe?.text).toContain("3 sessions")
+    expect(wipe?.text).toContain("cannot be undone")
     // The key instructions are for the TUI; the desktop panel filters them out.
     expect(lines.find((line) => line.text.includes("pick a retention"))?.hint).toBe(true)
     db.close()
@@ -544,6 +551,7 @@ describe("view plumbing", () => {
     expect(detailLabel({ kind: "model", value: "m", variant: "max" })).toBe("model m max")
     expect(detailLabel({ kind: "session", value: "s" })).toBe("session s")
     expect(detailLabel({ kind: "provider", value: "opencode-go" })).toBe("provider opencode-go")
+    expect(detailLabel({ kind: "wipe", value: "all" })).toBe("wipe all recorded usage")
   })
 
   test("never throws: an unreadable database becomes a line", () => {

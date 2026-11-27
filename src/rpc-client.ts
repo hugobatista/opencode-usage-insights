@@ -13,8 +13,9 @@ import {
   type TurnsOutput,
   type VacuumInput,
   type VacuumOutput,
+  type WipeInput,
 } from "./rpc"
-import type { BackfillResult, PruneResult } from "./stats/maintenance"
+import type { BackfillResult, PruneResult, WipeResult } from "./stats/maintenance"
 
 /**
  * Typed client for the usage RPC, shared by the TUI and the desktop GUI. The
@@ -46,6 +47,8 @@ export function usageApi(client: OpenCodeClient, location?: UsageLocation | unde
     dbInfo: (signal?: AbortSignal) => rpc.dbInfo({}, options(signal)) as Promise<import("./stats/maintenance").DbInfo>,
     prune: (input: PruneInput, signal?: AbortSignal) =>
       rpc.prune(input, options(signal)) as Promise<PruneResult>,
+    wipe: (input: WipeInput, signal?: AbortSignal) =>
+      rpc.wipe(input, options(signal)) as Promise<WipeResult>,
     vacuum: (input: VacuumInput, signal?: AbortSignal) =>
       rpc.vacuum(input, options(signal)) as Promise<VacuumOutput>,
     backfill: (input: BackfillInput, signal?: AbortSignal) =>

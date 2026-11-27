@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DEFAULT_SETTINGS } from "../src/panel-data"
-import type { PanelInput, PruneInput, TurnsInput } from "../src/rpc"
+import type { PanelInput, PruneInput, TurnsInput, WipeInput } from "../src/rpc"
 import { openStatsDb, recordPrompt, recordStep, upsertSession } from "../src/stats/db"
 
 const directory = mkdtempSync(join(tmpdir(), "usage-insights-server-"))
@@ -138,6 +138,11 @@ describe("the usage RPC server", () => {
         { error: (type, message) => ({ type, message }) },
       )) as { type: string }
       expect(result.type).toBe("disabled")
+      const wipe = (await server.handlers.wipe!(
+        { confirm: true } satisfies WipeInput,
+        { error: (type, message) => ({ type, message }) },
+      )) as { type: string }
+      expect(wipe.type).toBe("disabled")
     } finally {
       await server.cleanup()
     }
@@ -176,6 +181,44 @@ describe("the usage RPC server", () => {
         steps: number
       }
       expect(result.steps).toBe(1)
+    } finally {
+      await server.cleanup()
+    }
+  })
+
+  test("wipes every recorded row, including the sessions", async () => {
+    seed()
+    const server = await start()
+    try {
+      const result = (await server.handlers.wipe!({ confirm: true } satisfies WipeInput)) as {
+        steps: number
+        prompts: number
+        sessions: number
+      }
+      expect(result).toMatchObject({ steps: 2, prompts: 1, sessions: 1 })
+
+      const db = openStatsDb(path)
+      try {
+        for (const table of ["sessions", "prompts", "events", "steps", "usage"]) {
+          expect((db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n).toBe(0)
+        }
+      } finally {
+        db.close()
+      }
+    } finally {
+      await server.cleanup()
+    }
+  })
+
+  test("requires an explicit confirmation to wipe", async () => {
+    seed()
+    const server = await start()
+    try {
+      const result = (await server.handlers.wipe!(
+        { confirm: false } as never,
+        { error: (type, message) => ({ type, message }) },
+      )) as { type: string }
+      expect(result.type).toBe("invalid")
     } finally {
       await server.cleanup()
     }

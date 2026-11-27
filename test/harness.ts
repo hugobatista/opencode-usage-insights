@@ -173,6 +173,7 @@ export function createHarness(config: HarnessConfig = {}) {
     filters: () => Promise.resolve().then(() => service.filters()),
     dbInfo: () => Promise.resolve().then(() => service.dbInfo()),
     prune: (input: unknown) => Promise.resolve().then(() => service.prune(input as never)),
+    wipe: (input: unknown) => Promise.resolve().then(() => service.wipe(input as never)),
     vacuum: (input: unknown) => Promise.resolve().then(() => service.compact(input as never)),
     backfill: (input: unknown) => Promise.resolve().then(() => service.backfill(input as never)),
     events: { on: () => () => {} },

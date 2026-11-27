@@ -25,7 +25,7 @@ export class StatsError extends Error {
   }
 }
 
-export type StatsMethod = "panel" | "turns" | "listCost" | "filters" | "dbInfo" | "prune" | "vacuum" | "backfill"
+export type StatsMethod = "panel" | "turns" | "listCost" | "filters" | "dbInfo" | "prune" | "wipe" | "vacuum" | "backfill"
 
 type Pending = {
   resolve: (value: unknown) => void
@@ -47,14 +47,14 @@ const QUEUE_LIMIT = 8
 /** A read should answer quickly; a stuck worker is replaced. */
 const READ_TIMEOUT_MS = 10_000
 /**
- * Prune, backfill and especially vacuum rewrite the file and can legitimately
- * take minutes on a large history. They still get a watchdog, but one that
- * does not kill a healthy maintenance operation halfway through.
+ * Prune, wipe, backfill and especially vacuum rewrite the file and can
+ * legitimately take minutes on a large history. They still get a watchdog, but
+ * one that does not kill a healthy maintenance operation halfway through.
  */
 const MAINTENANCE_TIMEOUT_MS = 5 * 60_000
 const START_TIMEOUT_MS = 5_000
 
-const MAINTENANCE_METHODS = new Set<StatsMethod>(["prune", "vacuum", "backfill"])
+const MAINTENANCE_METHODS = new Set<StatsMethod>(["prune", "wipe", "vacuum", "backfill"])
 
 export type StatsClientOptions = {
   /** Absolute database path, resolved by the server plugin. */
@@ -142,6 +142,8 @@ export class StatsClient {
         return service.dbInfo()
       case "prune":
         return service.prune(input as never)
+      case "wipe":
+        return service.wipe(input as never)
       case "vacuum":
         return service.compact(input as never)
       case "backfill":

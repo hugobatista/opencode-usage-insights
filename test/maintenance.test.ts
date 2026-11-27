@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { openStatsDb, recordEvent, recordPrompt, recordStep, recordUsage, upsertSession } from "../src/stats/db"
-import { backfillListCost, dbInfo, pruneOlderThan, vacuum } from "../src/stats/maintenance"
+import { backfillListCost, dbInfo, pruneOlderThan, vacuum, wipeAll } from "../src/stats/maintenance"
 
 const DAY = 24 * 60 * 60 * 1000
 const NOW = 1_800_000_000_000
@@ -107,6 +107,40 @@ describe("pruneOlderThan", () => {
   test("is a no-op when nothing is older than the cutoff", () => {
     const db = seed()
     expect(pruneOlderThan(db, NOW - 400 * DAY)).toEqual({ steps: 0, prompts: 0, events: 0, usage: 0 })
+    db.close()
+  })
+})
+
+describe("wipeAll", () => {
+  test("deletes every recorded row, including the sessions, and keeps the schema", () => {
+    const db = seed()
+    expect(wipeAll(db)).toEqual({ steps: 3, prompts: 2, events: 2, usage: 2, sessions: 1 })
+    for (const table of ["sessions", "prompts", "events", "steps", "usage"] as const) {
+      expect((db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n).toBe(0)
+    }
+    // The file still carries its schema, so the next recorded event opens and
+    // writes into the same database instead of a broken one.
+    expect(dbInfo(db, ":memory:", NOW).schemaVersion).toBeGreaterThan(0)
+    db.close()
+  })
+
+  test("removes more rows than one batch, in batches", () => {
+    const db = openStatsDb(":memory:")
+    upsertSession(db, { sessionID: "s1", startedAt: NOW })
+    for (let index = 0; index < 5_200; index += 1) {
+      recordStep(db, { messageID: `bulk_${index}`, sessionID: "s1", input: 1, createdAt: NOW, recordedAt: NOW })
+    }
+    expect(wipeAll(db)).toEqual({ steps: 5_200, prompts: 0, events: 0, usage: 0, sessions: 1 })
+    expect(db.query("SELECT COUNT(*) AS n FROM steps").get()).toEqual({ n: 0 })
+    expect(db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 0 })
+    db.close()
+  })
+
+  test("degrades when an older database has no usage table", () => {
+    const db = seed()
+    db.exec("DROP TABLE usage")
+    expect(wipeAll(db)).toEqual({ steps: 3, prompts: 2, events: 2, usage: 0, sessions: 1 })
+    expect((db.query("SELECT COUNT(*) AS n FROM steps").get() as { n: number }).n).toBe(0)
     db.close()
   })
 })

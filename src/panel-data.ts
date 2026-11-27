@@ -59,7 +59,7 @@ export type PanelTone = "base" | "muted" | "warning" | "accent"
 
 /** What a selectable line stands for; Enter drills into it. */
 export type PanelRow = {
-  kind: "model" | "session" | "period" | "provider" | "turn" | "prune"
+  kind: "model" | "session" | "period" | "provider" | "turn" | "prune" | "wipe"
   value: string
   variant?: string | undefined
 }
@@ -412,7 +412,7 @@ export function viewBar(view: PanelView, width = 200): PanelLine {
 }
 
 export function keysFor(of: PanelView): string {
-  if (of === "db") return "↑↓ pick a retention · enter prune · e backfill estimates · v vacuum · r refresh · 1-9 view · ? help"
+  if (of === "db") return "↑↓ pick a retention · enter prune · the last row wipes · e backfill · v vacuum · r refresh · 1-9 view · ? help"
   if (of === "periods") return "↑↓ move · enter drill · b bucket · t range · m/p filter · x clear · 1-9 view · ? help"
   if (of === "turns") return "↑↓ move · a scope · t range · m/p filter · x clear · 1-9 view · ? help"
   return "↑↓ move · enter drill · s sort · t range · m/p filter · x clear · 1-9 view · ? help"
@@ -471,8 +471,8 @@ export function helpLines(width: number): PanelLine[] {
     { text: "" },
     { text: "database", tone: HEADER_TONE },
     { text: "  the db view shows where the file lives, what it holds and how much" },
-    { text: "  of it is old: ↑↓ pick a retention, enter prunes from its cutoff date," },
-    { text: "  e backfills list estimates, v gives the space back" },
+    { text: "  of it is old: ↑↓ pick a retention or wipe, enter asks before it" },
+    { text: "  deletes, e backfills list estimates, v gives the space back" },
     { text: "  local time · SQLite in the OpenCode state directory" },
   ]
   return lines.map((line) => ({ ...line, text: truncate(line.text, width) }))
@@ -1158,12 +1158,13 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
 
   lines.push({ text: "", tone: "muted" })
   lines.push({ text: "clean up", tone: HEADER_TONE })
-  // The retention rows are the only selectable lines here, so the hint says how
-  // to pick one and what Enter does: the row is a cutoff, not a count. Only the
-  // TUI renders this line; the desktop panel has buttons instead.
+  // The retention rows and the wipe row are the only selectable lines here, so
+  // the hint says how to pick one and what Enter does: a retention row is a
+  // cutoff, not a count, and the last row is everything. Only the TUI renders
+  // this line; the desktop panel has buttons instead.
   lines.push({
     text: truncate(
-      `  ↑↓ pick a retention · enter prunes the steps and their other usage (asks first)${
+      `  ↑↓ pick a retention · enter prunes from its cutoff · the wipe row deletes everything (asks first)${
         data.estimates === false ? "" : " · e backfills list estimates"
       } · v gives the space back`,
       width,
@@ -1194,6 +1195,14 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
       row: { kind: "prune", value: String(option.days) },
     })
   }
+  const steps = data.info.tables.find((table) => table.name === "steps")?.rows ?? 0
+  const sessions = data.info.tables.find((table) => table.name === "sessions")?.rows ?? 0
+  lines.push({ text: "", tone: "muted" })
+  lines.push({
+    text: truncate(`  wipe everything · ${formatCount(steps)} steps · ${formatCount(sessions)} sessions · cannot be undone`, width),
+    tone: steps === 0 && sessions === 0 ? "muted" : "warning",
+    row: { kind: "wipe", value: "all" },
+  })
   if (data.busy === true) {
     lines.push({ text: "", tone: "muted" })
     lines.push({ text: "the recorder is writing: try the vacuum again in a moment", tone: "warning" })

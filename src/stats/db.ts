@@ -16,7 +16,7 @@ import { isToken, sanitizeLabel, TEXT_LIMIT } from "../text"
  * - `openStatsDb` writes: schema, migrations and recording (the server).
  * - `openStatsDbReadOnly` only reads (the TUI), so no view can change the file
  *   and no reader pays for a schema write.
- * - `openStatsDbWrite` is a short-lived maintenance connection (prune, vacuum)
+ * - `openStatsDbWrite` is a short-lived maintenance connection (prune, wipe, vacuum)
  *   that gives up quickly instead of holding the recorder up.
  */
 
@@ -415,7 +415,7 @@ export function openStatsDbReadOnly(path: string): Database {
 
 /**
  * Short-lived write connection for maintenance. The busy timeout is short on
- * purpose: a prune or a vacuum that cannot take the lock must fail in front of
+ * purpose: a prune, wipe or vacuum that cannot take the lock must fail in front of
  * the user, not hold the recorder's response path for seconds.
  */
 export function openStatsDbWrite(path: string): Database {

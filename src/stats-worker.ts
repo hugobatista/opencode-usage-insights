@@ -7,6 +7,7 @@ import type {
   PruneInput,
   TurnsInput,
   VacuumInput,
+  WipeInput,
 } from "./rpc"
 import type { ModelPrice, PriceTable } from "./pricing"
 
@@ -25,7 +26,7 @@ type WorkerInit = {
 
 type WorkerRequest = {
   id: number
-  method: "panel" | "turns" | "listCost" | "filters" | "dbInfo" | "prune" | "vacuum" | "backfill"
+  method: "panel" | "turns" | "listCost" | "filters" | "dbInfo" | "prune" | "wipe" | "vacuum" | "backfill"
   input: unknown
   /** Serialized catalog for a backfill; undefined for every other method. */
   prices?: [string, ModelPrice][] | undefined
@@ -78,7 +79,7 @@ function serializedPrices(entries: [string, ModelPrice][] | undefined): PriceTab
 
 function run(request: WorkerRequest): unknown {
   if (service === undefined) throw new ServiceError("unavailable", "the usage worker is not initialized")
-  const maintenance = request.method === "prune" || request.method === "vacuum" || request.method === "backfill"
+  const maintenance = request.method === "prune" || request.method === "wipe" || request.method === "vacuum" || request.method === "backfill"
   if (maintenance) closeRead()
   try {
     switch (request.method) {
@@ -94,6 +95,8 @@ function run(request: WorkerRequest): unknown {
         return service.dbInfo()
       case "prune":
         return service.prune(request.input as PruneInput)
+      case "wipe":
+        return service.wipe(request.input as WipeInput)
       case "vacuum":
         return service.compact(request.input as VacuumInput)
       case "backfill":

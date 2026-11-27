@@ -12,7 +12,7 @@ import {
 } from "./panel-data"
 import { costOf, type PriceTable } from "./pricing"
 import { openStatsDbWrite } from "./stats/db"
-import { backfillListCost, dbInfo, pruneOlderThan, vacuum, type BackfillResult, type DbInfo, type PruneResult } from "./stats/maintenance"
+import { backfillListCost, dbInfo, pruneOlderThan, vacuum, wipeAll, type BackfillResult, type DbInfo, type PruneResult, type WipeResult } from "./stats/maintenance"
 import { filterOptions, overview, sessionListCost, turns, type FilterOption, type Filters } from "./stats/queries"
 import type {
   BackfillInput,
@@ -26,6 +26,7 @@ import type {
   TurnsOutput,
   VacuumInput,
   VacuumOutput,
+  WipeInput,
 } from "./rpc"
 
 /**
@@ -180,6 +181,12 @@ export function createService(db: () => Database, options: ServiceOptions) {
     return writeDb(options.path, (handle) => pruneOlderThan(handle, Date.now() - days * DAY))
   }
 
+  function wipe(input: WipeInput): WipeResult {
+    requireMaintenance()
+    requireConfirm(input.confirm)
+    return writeDb(options.path, (handle) => wipeAll(handle))
+  }
+
   function compact(input: VacuumInput): VacuumOutput {
     requireMaintenance()
     requireConfirm(input.confirm)
@@ -202,6 +209,7 @@ export function createService(db: () => Database, options: ServiceOptions) {
     filters,
     dbInfo: infoOf,
     prune,
+    wipe,
     compact,
     backfill,
   }

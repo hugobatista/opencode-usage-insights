@@ -7,4 +7,5 @@ test("the desktop panels use their product names", () => {
   expect(en["panel.view"]).toBe("View")
   expect(en["panel.scope"]).toBe("Scope")
   expect(en["panel.granularity"]).toBe("Granularity")
+  expect(en["panel.wipe"]).toBe("Wipe all history")
 })
