@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
-import { buildPanel, defaultSort, detailLabel, nextSort, sortKeys, type PanelRequest } from "../src/panel-build"
+import { buildPanel, detailLabel, type PanelRequest } from "../src/panel-build"
+import { defaultSort, nextSort, sortKeys } from "../src/panel-data"
 import { PANEL_VIEWS, sanitizeSettings, type PanelLine, type PanelView } from "../src/panel-data"
 import { openStatsDb, recordPrompt, recordStep, recordUsage, upsertSession } from "../src/stats/db"
 import { dbInfo, type DbInfo } from "../src/stats/maintenance"

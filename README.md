@@ -6,15 +6,17 @@
 [![npm](https://img.shields.io/npm/v/opencode-usage-insights.svg)](https://www.npmjs.com/package/opencode-usage-insights)
 
 **See what each turn costs.** OpenCode reports the cost of each request, but the
-TUI no longer shows it. This plugin puts cost back in view: a telemetry line
-after every turn, the session's running spend in the sidebar, and an interactive
-`/usage` panel with charged cost, list-price estimates, tokens, prompt-cache
-reuse and latency.
+TUI no longer shows it. This plugin puts cost back in view in the **TUI** and in
+**OpenCode Desktop**: a telemetry line after every turn, the session's running
+spend and turn history, and an interactive `/usage` panel with charged cost,
+list-price estimates, tokens, prompt-cache reuse and latency.
 
 ![The telemetry line after a turn](docs/images/line.png)
 
-Everything stays local: no prompts or responses are stored, and nothing leaves
-the machine.
+Everything stays in your OpenCode server: no prompts or responses are stored,
+and the plugin sends nothing to a third party. The TUI and Desktop both read the
+same recorder through an authenticated server RPC, so a client connected to a
+remote server shows that server's data.
 
 ## What it does
 
@@ -28,7 +30,12 @@ the machine.
   `db` — over five ranges (`session`, `today`, `7d`, `30d`, `all`), with
   drill-downs, sorting, filters and state remembered between openings.
   `/usage models 7d`, `/usage providers 30d`, `/usage turns 7d`.
-- **The session sidebar**: the session's running spend and its last turns, in
+- **The Desktop header badge and panels**: a spend badge in the session header,
+  next to the peak/off-peak badge; clicking it opens **Turns insights**, the
+  session history. **Usage insights** holds the nine views and opens from
+  `/usage`. The Desktop window never opens SQLite: the server's worker serves
+  the panels and history over RPC.
+- **The session sidebar** (TUI): the session's running spend and its last turns, in
   the same buckets as the line. Three lines per turn — when, through which
   provider and how long it took, the prompt volumes, then `hit · tok/s · cost`
   — plus the model at both ends of the block and on any turn that changed it,
@@ -51,14 +58,16 @@ the machine.
 
 ## Requirements
 
-- **OpenCode V2** (`>=2.0.0`). The V2 release changed the plugin API (slots,
-  panels, event stream).
+- **OpenCode V2** (`>=2.4.2`). The Desktop GUI part uses the V2 GUI plugin API
+  (`./gui-experimental`), introduced in the 2.4 line. The server and TUI parts
+  run on the same server that records the sessions.
 - [Bun](https://bun.sh) to install dependencies (development only).
 
 | | |
 | --- | --- |
 | **OS** | Linux, macOS and Windows. The database lives in the per-user state directory of each (table below); `test/paths.test.ts` asserts the path rules of all three from any machine, and `bun run check:platform` exercises the data layer — paths, database, recorder, queries, panel assembly, dump round-trip, file permissions — on the OS it runs on. CI runs the whole suite (including the TUI render tests) on Linux. |
 | **Runtime** | Bun, the runtime OpenCode ships with. SQLite comes from `bun:sqlite`: there is no native module to build and nothing to compile on install. |
+| **Desktop** | OpenCode Desktop 2.4+. The GUI is one CommonJS bundle (`dist/gui-experimental.cjs`) that uses the app's shared Solid, Effect and OpenCode client modules; it never opens SQLite. |
 
 ## Install
 
@@ -68,10 +77,15 @@ The plugin is published on npm as `opencode-usage-insights`.
 opencode plugin add opencode-usage-insights
 ```
 
-This adds one entry to the global `opencode.json(c)`. That entry loads both
-parts: the server recorder and the TUI contributions. A TUI-only package goes in
-`~/.config/opencode/cli.json`; this plugin has both parts, so `opencode.json(c)`
-is enough.
+This adds one entry to the global `opencode.json(c)`. That entry loads every
+part of the package: the server recorder and RPC, the TUI contributions, and the
+Desktop GUI. A TUI-only package goes in `~/.config/opencode/cli.json`; this
+plugin has a server part, so `opencode.json(c)` is enough.
+
+> **Desktop reads only `opencode.json(c)`.** If you added the plugin to
+> `~/.config/opencode/cli.json` for the TUI, add it to `opencode.json(c)` as
+> well; otherwise the Desktop side never loads. Do not keep it in both places:
+> one entry in `opencode.json(c)` covers the TUI and the Desktop.
 
 If you prefer to edit the configuration yourself:
 
@@ -93,16 +107,24 @@ To pass [options](#configuration), use the object form:
 }
 ```
 
-Or register a local checkout. V2 resolves a local *directory* plugin through its
-entry files, so pointing at `src/` loads the server recorder (`src/index.ts`)
-and the TUI contributions (`src/tui.tsx`) from source:
+Or register a local checkout. Point at the **package root**, not `src/`: the
+loader reads the package `exports`, which resolve the server, TUI, RPC and GUI
+parts. Build once before loading it, and rebuild after source changes:
+
+```sh
+cd /home/you/code/projects/opencode-usage-insights
+bun install
+bun run build
+```
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
-{ "plugins": [{ "package": "/home/you/code/projects/opencode-usage-insights/src" }] }
+{ "plugins": [{ "package": "/home/you/code/projects/opencode-usage-insights" }] }
 ```
 
-Configuration changes reload on their own; after changing the plugin's source,
+For GUI development, keep `bun run dev:gui` running in another terminal; each
+rebuild reloads the Desktop GUI in every window without restarting the server.
+Configuration changes reload on their own; after changing server or TUI source,
 restart the background service with `opencode service restart`.
 
 Send a prompt to verify: the telemetry line appears above the composer when the
@@ -142,6 +164,103 @@ A turn is every consecutive assistant step after a prompt. Compaction, shell,
 messages do. From a checkout, `bun run demo` prints one example per case,
 including the streaming one and both turn-total views.
 
+## OpenCode Desktop
+
+The Desktop app loads the package's `./gui-experimental` bundle in every window.
+The GUI plugin API is experimental in the 2.4 line; the bundle is tested against
+OpenCode Desktop 2.4.2. The window is Electron/Chromium: it has no Bun, no
+`bun:sqlite` and no Node filesystem.
+
+If the plugin was already installed before it gained the GUI part, restart the
+background service once (`opencode service restart`) and reopen the Desktop
+window. The plugin inventory caches the package's parts; a config reload may
+reload the server entry without noticing the new `./gui-experimental` export. The recorder, the database and the worker stay in the server; the
+window reads them through the same RPC the TUI uses.
+
+### The cost badge
+
+In the session header, next to the peak/off-peak badge, the usage insights badge
+shows the finished turn's spend (`$0.0210` or `≈$0.0210`):
+
+```text
+$0.0210
+```
+
+Hovering shows the full telemetry line. Clicking it opens **Turns insights**.
+The badge follows the TUI line and hides while a turn is running; it reappears
+with the final amount. The `fields`, `labels`, `turnTotals` and `pricing`
+options apply to both.
+
+### Usage insights and Turns insights
+
+`/usage` (and the hidden `/insights` alias) opens the **Usage insights** panel
+in the side region. It has the same nine views, five ranges, drill-downs,
+sorting and filters as the TUI, plus the database view's maintenance buttons.
+The **Turns insights** tab and `/usage turns` show the session history. Both
+panels have the inverse shortcut: **Usage insights** has an **Open turns
+insights** footer button, and **Turns insights** has **Open usage insights**.
+
+The TUI's always-visible sidebar has no Desktop slot. The Desktop equivalents
+are:
+
+| Where | What it shows |
+| --- | --- |
+| Session header badge | The turn spend and the full line on hover; click opens Turns insights. |
+| Turns insights tab / `/usage turns` | The complete history, with the session/all-sessions scope. |
+| Side panel `+` menu | **Usage insights** and **Turns insights** launchers. |
+
+The panel state is stored separately from the TUI: opening the Desktop panel
+does not move the TUI panel, and vice versa.
+
+### The server side
+
+The server part now also registers the usage RPC and starts a **database
+worker**. The worker owns a read-only SQLite connection for the panel and the
+turn history, and opens a short write connection for `prune`, `vacuum` and
+`backfill`. Panel queries therefore never block the agent's event loop, and the
+TUI no longer opens SQLite either: it works against a local or a remote server.
+
+The worker is started lazily on the first usage request (the panel, the history or the header badge estimate). If it cannot start
+(for example in a development runtime), the server falls back to an in-process
+service and logs it; the plugin still works, but the fallback shares the
+server's event loop.
+
+### Desktop options
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-usage-insights",
+      "options": {
+        "maintenance": false,
+        "exposePaths": false,
+        "sidebarTurns": 8
+      }
+    }
+  ]
+}
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `maintenance` | `true` | Allow the RPC to prune, vacuum and backfill. Set `false` on servers reachable from other machines; the TUI and Desktop then hide the maintenance rows and refuse the actions. |
+| `exposePaths` | `false` | Return the absolute database path in the `db` view. The default returns only the file name. |
+| `sidebarTurns` | `8` | Turns shown in the TUI sidebar and the Desktop Turns insights tab. |
+| `panel` | `true` | Register the `/usage` panel and command. |
+| `sidebar` | `true` | TUI-only: show the turn history in the session sidebar. The Desktop history is the Turns insights tab. |
+
+The `db` option is server-side: clients never open the file. The database path
+is resolved by the server, relative to the server process when it is relative.
+
+### Remote servers
+
+The TUI and Desktop call the RPC on the server that owns the session. A TUI
+connected to a remote server shows that server's usage; the Desktop GUI is
+loaded from its own background server, but the panel targets the session's
+server. The plugin's server part must be installed and enabled on that server.
+If it is not, the panel explains that usage data is unavailable.
+
 ## How costs are calculated
 
 **Charged money is never recalculated by the plugin.** `steps.cost` is what the
@@ -159,7 +278,7 @@ overrides, Zen/Go pricing):
 | Server recorder | `ctx.model.list()` → `ModelInfo.cost` |
 | Live turn / backfill | `ctx.data.location.model.list(ctx.location)` → `ModelInfo.cost` |
 | Panel, sidebar, NDJSON, CLI report | stored `steps.list_cost` |
-| `sess` segment | `SUM(list_cost)` from the plugin database |
+| `sess` segment | `SUM(list_cost)` from the plugin database, served over the RPC |
 
 The plugin does **not** read `~/.cache/opencode/models.json`, does **not** use
 `opencode models` for prices (it lists model IDs only), and makes no network
@@ -356,17 +475,19 @@ number in place.
 
 ## Configuration
 
-Options apply to both parts (each side reads the ones it needs):
+Options apply to all three parts (each side reads the ones it needs):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | `false` disables that side completely — no line, no panel, no recording. |
-| `db` | per-OS state path | SQLite path override. Must match between the server and TUI parts. |
+| `db` | per-OS state path | SQLite path override, resolved by the **server**. The TUI and Desktop read it through the RPC and never open the file. |
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `pricing` | `"auto"` | `"off"` disables list-price estimates everywhere: no new `list_cost` records, no `≈` on the line, in the panel or in the sidebar, and no historical backfill. Charged money is unaffected. |
-| `sidebar` | `true` | Show the session summary and the per-prompt history — turn duration, cache hit and cost per turn — in the session sidebar (the slot is invisible while the sidebar is hidden). |
-| `sidebarTurns` | `8` | How many turns the sidebar history shows. The host sidebar scrolls; raise it for a longer history. |
-| `panel` | `true` | Show the `/usage` statistics panel and its command. `false` keeps the line and the sidebar. |
+| `sidebar` | `true` | TUI-only: show the session summary and the per-prompt history in the session sidebar. The Desktop history is the Turns insights tab. |
+| `sidebarTurns` | `8` | How many turns the history shows. The host sidebar scrolls; raise it for a longer history. |
+| `panel` | `true` | Show the `/usage` statistics panel and its command in the TUI and Desktop. `false` keeps the line and the history. |
+| `maintenance` | `true` | Allow the RPC to prune, vacuum and backfill. Set `false` on servers reachable from other machines. |
+| `exposePaths` | `false` | Return the absolute database path in the `db` view; the default returns only the file name. |
 | `fields` | see below | Toggle line segments. |
 | `labels` | see below | Override line labels (the plugin is English-only by default). |
 
@@ -397,11 +518,13 @@ The recorder writes to the per-user state directory:
 
 `OPENCODE_USAGE_INSIGHTS_DB=/path/to/usage.db` overrides the path, and the `db`
 option overrides both. The file is private to the user: its directory is created
-`0700` and the file `0600` (POSIX), re-applied on every open. The TUI's views
-read through a read-only connection, so they never write, migrate or take the
-recorder's lock; prune, backfill and compact use a separate short-lived writer.
-The server part applies schema migrations on open; after an upgrade, start it
-once before opening the panel if the file predates the new schema.
+`0700` and the file `0600` (POSIX), re-applied on every open. The TUI and the
+Desktop GUI never open the file. They call the usage RPC; the server's worker
+holds a read-only connection for the panel and the history, so a view can never
+write, migrate or take the recorder's lock. Prune, backfill and compact use a
+separate short-lived writer inside the worker. The server part applies schema
+migrations on open; after an upgrade, start it once before opening the panel if
+the file predates the new schema.
 
 Per step the database holds tokens, charged cost, the list-price estimate when
 the host reported `$0`, timings, finish reason, the configured provider and the
@@ -409,6 +532,36 @@ model it ran through, and the session title and working directory. **Prompts and
 responses are not stored**, and nothing leaves the machine. The schema, the
 indexes, the identity rules and the security notes live in
 [docs/internals.md](docs/internals.md).
+
+### Security and remote servers
+
+The usage RPC is served by the OpenCode server and inherits its authentication.
+It is not a new unauthenticated endpoint, but it is a new authenticated surface:
+any client that can call the server API can call it, and the RPC handler has no
+caller identity (`RpcCallContext` exposes only cancellation and declared
+errors). The plugin therefore applies least privilege at the surface:
+
+- **Read-only by default for queries.** `panel`, `turns`, `listCost`, `filters`
+  and `dbInfo` run on the worker's read-only SQLite connection. The only writes
+  are `prune`, `vacuum` and `backfill`, gated by `maintenance` and an explicit
+  confirmation.
+- **No free-form access.** There is no SQL, path, import or export method. Inputs
+  are validated by JSON Schema with closed objects, enums, length limits and
+  numeric clamps; the service validates them again. SQL is parameterized.
+- **Minimal output.** The RPC returns usage metadata — session titles,
+  directories, models, providers, tokens, costs and the database shape — never
+  prompts or responses. Database paths are returned as a file name unless
+  `exposePaths: true`.
+- **Availability.** The worker keeps panel queries off the server's event loop;
+  the client queue is bounded and the worker has a watchdog. Generic errors are
+  returned; details stay in the server log.
+
+For a server reachable from another machine, set `maintenance: false` unless you
+need the maintenance buttons there. The RPC is only as protected as the server:
+do not expose an OpenCode server without its password/auth. The usage database
+is per server user; every authenticated client on that server sees the same
+sessions and aggregates. If you need per-user or per-tenant isolation, do not
+expose the RPC until the database carries that dimension.
 
 ## CLI report
 
@@ -428,20 +581,29 @@ bun run report --import backup.jsonl    # merge an export (idempotent)
 bun run report --help
 ```
 
-The views come from the same `buildPanel` the TUI renders, so the terminal and
-the panel never drift apart. `--width`, `--granularity`, `--model`,
-`--provider`, `--sort` and `--asc` mirror what the panel's keys do.
+The views come from the same `buildPanel` the TUI and the Desktop render, so the
+terminal and the panels never drift apart. Run this on the server that owns the
+database; it is the local CLI counterpart to the RPC. `--width`,
+`--granularity`, `--model`, `--provider`, `--sort` and `--asc` mirror what the
+panel's controls do.
 
 ## Development
 
 ```sh
 bun install
-bun run typecheck    # tsc --noEmit, strict
-bun test             # pure logic + database + TUI harness + render tests
-bun run build        # dist/index.js, dist/tui.js and declarations
+bun run typecheck    # server, TUI and the separate Desktop DOM typecheck
+bun test             # pure logic + database + TUI harness + worker/RPC tests
+bun run build        # dist/index.js, tui.js, rpc.js, stats-worker.js, gui-experimental.cjs
+bun run check:package
 bun run demo         # print the line and every view from a seeded database
 bun run docs:images  # re-render docs/images/*.png (needs ImageMagick)
+bun run dev:gui      # vite build --watch for the Desktop part
 ```
+
+For the Desktop development loop, point the local plugin at the package root
+(built once) and keep `bun run dev:gui` running: each GUI rebuild reloads the
+bundle in every Desktop window. Server or TUI source changes still need
+`opencode service restart`.
 
 - `src/core.ts`, `src/line.ts`, `src/panel-data.ts` and `src/stats/` are pure:
   turn accounting, the host-shape adapter, the view models, and the database,
@@ -450,11 +612,19 @@ bun run docs:images  # re-render docs/images/*.png (needs ImageMagick)
 - `src/text.ts` — text hygiene and the token shape a provider id is validated
   against.
 - `src/recorder.ts` — the event-stream state machine that fills the database.
-- `src/panel-build.ts`, `src/panel.tsx`, `src/sidebar.tsx` — panel assembly, the
-  panel component, and the sidebar contribution.
-- `src/index.ts`, `src/tui.tsx` — the server and TUI parts.
-- `scripts/` — the demo, report, bench, platform-check and documentation-image
-  CLIs, plus the two-entry `Bun.build`.
+- `src/rpc.ts`, `src/rpc-client.ts` — the shared RPC contract and its typed
+  client wrapper.
+- `src/service.ts`, `src/stats-worker.ts`, `src/stats-client.ts` — the database
+  service, the worker that runs it off the server's event loop, and the bounded
+  server-side client with its in-process fallback.
+- `src/panel-build.ts`, `src/panel.tsx`, `src/sidebar.tsx` — server-side panel
+  assembly, the TUI panel component, and the TUI sidebar contribution.
+- `src/gui.tsx`, `src/gui/` — the Desktop entry, header badge, panels, line
+  helpers, CSS, icon and copy.
+- `src/index.ts`, `src/tui.tsx` — the server (recorder + RPC + worker) and TUI
+  parts.
+- `scripts/` — the demo, report, bench, platform-check, package-check and
+  documentation-image CLIs, plus the Bun/Vite build.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules and review
 expectations, and [docs/internals.md](docs/internals.md) for the database

@@ -68,6 +68,33 @@ export type PanelLine = {
   text: string
   tone?: PanelTone
   row?: PanelRow | undefined
+  /** TUI-only key hint; the desktop GUI filters these lines out. */
+  hint?: boolean | undefined
+}
+
+/** Sorting options per view; the first is the default. */
+export const SORT_KEYS: Partial<Record<PanelView, readonly string[]>> = {
+  models: ["steps", "cached", "hit", "out", "cost"],
+  providers: ["steps", "cached", "hit", "cost", "share", "tps"],
+  latency: ["n", "tps", "wall"],
+  sessions: ["last", "steps", "cached", "cost"],
+  turns: ["time", "cost", "tokens"],
+}
+
+export function sortKeys(view: PanelView): readonly string[] {
+  return SORT_KEYS[view] ?? []
+}
+
+export function defaultSort(view: PanelView): string {
+  return sortKeys(view)[0] ?? ""
+}
+
+export function nextSort(view: PanelView, current: string, step: number): string {
+  const keys = sortKeys(view)
+  if (keys.length === 0) return current
+  const index = keys.indexOf(current)
+  if (index === -1) return keys[0]!
+  return keys[(index + step + keys.length) % keys.length]!
 }
 
 /** The views and ranges, as the command and the panel header understand them. */

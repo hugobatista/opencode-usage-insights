@@ -26,7 +26,8 @@ import { sessions, turns } from "../src/stats/queries"
 import { cacheDropsOf, cachePairs, cacheStatsOf, coverageOf, periodsOf, stepRows } from "../src/stats/aggregates"
 import { createRecorder, type RecorderEvent } from "../src/recorder"
 import { buildPanel, type PanelRequest } from "../src/panel-build"
-import { PANEL_VIEWS, type PanelView } from "../src/panel-data"
+import { DEFAULT_SETTINGS, PANEL_VIEWS, type PanelView } from "../src/panel-data"
+import { createService } from "../src/service"
 import { defaultDbPath, resolveDbPath } from "../src/stats/paths"
 
 const BASE = 1_800_000_000_000
@@ -105,6 +106,25 @@ function main(): void {
       assert(info.tables.find((table) => table.name === "steps")?.rows === 1, "the db view counts the step wrong")
       assert(info.firstAt === BASE + MIN || info.lastAt === BASE + MIN, "the db view does not see the window")
       db.close()
+    })
+
+    check("serves the panel and the history through the service", () => {
+      const reader = openStatsDbReadOnly(path)
+      const service = createService(() => reader, {
+        path,
+        pricing: true,
+        maintenance: false,
+        exposePaths: false,
+        format: { estimates: true },
+      })
+      const panel = service.panel({ sessionID: "ses_check", settings: DEFAULT_SETTINGS, width: 80 })
+      assert(panel.lines.length > 0, "the service panel returned no lines")
+      const history = service.turnHistory({ sessionID: "ses_check", limit: 4, width: 40 })
+      assert(history.summary.length > 0, "the service summary is empty")
+      assert(history.history.length > 0, "the service history is empty")
+      assert(typeof service.listCost({ sessionID: "ses_check" }).cost === "number", "the list cost is not a number")
+      assert(service.dbInfo().path === "usage.db", "the service did not redact the database path")
+      reader.close()
     })
 
     check("the reader opens it without a write connection", () => {

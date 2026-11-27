@@ -1,0 +1,174 @@
+/* Desktop panel and badge styles. The colours are the app's v2 tokens so the
+   plugin follows the user's theme in light and dark mode. */
+
+[data-component="oui-panel"] {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--v2-background-bg-base);
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oui-header"] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  border-bottom: 0.5px solid var(--v2-border-border-base);
+  flex: none;
+}
+
+[data-slot="oui-title-row"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+[data-slot="oui-title"] {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 600;
+  letter-spacing: -0.04px;
+}
+
+[data-slot="oui-subtitle"] {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oui-controls"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+[data-slot="oui-controls"] [data-component="oui-control"] {
+  min-width: 0;
+}
+
+[data-slot="oui-body"] {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0 12px;
+}
+
+[data-slot="oui-lines"] {
+  display: flex;
+  flex-direction: column;
+  min-width: max-content;
+  padding: 0 12px;
+  font-family: var(--v2-font-family-mono, var(--font-family-mono, monospace));
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre;
+}
+
+[data-slot="oui-line"] {
+  display: block;
+  width: 100%;
+  min-height: 18px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  white-space: pre;
+}
+
+button[data-slot="oui-line"][data-selectable="true"] {
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+button[data-slot="oui-line"][data-selectable="true"]:hover,
+button[data-slot="oui-line"][data-selectable="true"]:focus-visible {
+  background: var(--v2-background-bg-layer-01);
+  outline: none;
+}
+
+button[data-slot="oui-line"][data-selectable="true"]:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-focus);
+}
+
+[data-slot="oui-loading"],
+[data-slot="oui-empty"],
+[data-slot="oui-error"] {
+  padding: 16px 12px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oui-error"] {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-slot="oui-actions"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 0.5px solid var(--v2-border-border-base);
+  flex: none;
+}
+
+[data-slot="oui-detail-head"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 4px;
+  flex: none;
+}
+
+[data-slot="oui-divider"] {
+  height: 0.5px;
+  background: var(--v2-border-border-base);
+  margin: 8px 0;
+}
+
+/* Session header badge, next to the peak/off-peak badge. */
+
+[data-component="oui-header-badge"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--v2-text-text-base);
+}
+
+button[data-component="oui-header-badge"] {
+  cursor: pointer;
+}
+
+button[data-component="oui-header-badge"]:hover {
+  color: var(--v2-text-text-accent);
+}
+
+button[data-component="oui-header-badge"]:focus-visible {
+  outline: 1px solid var(--v2-border-border-focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+[data-slot="oui-header-badge-label"] {
+  color: inherit;
+}
+
+.oui-tone-base { color: var(--v2-text-text-base); }
+.oui-tone-muted { color: var(--v2-text-text-muted); }
+.oui-tone-warning { color: var(--v2-state-fg-warning); }
+.oui-tone-accent { color: var(--v2-text-text-accent); }

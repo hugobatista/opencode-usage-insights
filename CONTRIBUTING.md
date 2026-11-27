@@ -41,7 +41,7 @@ PRs that are too large to review efficiently will be asked to be split.
    ```
 5. **Make your changes** and validate before pushing:
    ```bash
-   bun run typecheck && bun test
+   bun run typecheck && bun test && bun run build && bun run check:package
    ```
 6. **Push and open a PR** against the `main` branch, filling in the PR template completely.
 
@@ -51,6 +51,18 @@ PRs that are too large to review efficiently will be asked to be split.
   `src/stats/` and `src/text.ts` must stay free of host imports
   (`@opencode/*`, `@opentui/*`, `solid-js`) so they remain unit-testable
   without a TUI runtime.
+- `src/gui/**` is browser code: no `bun:*`, no `node:*`, no `bun:sqlite` and no
+  `@opencode/ui`/`@opencode/session-ui`. It may import `effect`, `solid-js`,
+  `@opencode/plugin/gui`, `@opencode/plugin/rpc` and `@opencode/client`, which
+  the Desktop provides. Render controls with `ctx.ui` and the app's v2 CSS
+  tokens; `scripts/check-package.ts` fails on a forbidden module in the bundle.
+- The usage RPC (`src/rpc.ts`) is a security boundary. A new method needs a
+  closed JSON Schema, a bounded input, a server-side clamp, and a test for the
+  read-only and maintenance paths. Do not add SQL, a filesystem path or an
+  import/export operation to the RPC.
+- The worker is the only reader for the panel and the turn history. Server
+  request handlers must not query SQLite directly; go through `src/service.ts`
+  and `src/stats-client.ts`, and keep the worker read-only for queries.
 - Every view or line change needs a test at the level it lives at: pure text for
   the view models, the shared harness (`test/harness.ts`) for slots, commands
   and the line, and a render test for anything that changes JSX.

@@ -2,18 +2,14 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context } from "@opencode/plugin/tui/context"
 import { StyledText, fg, type ColorInput } from "@opentui/core"
-import type { Database } from "bun:sqlite"
-import { Show, createMemo, createRenderEffect, createSignal } from "solid-js"
+import { Show, createEffect, createMemo, createRenderEffect, createSignal } from "solid-js"
 import { computeTurn, type LineFields, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
 import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
 import { costOf, priceTable, type PriceFn, type PriceTable } from "./pricing"
+import { usageApi } from "./rpc-client"
 import { TurnsSidebar } from "./sidebar"
-import { openStatsDbReadOnly, openStatsDbWrite } from "./stats/db"
-import { backfillListCost, type BackfillResult } from "./stats/maintenance"
-import { resolveDbPath } from "./stats/paths"
-import { sessionListCost } from "./stats/queries"
 
 /**
  * TUI side of the plugin. Two contributions:
@@ -24,17 +20,20 @@ import { sessionListCost } from "./stats/queries"
  * - `session.panel` + the `/stats` slash command: the statistics panel over
  *   the database written by the server entry.
  *
- * The line is computed from the host's transcript alone; the database is opened
- * lazily for the panel and the sidebar, read-only in spirit: the TUI never
- * writes usage. When the database cannot be opened, the line still works and
- * the panel explains itself.
+ * The line is computed from the host's transcript alone; the panel, the
+ * sidebar history and the stored list estimate come from the server's usage
+ * RPC. The TUI never opens SQLite, so it works the same against a local or a
+ * remote server. When the RPC is unavailable, the line still works and the
+ * panel explains itself.
  */
 
 export type Options = {
   /** Turn the TUI side off: no line and no panel. */
   enabled?: boolean | undefined
-  /** SQLite database path override; must match the server entry. */
+  /** Server-side database path override; the TUI reads it through the RPC. */
   db?: string | undefined
+  /** Allow the panel's prune, vacuum and backfill actions. Defaults to true. */
+  maintenance?: boolean | undefined
   /**
    * List-price estimates for steps the host reports as costing nothing.
    * `off` hides them on the line, in the panel and in the sidebar, and
@@ -126,22 +125,20 @@ export default Plugin.define({
       void updateSettings(mutation)
     }
     // Bumped when a step or an execution ends: the panel and the sidebar read
-    // the database, which is not reactive by itself.
+    // the server database, which is not reactive by itself.
     const [refresh, setRefresh] = createSignal(0)
-    let database: Database | undefined
-    let databaseFailed = false
+    const [listCosts, setListCosts] = createSignal<Record<string, number>>({})
+    const pendingListCost = new Set<string>()
+    const api = usageApi(ctx.client, ctx.location)
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let lastRefresh = 0
-    /** Per-session list estimate for the `sess` segment; cleared on every write event. */
-    const sessionCostCache = new Map<string, number>()
 
     /**
-     * Ask the panel and the sidebar to re-read the database, at most once per
-     * throttle window. The first event after an idle stretch is instant; the
-     * rest of a burst is folded into one trailing rebuild.
+     * Ask the panel, the sidebar and the line to re-read the server, at most
+     * once per throttle window. The first event after an idle stretch is
+     * instant; the rest of a burst is folded into one trailing rebuild.
      */
     function bumpRefresh(): void {
-      sessionCostCache.clear()
       const now = Date.now()
       const wait = lastRefresh + REFRESH_THROTTLE_MS - now
       if (wait <= 0) {
@@ -159,80 +156,33 @@ export default Plugin.define({
       ;(refreshTimer as { unref?: (() => void) | undefined }).unref?.()
     }
 
-    /**
-     * Reader connection. Read-only on purpose: the TUI only ever reads, and a
-     * reader that cannot write never takes the recorder's lock, never runs a
-     * schema statement and cannot corrupt what it shows.
-     */
-    function db(): Database | undefined {
-      if (database !== undefined) return database
-      if (databaseFailed) return undefined
-      try {
-        database = openStatsDbReadOnly(resolveDbPath(options.db))
-        return database
-      } catch {
-        databaseFailed = true
-        return undefined
-      }
-    }
-
-    /**
-     * The session's recorded list estimate, for the `sess` segment. One indexed
-     * sum per session between write events, cached so a long transcript does
-     * not pay for it on every recompute. A missing database or an older schema
-     * degrades to the host's charged total alone.
-     */
-    function sessionListCostFor(sessionID: string): number {
+    /** The session's recorded list estimate, for the `sess` segment. */
+    function listCostFor(sessionID: string): number {
       if (!pricing) return 0
-      const cached = sessionCostCache.get(sessionID)
-      if (cached !== undefined) return cached
-      const handle = db()
-      if (handle === undefined) return 0
-      try {
-        const value = sessionListCost(handle, sessionID)
-        if (sessionCostCache.size >= 512) {
-          const oldest = sessionCostCache.keys().next()
-          if (oldest.done !== true) sessionCostCache.delete(oldest.value)
-        }
-        sessionCostCache.set(sessionID, value)
-        return value
-      } catch {
-        return 0
-      }
+      return listCosts()[sessionID] ?? 0
     }
 
     /**
-     * Write connection for maintenance only (prune, compact), opened for the
-     * duration of the operation with a short busy timeout: a reader waits, but
-     * a maintenance action that cannot take the lock is an error the user can
-     * see and retry.
+     * Fetch the session's stored list estimate once per write event. The line
+     * shows the host's charged total immediately and adds the estimate when
+     * the RPC answers; a server that cannot answer degrades to charged money.
      */
-    function withWrite<Value>(run: (handle: Database) => Value): Value | undefined {
-      let handle: Database | undefined
+    async function loadListCost(sessionID: string): Promise<void> {
+      if (!pricing || pendingListCost.has(sessionID)) return
+      pendingListCost.add(sessionID)
       try {
-        handle = openStatsDbWrite(resolveDbPath(options.db))
-        return run(handle)
+        const result = await api.listCost({ sessionID })
+        setListCosts((current) => {
+          const next = { ...current, [sessionID]: result.cost }
+          const keys = Object.keys(next)
+          if (keys.length > 512) for (const key of keys.slice(0, keys.length - 512)) delete next[key]
+          return next
+        })
       } catch {
-        return undefined
+        // The line degrades to the charged total.
       } finally {
-        handle?.close()
+        pendingListCost.delete(sessionID)
       }
-    }
-
-    /**
-     * Price every historical step the host recorded at $0 and that has no
-     * estimate yet. Explicit, because the catalog used is today's: a model
-     * that was free at the time is priced as it is now.
-     */
-    function backfill(): BackfillResult | undefined {
-      if (!pricing) return undefined
-      const table = priceTableFor()
-      if (table === undefined) return undefined
-      return withWrite((handle) => backfillListCost(handle, (ref, tokens) => costOf(table, ref, tokens)))
-    }
-
-    function sessionStart(sessionID: string): number | undefined {
-      return ctx.data.session.get(sessionID)?.time.created
     }
 
     /**
@@ -263,7 +213,7 @@ export default Plugin.define({
       const info = ctx.data.session.get(sessionID) as unknown as RuntimeSessionInfo | undefined
       // The host supplies the charged session total; the plugin database supplies
       // the list estimate for the steps the host reported as $0.
-      const session = info === undefined ? undefined : sessionTotals(info, sessionListCostFor(sessionID))
+      const session = info === undefined ? undefined : sessionTotals(info, listCostFor(sessionID))
       return computeTurn(toTranscriptTail(messages, 2, priceFor()), session)
     }
 
@@ -285,6 +235,11 @@ export default Plugin.define({
           estimates: pricing,
         }),
       )
+      createEffect(() => {
+        props.sessionID
+        refresh()
+        void loadListCost(props.sessionID)
+      })
       return (
         <Show when={parts().length > 0}>
           {() => {
@@ -320,10 +275,10 @@ export default Plugin.define({
               <Panel
                 input={input}
                 ctx={ctx}
-                deps={{ db, dbPath: () => resolveDbPath(options.db), withWrite, backfill, now: () => Date.now(), sessionStart, refresh, bump: bumpRefresh }}
+                deps={{ refresh, bump: bumpRefresh }}
                 settings={settings}
                 update={patchSettings}
-                format={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, estimates: pricing }}
+                maintenance={options.maintenance !== false}
               />
             ) : null,
         })
@@ -336,8 +291,7 @@ export default Plugin.define({
           <TurnsSidebar
             sessionID={input.sessionID}
             ctx={ctx}
-            deps={{ db, refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 8)) }}
-            options={{ labels: options.labels, fields: options.fields, turnTotals: options.turnTotals, estimates: pricing }}
+            deps={{ refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 8)) }}
           />
         ),
     })
@@ -403,7 +357,20 @@ export default Plugin.define({
       })
     }
 
+    const watchRecorded = (): (() => void) => {
+      try {
+        return api.onRecorded(() => bumpRefresh())
+      } catch {
+        // The server part may still be starting; the data events below remain
+        // a safe fallback.
+        return () => {}
+      }
+    }
+
     const disposeEvents = [
+      // The server writes the panel rows and the session estimate; its RPC
+      // event lands after the write, so the views re-read the committed data.
+      watchRecorded(),
       // A finished step means the history views have one more row: let them
       // re-read the database.
       ctx.data.on("session.step.ended", () => bumpRefresh()),
@@ -419,8 +386,10 @@ export default Plugin.define({
     ]
 
     __test.line = lineFor
-    __test.lineText = (sessionID: string) =>
-      lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields, estimates: pricing }))
+    __test.lineText = (sessionID: string) => {
+      void loadListCost(sessionID)
+      return lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields, estimates: pricing }))
+    }
     __test.open = open
     __test.state = () => {
       const current = sanitizeSettings(settings)
@@ -433,7 +402,6 @@ export default Plugin.define({
       disposeLine()
       disposePanel()
       disposeSidebar()
-      database?.close()
     }
   },
 })

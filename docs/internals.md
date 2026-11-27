@@ -1,7 +1,7 @@
 # Internals
 
 How the plugin works under the hood: the local database, where the identity of a
-step comes from, the rules the hot paths keep, and how the TUI side is tested.
+step comes from, the rules the hot paths keep, and how the clients are tested.
 The [README](../README.md) covers what a user sees; this file covers why it
 behaves the way it does.
 
@@ -17,7 +17,8 @@ The recorder writes to the per-user state directory of the current OS:
 
 `OPENCODE_USAGE_INSIGHTS_DB=/path/to/usage.db` overrides the path, and the
 `db` option overrides both. The database is opened with `journal_mode = WAL`, so
-the TUI process (reader) and the server process (writer) never block each other.
+the worker's reader and the server's writer never block each other. The TUI and
+the Desktop GUI never open the file: they call the server's usage RPC.
 Every write is an upsert keyed by message id, which makes recording idempotent:
 replayed events, restarts and re-imports never duplicate rows.
 
@@ -49,13 +50,11 @@ full table scan on every panel rebuild.
 
 The file is private to the user: its directory is created `0700` and the file
 `0600` (POSIX), re-applied every time either is opened. Schema migrations run on
-the server's writer connection; a read-only TUI that opens a file from before
-the current schema cannot add the column, so it reports the query error until
-the upgraded server has opened it once. The TUI reads through a
-read-only connection — it can never write, never migrate and never hold the
-writer's lock — and prune, the list-price backfill and compact use a separate
-short-lived writer with a 250 ms busy timeout, so maintenance fails fast with a
-message instead of stalling the recorder.
+the server's writer connection. The worker opens a read-only connection for the
+panel and the turn history — it can never write, never migrate and never hold
+the writer's lock — and prune, the list-price backfill and compact use a separate
+short-lived writer inside the worker with a 250 ms busy timeout, so maintenance
+fails fast with a message instead of stalling the recorder.
 
 ## The identity of a step
 
@@ -153,10 +152,10 @@ and makes no network call of its own.
 
 The server loads the list without blocking the recorder, refreshes it on
 `model.updated` and on a coarse TTL, and keeps the previous table when a refresh
-fails. The TUI builds its own table for the live line and the backfill, with the
-same event invalidation and TTL; a missing table means no estimate. The
-historical views never consult it: they read `steps.list_cost`, which is why
-they work without a host runtime.
+fails. The backfill uses that table. The TUI and the Desktop build their own
+table for the live line, with the same event invalidation and TTL; a missing
+table means no estimate. The historical views never consult it: they read
+`steps.list_cost`, which is why they work without a host runtime.
 
 The estimate is the host's own `cost` fallback:
 
@@ -202,13 +201,13 @@ step.
 The estimate is stored instead of recomputed on read for a practical reason:
 the panel, the sidebar, the NDJSON export and `bun run report` read the database
 without a host runtime. `list_cost` freezes the price at record time; the live
-turn prices from the TUI's current model list, which may be newer. The
+turn prices from the client's current model list, which may be newer. The
 maintenance backfill intentionally uses today's model list and is user-triggered,
 because a model that was free when the step ran may not be free now.
 
 The session segment follows a split rule: its charged total is the host's, and
-its estimate is `SUM(list_cost)` over the plugin's recorded steps, cached per
-session and invalidated on every write event. If the plugin began recording in
+its estimate is `SUM(list_cost)` over the plugin's recorded steps, fetched over
+the RPC and cached by the client, invalidated on every write event. If the plugin began recording in
 the middle of a session, that estimate covers only the recorded steps; the
 charged total still comes from the host. If the database is unavailable, the
 line falls back to the host total with no estimate.
@@ -279,11 +278,16 @@ arguments, no file contents, no environment variables.
 - **Private files.** The database directory is created `0700` and the file
   `0600` (POSIX), re-applied on every open; on Windows the file inherits the
   user profile's ACL.
-- **A read-only reader.** The TUI opens the database read-only, so the panel and
-  the sidebar can never write, migrate or take the recorder's lock. Prune and
-  compact open a separate short-lived writer with a 250 ms busy timeout: a
-  maintenance action that cannot take the lock tells the user and stops, instead
-  of stalling the request pipeline that records usage.
+- **A read-only reader.** The worker opens the database read-only, so panel and
+  history queries can never write, migrate or take the recorder's lock. Prune
+  and compact open a short-lived writer inside the worker with a 250 ms busy
+  timeout: a maintenance action that cannot take the lock tells the user and
+  stops, instead of stalling the request pipeline that records usage.
+- **A bounded, validated RPC.** The TUI and the Desktop GUI read the worker
+  through JSON-Schema-validated methods with closed objects, enums and clamps.
+  There is no SQL, path, import or export method. Maintenance is gated by the
+  `maintenance` option and an explicit confirmation; the worker runs every query
+  off the server's event loop and the client queue is bounded.
 - **Validated input.** Anything that reaches the database from outside — a
   provider id the host reports, a session title, an imported NDJSON dump — is
   validated as an identifier token or stripped of control characters and capped
@@ -307,10 +311,11 @@ the composer line. The rules it keeps are:
   turns, so a session with enough history stays bounded; a session with fewer
   finished turns can walk its history once. The line never scans a session's
   whole history.
-- **The TUI reads, and reads at most 300 ms apart.** The panel and the sidebar
-  share one read-only connection, a burst of step events is coalesced into one
-  rebuild, and each view is memoised; the file's own numbers (`dbInfo`) are only
-  asked for by the `db` view.
+- **Clients read through the worker, at most 300 ms apart.** The TUI and the
+  Desktop GUI each call the RPC; a burst of step events is coalesced into one
+  request, and the worker runs the query off the server's event loop. The
+  panel's and the history's rows are shared; the file's own numbers (`dbInfo`)
+  are only asked for by the `db` view.
 - **The panel's cost is the range it shows.** A view folds the steps of its
   range — in SQLite where the answer is a sum or a count, in JavaScript where it
   is a percentile or a comparison between consecutive steps. That is why the
@@ -333,9 +338,12 @@ Two rules came out of measuring, and the bench enforces both:
 stopped using an index. `bun run bench` checks the budgets on 20k steps,
 `bun run bench --full` on 120k, and `--explain` prints the query plans.
 
-## Testing the TUI side
+## Testing the clients
 
-`bun test` runs through `bunfig.toml`, which preloads `test/preload.ts`. Bun
+The TUI harness is the same one the tests and the documentation images use. The
+Desktop line helpers have their own pure tests (`test/gui-line.test.ts`), and
+`test/server.test.ts` drives the real server RPC through the worker. `bun test`
+runs through `bunfig.toml`, which preloads `test/preload.ts`. Bun
 resolves the bare `solid-js` specifier to the package's server build, where
 signals do not track and render effects run once; the host resolves the client
 build (the one `@opentui/solid` uses internally). The preload points the
@@ -364,6 +372,7 @@ bun test              # whole suite, Linux
 bun run check:platform
 bun run bench --full  # budgets at 120k steps
 bun run build
+bun run check:package
 npm pack --dry-run
 ```
 

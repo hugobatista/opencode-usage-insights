@@ -49,11 +49,17 @@ jobs:
           exit 1
         fi
 
-    - name: Type check and test
-      run: bun run typecheck && bun test
+    - name: Type check
+      run: bun run typecheck
 
     - name: Build
       run: bun run build
+
+    - name: Test
+      run: bun test
+
+    - name: Package check
+      run: bun run check:package
 
     - name: Display structure of build files
       id: display_build_files

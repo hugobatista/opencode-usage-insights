@@ -1,30 +1,30 @@
 /** @jsxImportSource @opentui/solid */
-import type { Database } from "bun:sqlite"
 import { TextAttributes, type RGBA } from "@opentui/core"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
-import { For, createMemo, createRenderEffect, createSignal } from "solid-js"
-import { buildPanel, defaultSort, nextSort, type PanelRequest } from "./panel-build"
+import { For, Show, createEffect, createMemo, createRenderEffect, createSignal } from "solid-js"
 import {
   GRANULARITIES,
   PANEL_VIEWS,
   RANGE_KEYS,
+  defaultSort,
   filterSummary,
   formatCount,
   helpLines,
   keysFor,
   nextIn,
+  nextSort,
   rangeLabel,
   sanitizeSettings,
   viewBar,
-  type LineFormatOptions,
   type PanelLine,
   type PanelRow,
   type PanelSettings,
   type PanelTone,
   type PanelView,
 } from "./panel-data"
-import { filterOptions, type Filters } from "./stats/queries"
-import { dbInfo, pruneOlderThan, vacuum, type BackfillResult, type DbInfo } from "./stats/maintenance"
+import { usageApi } from "./rpc-client"
+import type { FiltersOutput, PanelInput as UsagePanelInput } from "./rpc"
+import type { DbInfo } from "./stats/maintenance"
 
 /**
  * The `/usage` panel. One read-only view over the stats database at a time,
@@ -37,22 +37,6 @@ import { dbInfo, pruneOlderThan, vacuum, type BackfillResult, type DbInfo } from
  */
 
 export type PanelDeps = {
-  /** Lazily opened stats database; undefined when it cannot be opened. */
-  db: () => Database | undefined
-  /** Where that database lives, for the `db` view. */
-  dbPath: () => string
-  /**
-   * Short-lived write connection for maintenance (prune, compact). The panel
-   * itself only reads; opening a writer on demand is what keeps a read from
-   * ever taking the recorder's lock. Undefined when the write cannot be made.
-   */
-  withWrite?: (<Value>(run: (db: Database) => Value) => Value | undefined) | undefined
-  /** Price the historical $0 steps that have no estimate yet. */
-  backfill?: (() => BackfillResult | undefined) | undefined
-  /** Injectable clock, for tests. */
-  now: () => number
-  /** Creation time of a session, used by the `session` range. */
-  sessionStart: (sessionID: string) => number | undefined
   /** Bumped by the TUI when a step or an execution ends, so views re-read. */
   refresh?: (() => number) | undefined
   /**
@@ -70,7 +54,7 @@ export function Panel(props: {
   readonly deps: PanelDeps
   readonly settings: PanelSettings
   readonly update: (mutation: (draft: PanelSettings) => void) => void
-  readonly format?: LineFormatOptions | undefined
+  readonly maintenance?: boolean | undefined
 }) {
   const [anchor, setAnchor] = createSignal<string | undefined>(undefined)
   const [detail, setDetail] = createSignal<PanelRow | undefined>(undefined)
@@ -78,18 +62,23 @@ export function Panel(props: {
   const [tick, setTick] = createSignal(0)
   // Set when a vacuum could not take the write lock: the recorder is mid-write.
   const [busy, setBusy] = createSignal(false)
+  const [lines, setLines] = createSignal<PanelLine[]>([])
+  const [database, setDatabase] = createSignal<DbInfo | undefined>(undefined)
+  const [loading, setLoading] = createSignal(false)
+  const [error, setError] = createSignal<string | undefined>(undefined)
+  let generation = 0
   let scroller: Scroller | undefined
 
   const width = (): number => Math.max(60, props.input.width - 4)
   const view = (): PanelView => sanitizeSettings(props.settings).view
   const settings = (): PanelSettings => sanitizeSettings(props.settings)
 
-  const filters = (): Filters => {
-    const current = settings()
-    return {
-      ...(current.modelID !== "" ? { modelID: current.modelID } : {}),
-      ...(current.providerID !== "" ? { provider: current.providerID } : {}),
-    }
+  const api = () => usageApi(props.ctx.client, props.ctx.location)
+
+  function errorMessage(cause: unknown): string {
+    if (cause instanceof Error) return cause.message
+    if (cause !== null && typeof cause === "object" && "message" in cause) return String((cause as { message: unknown }).message)
+    return "usage service unavailable"
   }
 
   const rowKey = (row: PanelRow): string => `${row.kind}:${row.value}${row.variant !== undefined ? `#${row.variant}` : ""}`
@@ -99,47 +88,55 @@ export function Panel(props: {
    * table, so only the `db` view (and the prune confirmation) asks for it: the
    * other views must not pay for it on every rebuild.
    */
-  const database = createMemo<DbInfo | undefined>(() => {
+  const request = createMemo<UsagePanelInput | undefined>(() => {
     tick()
-    const handle = props.deps.db()
-    if (handle === undefined) return undefined
-    try {
-      return dbInfo(handle, props.deps.dbPath(), props.deps.now())
-    } catch {
-      return undefined
+    props.deps.refresh?.()
+    if (help()) return undefined
+    const current = settings()
+    return {
+      sessionID: props.input.sessionID,
+      settings: current,
+      ...(detail() !== undefined ? { detail: detail() } : {}),
+      width: width(),
+      busy: busy(),
     }
   })
 
+  createEffect(() => {
+    const input = request()
+    const current = ++generation
+    if (input === undefined) {
+      setLines(helpLines(width()))
+      setDatabase(undefined)
+      setError(undefined)
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    void api()
+      .panel(input)
+      .then((result) => {
+        if (current !== generation) return
+        setLines(result.lines)
+        setDatabase(result.database)
+        setError(undefined)
+      })
+      .catch((cause: unknown) => {
+        if (current !== generation) return
+        setError(errorMessage(cause))
+        if (lines().length === 0) setLines([])
+      })
+      .finally(() => {
+        if (current === generation) setLoading(false)
+      })
+  })
+
   const content = createMemo<PanelLine[]>(() => {
-    tick()
-    props.deps.refresh?.()
-    const current = settings()
-    if (help()) return helpLines(width())
-    const db = props.deps.db()
-    if (db === undefined) {
-      return [{ text: `stats database is not readable at ${props.deps.dbPath()}; enable the usage-insights server plugin in opencode.json`, tone: "warning" }]
+    if (error() !== undefined && lines().length === 0) {
+      return [{ text: `usage service unavailable: ${error()}`, tone: "warning" }]
     }
-    const info = current.view === "db" ? database() : undefined
-    const request: PanelRequest = {
-      db,
-      view: current.view,
-      range: current.range,
-      filters: filters(),
-      granularity: current.granularity,
-      turnsScope: current.turnsScope,
-      sort: current.sort,
-      sortDesc: current.sortDesc,
-      sessionID: props.input.sessionID,
-      sessionStart: props.deps.sessionStart(props.input.sessionID),
-      now: props.deps.now(),
-      format: props.format,
-      estimates: props.format?.estimates !== false,
-      ...(detail() !== undefined ? { detail: detail() } : {}),
-      ...(info !== undefined ? { database: info } : {}),
-      busy: busy(),
-      width: width(),
-    }
-    return buildPanel(request)
+    const visible = (line: PanelLine): boolean => props.maintenance !== false || line.row?.kind !== "prune"
+    return lines().filter(visible)
   })
 
   const header = createMemo<PanelLine[]>(() => {
@@ -219,6 +216,10 @@ export function Panel(props: {
 
   /** Delete the recorded usage older than `days`, after asking. */
   async function prune(days: number): Promise<void> {
+    if (props.maintenance === false) {
+      props.ctx.ui.toast.show({ message: "database maintenance is disabled", variant: "warning" })
+      return
+    }
     if (!Number.isFinite(days)) return
     if (sessionRunning()) {
       props.ctx.ui.toast.show({ message: "the session is running: prune again when it is idle", variant: "warning" })
@@ -232,27 +233,26 @@ export function Panel(props: {
       label: { confirm: "Prune", cancel: "Keep" },
     })
     if (confirmed !== true) return
-    const cutoff = props.deps.now() - days * 24 * 60 * 60 * 1000
-    const result = props.deps.withWrite?.((handle) => pruneOlderThan(handle, cutoff))
-    if (result === undefined) {
-      props.ctx.ui.toast.show({ message: "the recorder is writing: try again in a moment", variant: "warning" })
-    } else {
+    try {
+      const result = await api().prune({ days, confirm: true })
       props.ctx.ui.toast.show({
         message: `pruned ${result.steps} steps · ${result.prompts} prompts · ${result.events} compactions · ${result.usage} other usage`,
         variant: "success",
       })
+    } catch (cause) {
+      props.ctx.ui.toast.show({ message: errorMessage(cause), variant: "warning" })
     }
     setAnchor(undefined)
     setTick((value) => value + 1)
     // A batched prune can have committed some batches before failing; the
-    // sidebar reads the same database but has no tick of its own.
+    // sidebar reads the same server database but has no tick of its own.
     props.deps.bump?.()
   }
 
   /** Price the historical steps the host recorded at $0. */
   async function backfillEstimates(): Promise<void> {
-    if (props.format?.estimates === false) {
-      props.ctx.ui.toast.show({ message: "list-price estimates are turned off", variant: "warning" })
+    if (props.maintenance === false) {
+      props.ctx.ui.toast.show({ message: "database maintenance is disabled", variant: "warning" })
       return
     }
     if (sessionRunning()) {
@@ -265,7 +265,7 @@ export function Panel(props: {
       return
     }
     const candidates = info?.unpriced ?? 0
-    if (candidates === 0) {
+    if (info !== undefined && candidates === 0) {
       props.ctx.ui.toast.show({ message: "every $0 step already has a list estimate" })
       return
     }
@@ -275,14 +275,14 @@ export function Panel(props: {
       label: { confirm: "Backfill", cancel: "Cancel" },
     })
     if (confirmed !== true) return
-    const result = props.deps.backfill?.()
-    if (result === undefined) {
-      props.ctx.ui.toast.show({ message: "the price catalog is unavailable: try again in a moment", variant: "warning" })
-    } else {
+    try {
+      const result = await api().backfill({ confirm: true })
       props.ctx.ui.toast.show({
         message: `backfilled ${formatCount(result.updated)} of ${formatCount(result.candidates)} steps`,
         variant: result.updated === 0 ? "warning" : "success",
       })
+    } catch (cause) {
+      props.ctx.ui.toast.show({ message: errorMessage(cause), variant: "warning" })
     }
     setTick((value) => value + 1)
     // A backfill can have committed some batches before failing; re-read even
@@ -292,6 +292,10 @@ export function Panel(props: {
 
   /** Give the space a prune freed back to the filesystem. */
   async function compact(): Promise<void> {
+    if (props.maintenance === false) {
+      props.ctx.ui.toast.show({ message: "database maintenance is disabled", variant: "warning" })
+      return
+    }
     if (sessionRunning()) {
       props.ctx.ui.toast.show({ message: "the session is running: compact again when it is idle", variant: "warning" })
       return
@@ -302,22 +306,16 @@ export function Panel(props: {
       label: { confirm: "Compact", cancel: "Cancel" },
     })
     if (confirmed !== true) return
-    const path = props.deps.dbPath()
-    let result: { freed: number } | undefined
     try {
-      result = props.deps.withWrite?.((handle) => vacuum(handle, path))
-    } catch {
-      result = undefined
-    }
-    if (result === undefined) {
-      setBusy(true)
-      props.ctx.ui.toast.show({ message: "the recorder is writing: try again in a moment", variant: "warning" })
-    } else {
+      const result = await api().vacuum({ confirm: true })
       setBusy(false)
       props.ctx.ui.toast.show({
         message: `compacted: ${(result.freed / 1_048_576).toFixed(1)} MB back`,
         variant: "success",
       })
+    } catch (cause) {
+      setBusy(true)
+      props.ctx.ui.toast.show({ message: errorMessage(cause), variant: "warning" })
     }
     setTick((value) => value + 1)
   }
@@ -329,9 +327,13 @@ export function Panel(props: {
   }
 
   async function pickFilter(kind: "model" | "provider"): Promise<void> {
-    const db = props.deps.db()
-    if (db === undefined) return
-    const all = filterOptions(db)
+    let all: FiltersOutput
+    try {
+      all = await api().filters()
+    } catch (cause) {
+      props.ctx.ui.toast.show({ message: errorMessage(cause), variant: "warning" })
+      return
+    }
     const list = kind === "model" ? all.models : all.providers
     const current = settings()
     const selected = kind === "model" ? current.modelID : current.providerID
@@ -481,6 +483,9 @@ export function Panel(props: {
             )
           }}
         </For>
+        <Show when={loading()}>
+          <text fg={props.ctx.theme.text.muted}>loading…</text>
+        </Show>
         <text fg={props.ctx.theme.text.muted}>{""}</text>
         <text fg={props.ctx.theme.text.muted}>{keysFor(view())}</text>
       </scrollbox>

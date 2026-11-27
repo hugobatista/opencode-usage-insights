@@ -1,20 +1,19 @@
 /** @jsxImportSource @opentui/solid */
-import type { Database } from "bun:sqlite"
 import type { RGBA } from "@opentui/core"
 import type { Context } from "@opencode/plugin/tui/context"
-import { For, createMemo } from "solid-js"
-import { sidebarLines, sessionSummaryLines, type LineFormatOptions, type PanelLine, type PanelTone } from "./panel-data"
-import { overview, turns } from "./stats/queries"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import type { PanelLine, PanelTone } from "./panel-data"
+import { usageApi } from "./rpc-client"
+import type { TurnsOutput } from "./rpc"
 
 /**
  * Sidebar history: the session's accumulated usage, then the last finished
  * turns — when and through which provider, the model when it changed, and the
- * prompt volumes. Reads the same database, the same buckets and the same
- * formatter as the panel and the live line, and refreshes whenever a turn ends.
+ * prompt volumes. The lines are formatted by the server's RPC from the same
+ * database the panel uses; the sidebar only renders them.
  */
 
 export type TurnsSidebarDeps = {
-  db: () => Database | undefined
   /** Bumped by the TUI when a step or an execution ends. */
   refresh: () => number
   /** How many turns to show. */
@@ -27,7 +26,6 @@ export function TurnsSidebar(props: {
   readonly sessionID: string
   readonly ctx: Context
   readonly deps: TurnsSidebarDeps
-  readonly options?: LineFormatOptions | undefined
 }) {
   const color = (tone: PanelTone | undefined): RGBA => {
     switch (tone) {
@@ -42,25 +40,53 @@ export function TurnsSidebar(props: {
     }
   }
 
-  const lines = createMemo<PanelLine[]>(() => {
+  const [data, setData] = createSignal<TurnsOutput | undefined>(undefined)
+  const [error, setError] = createSignal<unknown>(undefined)
+  const [loading, setLoading] = createSignal(false)
+  let generation = 0
+
+  createEffect(() => {
     props.deps.refresh()
-    const db = props.deps.db()
-    if (db === undefined) return []
-    const budget = props.deps.budget ?? 34
-    try {
-      // The session's own steps, never the window after it started: siblings
-      // and subagents are their own sessions.
-      const summary = sessionSummaryLines(overview(db, undefined, { sessionID: props.sessionID }), budget, props.options?.estimates !== false)
-      const history = sidebarLines(turns(db, { sessionID: props.sessionID, limit: props.deps.limit }), { ...props.options, budget })
-      return [...summary, { text: "turns", tone: "accent" as PanelTone }, ...history]
-    } catch {
+    const input = {
+      sessionID: props.sessionID,
+      limit: props.deps.limit,
+      width: props.deps.budget ?? 34,
+    }
+    const current = ++generation
+    const controller = new AbortController()
+    onCleanup(() => controller.abort())
+    setLoading(true)
+    void usageApi(props.ctx.client, props.ctx.location)
+      .turns(input, controller.signal)
+      .then((result) => {
+        if (current !== generation) return
+        setData(result)
+        setError(undefined)
+      })
+      .catch((cause: unknown) => {
+        if (current !== generation) return
+        setError(cause)
+      })
+      .finally(() => {
+        if (current === generation) setLoading(false)
+      })
+  })
+
+  const lines = createMemo<PanelLine[]>(() => {
+    const result = data()
+    if (result === undefined) {
+      if (error() !== undefined) return [{ text: "usage history unavailable", tone: "muted" }]
       return []
     }
+    return [...result.summary, { text: "turns", tone: "accent" as PanelTone }, ...result.history]
   })
 
   return (
     <box flexDirection="column" paddingLeft={1} paddingRight={1}>
       <For each={lines()}>{(line) => <text fg={color(line.tone)}>{line.text}</text>}</For>
+      <Show when={loading() && data() !== undefined}>
+        <text fg={props.ctx.theme.text.muted}>…</text>
+      </Show>
     </box>
   )
 }

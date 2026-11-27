@@ -215,7 +215,7 @@ describe("telemetry line", () => {
     expect(line).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost $0.5000")
   })
 
-  test("shows the recorded session estimate in the sess segment", () => {
+  test("shows the recorded session estimate in the sess segment", async () => {
     const db = openStatsDb(resolveDbPath())
     recordStep(db, {
       messageID: "msg_session_estimate",
@@ -229,10 +229,12 @@ describe("telemetry line", () => {
     db.close()
 
     const harness = init({ sessions: [session({ id: "ses_session_estimate", cost: 0 })] })
+    harness.lineText("ses_session_estimate")
+    await harness.settle()
     expect(harness.lineText("ses_session_estimate")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.2000")
   })
 
-  test("refreshes the session estimate after a write event", () => {
+  test("refreshes the session estimate after a write event", async () => {
     const db = openStatsDb(resolveDbPath())
     recordStep(db, {
       messageID: "msg_session_refresh_a",
@@ -246,6 +248,8 @@ describe("telemetry line", () => {
     db.close()
 
     const harness = init({ sessions: [session({ id: "ses_session_refresh", cost: 0 })] })
+    harness.lineText("ses_session_refresh")
+    await harness.settle()
     expect(harness.lineText("ses_session_refresh")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.2000")
 
     const writer = openStatsDb(resolveDbPath())
@@ -262,6 +266,8 @@ describe("telemetry line", () => {
 
     // The next step event clears the line's per-session cache.
     harness.emit("session.step.ended")
+    harness.lineText("ses_session_refresh")
+    await harness.settle()
     expect(harness.lineText("ses_session_refresh")).toContain("sess in 132k (2.13M), cached 2M, out 5k, cost ≈ $0.3000")
   })
 

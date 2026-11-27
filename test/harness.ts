@@ -11,9 +11,14 @@ import { plugin as registerBunPlugin } from "bun"
 import { RGBA } from "@opentui/core"
 import solid from "@opentui/solid/bun-plugin"
 import { createSignal } from "solid-js"
+import type { Database } from "bun:sqlite"
+import type { LineFields, LineLabels, TurnTotalsView } from "../src/core"
 import { DEFAULT_SETTINGS, type PanelSettings } from "../src/panel-data"
 import type { RuntimeMessage, RuntimeModelRef, RuntimeTokenUsage } from "../src/line"
-import type { ModelInfoLike } from "../src/pricing"
+import { priceTable, type ModelInfoLike } from "../src/pricing"
+import { createService } from "../src/service"
+import { openStatsDbReadOnly } from "../src/stats/db"
+import { resolveDbPath } from "../src/stats/paths"
 
 registerBunPlugin(solid)
 
@@ -138,7 +143,44 @@ export function createHarness(config: HarnessConfig = {}) {
 
   const theme = mergeTheme(DEFAULT_HARNESS_THEME, config.theme)
 
+  const options = config.options as
+    | { pricing?: "auto" | "off"; labels?: Partial<LineLabels>; fields?: Partial<LineFields>; turnTotals?: TurnTotalsView }
+    | undefined
+  const dbPath = resolveDbPath()
+  let serviceDb: Database | undefined
+  const read = (): Database => {
+    if (serviceDb === undefined) serviceDb = openStatsDbReadOnly(dbPath)
+    return serviceDb
+  }
+  const pricing = options?.pricing !== "off"
+  const service = createService(read, {
+    path: dbPath,
+    pricing,
+    maintenance: true,
+    exposePaths: false,
+    format: {
+      ...(options?.labels !== undefined ? { labels: options.labels } : {}),
+      ...(options?.fields !== undefined ? { fields: options.fields } : {}),
+      ...(options?.turnTotals !== undefined ? { turnTotals: options.turnTotals } : {}),
+      estimates: pricing,
+    },
+    priceTable: () => priceTable(config.models),
+  })
+  const rpc = {
+    panel: (input: unknown) => Promise.resolve().then(() => service.panel(input as never)),
+    turns: (input: unknown) => Promise.resolve().then(() => service.turnHistory(input as never)),
+    listCost: (input: unknown) => Promise.resolve().then(() => service.listCost(input as never)),
+    filters: () => Promise.resolve().then(() => service.filters()),
+    dbInfo: () => Promise.resolve().then(() => service.dbInfo()),
+    prune: (input: unknown) => Promise.resolve().then(() => service.prune(input as never)),
+    vacuum: (input: unknown) => Promise.resolve().then(() => service.compact(input as never)),
+    backfill: (input: unknown) => Promise.resolve().then(() => service.backfill(input as never)),
+    events: { on: () => () => {} },
+  }
+  const client = { rpc: () => rpc }
+
   const ctx = {
+    client,
     options: config.options ?? {},
     location: { directory: "/project" },
     data: {
@@ -223,7 +265,15 @@ export function createHarness(config: HarnessConfig = {}) {
     },
   }
 
-  const cleanup = pluginModule.default.setup(ctx as never) as unknown as (() => void) | undefined
+  const dispose = pluginModule.default.setup(ctx as never) as unknown as (() => void) | undefined
+  const cleanup =
+    dispose === undefined
+      ? undefined
+      : () => {
+          dispose()
+          serviceDb?.close()
+          serviceDb = undefined
+        }
 
   return {
     claims,
@@ -244,6 +294,11 @@ export function createHarness(config: HarnessConfig = {}) {
     setStatus: (sessionID: string, next: "idle" | "running") => statusSignals.get(sessionID)?.[1](next),
     lineText: (sessionID: string) => pluginModule.__test.lineText!(sessionID),
     state: () => pluginModule.__test.state!(),
+    settle: async () => {
+      await Promise.resolve()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Promise.resolve()
+    },
     emit: (type: string, payload?: unknown) => {
       for (const entry of events) {
         if (entry.live && entry.type === type) entry.handler({ type, data: payload })

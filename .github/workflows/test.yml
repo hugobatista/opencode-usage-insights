@@ -6,6 +6,10 @@ on:
     paths:
       - '**.ts'
       - '**.tsx'
+      - 'package.json'
+      - 'bun.lock'
+      - 'vite.config.ts'
+      - 'tsconfig*.json'
       - 'test/**'
   pull_request:
     branches: [master, main]
@@ -42,6 +46,13 @@ jobs:
 
       - name: Type check
         run: bun run typecheck
+
+      # The server, TUI, RPC contract, worker and the desktop CommonJS bundle.
+      - name: Build
+        run: bun run build
+
+      - name: Package check
+        run: bun run check:package
 
       # The data layer (paths, database, recorder, queries, panel assembly, dump
       # round-trip, file permissions) against a throwaway database. The script

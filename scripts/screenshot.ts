@@ -96,6 +96,9 @@ async function renderSvg(render: () => unknown, size: { width: number; height: n
 async function renderFrame(render: () => unknown, size: { width: number; height: number }, background: RGBA): Promise<CapturedFrame> {
   const setup = await testRender(render as never, { ...size, backgroundColor: background })
   try {
+    // The panel and the sidebar fetch their rows over RPC; let the mock
+    // service's promise land before capturing the first frame.
+    await Bun.sleep(0)
     await setup.renderOnce()
     return setup.captureSpans()
   } finally {

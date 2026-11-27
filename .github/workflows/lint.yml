@@ -6,6 +6,10 @@ on:
     paths:
       - '**.ts'
       - '**.tsx'
+      - 'package.json'
+      - 'bun.lock'
+      - 'vite.config.ts'
+      - 'tsconfig*.json'
   pull_request:
     branches: [master, main]
   workflow_dispatch:
