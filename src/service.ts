@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite"
 import { basename } from "node:path"
+import { clampPanelWidth, clampTurnsLimit } from "./limits"
 import { buildPanel, type PanelRequest } from "./panel-build"
 import {
   defaultSort,
@@ -35,8 +36,6 @@ import type {
  */
 
 const DAY = 24 * 60 * 60 * 1000
-const MAX_WIDTH = 200
-const MAX_LIMIT = 50
 const MAX_DAYS = 3650
 
 export type ServiceErrorCode = "busy" | "unavailable" | "disabled" | "invalid"
@@ -120,7 +119,7 @@ export function createService(db: () => Database, options: ServiceOptions) {
   function panel(input: PanelInput): PanelOutput {
     const settings = settingsOf(input)
     const database = settings.view === "db" ? infoOf() : undefined
-    const width = clamp(input.width, 20, MAX_WIDTH)
+    const width = clampPanelWidth(input.width)
     const filters = filtersOf(settings)
     const request: PanelRequest = {
       db: db(),
@@ -147,7 +146,7 @@ export function createService(db: () => Database, options: ServiceOptions) {
   function turnHistory(input: TurnsInput): TurnsOutput {
     const handle = db()
     const width = clamp(input.width, 20, 120)
-    const limit = clamp(input.limit, 1, MAX_LIMIT)
+    const limit = clampTurnsLimit(input.limit)
     const summary = sessionSummaryLines(overview(handle, undefined, { sessionID: input.sessionID }), width, options.pricing)
     const history = sidebarLines(turns(handle, { sessionID: input.sessionID, limit }), {
       ...options.format,

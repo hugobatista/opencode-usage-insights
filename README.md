@@ -182,16 +182,19 @@ $0.0210
 Hovering shows the full telemetry line. Clicking it opens **Turns insights**.
 The badge follows the TUI line and hides while a turn is running; it reappears
 with the final amount. The `fields`, `labels`, `turnTotals` and `pricing`
-options apply to the line, badge tooltip and panel.
+options apply to the line, badge tooltip and panel; `fields.cost: false` hides
+the badge as well.
 
 ### Usage insights and Turns insights
 
 `/usage` (and the hidden `/insights` alias) opens the **Usage insights** panel
 in the side region. It has the same nine views, five ranges, drill-downs,
 sorting and filters as the TUI, plus the database view's maintenance buttons.
-The **Turns insights** tab and `/usage turns` show the session history. Both
-panels have the inverse shortcut: **Usage insights** has an **Open turns
-insights** footer button, and **Turns insights** has **Open usage insights**.
+The **Turns insights** tab shows the current session's history. `/usage turns`
+opens the same history inside **Usage insights**, where the session/all-sessions
+scope is available. Both panels have the inverse shortcut: **Usage insights**
+has an **Open turns insights** footer button, and **Turns insights** has
+**Open usage insights**.
 
 The TUI's always-visible sidebar has no Desktop slot. The Desktop equivalents
 are:
@@ -199,7 +202,7 @@ are:
 | Where | What it shows |
 | --- | --- |
 | Session header badge | The turn spend and the full line on hover; click opens Turns insights. |
-| Turns insights tab / `/usage turns` | The complete history, with the session/all-sessions scope. |
+| Turns insights tab | The current session's complete history. `/usage turns` adds the session/all-sessions scope. |
 | Side panel `+` menu | **Usage insights** and **Turns insights** launchers. |
 
 The panel state is stored separately from the TUI: opening the Desktop panel
@@ -368,7 +371,7 @@ Options apply to all three parts (each side reads the ones it needs):
 | `turnTotals` | `"latest"` | How the turn segment counts prompt usage: `latest` shows the prompt size the turn ended with; `sum` adds every step of the turn. |
 | `pricing` | `"auto"` | `"off"` disables list-price estimates everywhere: no new `list_cost` records, no `≈` on the line, badge, panel or sidebar, and no historical backfill. Charged money is unaffected. |
 | `sidebar` | `true` | TUI-only: show the session summary and the per-prompt history in the session sidebar. The Desktop history is the Turns insights tab. |
-| `sidebarTurns` | `8` | How many turns the TUI sidebar and the Desktop Turns insights tab show. |
+| `sidebarTurns` | `8` | How many turns the TUI sidebar and the Desktop Turns insights tab show (`1`–`50`; values outside are clamped). |
 | `panel` | `true` | Show the `/usage` statistics panel and its command in the TUI and Desktop. `false` keeps the line and the history. |
 | `maintenance` | `true` | Allow the RPC to prune, vacuum and backfill. Set `false` on servers reachable from other machines. |
 | `exposePaths` | `false` | Return the absolute database path in the `db` view; the default returns only the file name. |
@@ -438,8 +441,9 @@ errors). The plugin therefore applies least privilege at the surface:
   prompts or responses. Database paths are returned as a file name unless
   `exposePaths: true`.
 - **Availability.** The worker keeps panel queries off the server's event loop;
-  the client queue is bounded and the worker has a watchdog. Generic errors are
-  returned; details stay in the server log.
+  the client queue is bounded while the worker is in use. Reads have a 10 s
+  watchdog; maintenance gets five minutes. Generic errors are returned; details
+  stay in the server log.
 
 For a server reachable from another machine, set `maintenance: false` unless you
 need the maintenance buttons there. The RPC is only as protected as the server:

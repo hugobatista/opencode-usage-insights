@@ -1,4 +1,5 @@
 import { Rpc } from "@opencode/plugin/rpc"
+import { MAX_PANEL_WIDTH, MAX_TURNS } from "./limits"
 import type { LineFormatOptions, PanelLine, PanelRow, PanelSettings } from "./panel-data"
 import type { BackfillResult, DbInfo, PruneResult } from "./stats/maintenance"
 import type { FilterOption } from "./stats/queries"
@@ -218,7 +219,7 @@ export const UsageInsights = Rpc.define({
           sessionID: { type: "string", maxLength: 200 },
           settings: PanelSettingsSchema,
           detail: PanelRowSchema,
-          width: { type: "number", minimum: 20, maximum: 200 },
+          width: { type: "number", minimum: 20, maximum: MAX_PANEL_WIDTH },
           busy: { type: "boolean" },
         },
         required: ["sessionID", "settings", "width"],
@@ -240,7 +241,7 @@ export const UsageInsights = Rpc.define({
         type: "object",
         properties: {
           sessionID: { type: "string", maxLength: 200 },
-          limit: { type: "number", minimum: 1, maximum: 50 },
+          limit: { type: "number", minimum: 1, maximum: MAX_TURNS },
           width: { type: "number", minimum: 20, maximum: 120 },
         },
         required: ["sessionID", "limit", "width"],

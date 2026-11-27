@@ -58,8 +58,11 @@ const PRICE_RETRY_MS = 30 * 1000
 /** Events whose write can change a panel or a turn history. */
 const RECORDED_EVENTS = new Set([
   "session.created",
-  "session.updated",
+  // `session.renamed` and `session.moved` write the session row;
+  // `session.updated` is not a recorder write.
+  "session.renamed",
   "session.moved",
+  "session.inbox.enqueued",
   "session.step.ended",
   "session.step.failed",
   "session.usage.recorded",

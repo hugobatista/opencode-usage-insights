@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.dist-build/
+.dist-old/
 release-assets/
 *.bck
 *.tgz

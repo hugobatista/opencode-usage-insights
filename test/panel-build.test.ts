@@ -501,6 +501,8 @@ describe("the db view", () => {
     expect(body).toContain("list estimates")
     expect(lines.filter((line) => line.row?.kind === "prune").length).toBe(3)
     expect(body).toContain("365 days")
+    // The key instructions are for the TUI; the desktop panel filters them out.
+    expect(lines.find((line) => line.text.includes("pick a retention"))?.hint).toBe(true)
     db.close()
   })
 
@@ -508,7 +510,7 @@ describe("the db view", () => {
     const db = openStatsDb(":memory:")
     recordStep(db, { messageID: "u1", sessionID: "s", providerID: "opencode-go", modelID: "m", input: 10, cost: 0, createdAt: BASE })
     const lines = buildPanel(request(db, { view: "db", database: dbInfoOf(db) }))
-    expect(text(lines)).toContain("1 $0 steps without a known price · e retries")
+    expect(text(lines)).toContain("1 $0 steps without a known price")
     // Pricing off removes the action from the view entirely.
     const hidden = buildPanel(request(db, { view: "db", database: dbInfoOf(db), estimates: false }))
     expect(text(hidden)).not.toContain("list estimates")

@@ -1159,8 +1159,18 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
   lines.push({ text: "", tone: "muted" })
   lines.push({ text: "clean up", tone: HEADER_TONE })
   // The retention rows are the only selectable lines here, so the hint says how
-  // to pick one and what Enter does: the row is a cutoff, not a count.
-  lines.push({ text: truncate("  ↑↓ pick a retention · enter prunes the steps and their other usage (asks first) · v gives the space back", width), tone: "muted" })
+  // to pick one and what Enter does: the row is a cutoff, not a count. Only the
+  // TUI renders this line; the desktop panel has buttons instead.
+  lines.push({
+    text: truncate(
+      `  ↑↓ pick a retention · enter prunes the steps and their other usage (asks first)${
+        data.estimates === false ? "" : " · e backfills list estimates"
+      } · v gives the space back`,
+      width,
+    ),
+    tone: "muted",
+    hint: true,
+  })
   if (data.estimates !== false) {
     lines.push({
       text: truncate(
@@ -1168,7 +1178,7 @@ export function dbLines(data: { info: DbInfo; busy?: boolean | undefined; now: n
           ? "  list estimates  the recorder must upgrade this database first"
           : data.info.unpriced === 0
             ? "  list estimates  every $0 step has a price"
-            : `  list estimates  ${formatCount(data.info.unpriced)} $0 steps without a known price · e retries`,
+            : `  list estimates  ${formatCount(data.info.unpriced)} $0 steps without a known price`,
         width,
       ),
       tone: data.info.schemaVersion < 10 || data.info.unpriced > 0 ? "base" : "muted",

@@ -44,8 +44,17 @@ type WorkerLike = {
 type WorkerConstructor = new (url: URL) => WorkerLike
 
 const QUEUE_LIMIT = 8
-const REQUEST_TIMEOUT_MS = 10_000
+/** A read should answer quickly; a stuck worker is replaced. */
+const READ_TIMEOUT_MS = 10_000
+/**
+ * Prune, backfill and especially vacuum rewrite the file and can legitimately
+ * take minutes on a large history. They still get a watchdog, but one that
+ * does not kill a healthy maintenance operation halfway through.
+ */
+const MAINTENANCE_TIMEOUT_MS = 5 * 60_000
 const START_TIMEOUT_MS = 5_000
+
+const MAINTENANCE_METHODS = new Set<StatsMethod>(["prune", "vacuum", "backfill"])
 
 export type StatsClientOptions = {
   /** Absolute database path, resolved by the server plugin. */
@@ -58,6 +67,8 @@ export type StatsClientOptions = {
   fallback: () => Service
   /** Worker entrypoint override, for tests. */
   workerUrl?: (() => URL | undefined) | undefined
+  /** Timeout overrides, for tests. */
+  timeouts?: { read?: number; maintenance?: number; start?: number } | undefined
   /** Diagnostics sink. */
   log?: ((message: string) => void) | undefined
 }
@@ -78,6 +89,7 @@ export class StatsClient {
   private worker: WorkerLike | undefined
   private startPromise: Promise<void> | undefined
   private starting: WorkerLike | undefined
+  private startAbort: (() => void) | undefined
   private fallbackService: Service | undefined
   private fallbackMode = false
   private stopped = false
@@ -93,6 +105,7 @@ export class StatsClient {
     if (this.fallbackMode) return Promise.resolve().then(() => this.callService(method, input) as T)
 
     return this.ensureWorker().then(() => {
+      if (this.stopped) throw new StatsError("unavailable", "the usage service is stopped")
       if (this.fallbackMode) return this.callService(method, input) as T
       if (this.pending.size >= QUEUE_LIMIT) throw new StatsError("busy", "too many usage requests are already running")
       return this.send<T>(method, input, options.signal)
@@ -103,9 +116,15 @@ export class StatsClient {
     if (this.stopped) return
     this.stopped = true
     this.rejectAll(new StatsError("unavailable", "the usage service stopped"))
+    // If a worker is still starting, resolve its start promise and terminate
+    // it. Without this the worker can survive a plugin reload: the pending
+    // request never settles, and a late `ready` attaches a live worker to a
+    // stopped client.
+    this.startAbort?.()
     this.worker?.terminate()
     this.worker = undefined
     this.starting = undefined
+    this.startPromise = undefined
   }
 
   private callService(method: StatsMethod, input: unknown): unknown {
@@ -164,17 +183,37 @@ export class StatsClient {
         if (timer !== undefined) clearTimeout(timer)
         this.startPromise = undefined
         this.starting = undefined
+        this.startAbort = undefined
+        // stop() may run while the worker is starting. Resolve the start
+        // promise for the request waiting on it, but never attach the worker
+        // or switch the client to the fallback after shutdown.
+        if (this.stopped) {
+          worker.terminate()
+          this.worker = undefined
+          resolve()
+          return
+        }
         if (!ok) {
           worker.terminate()
           this.useFallback(reason ?? "the usage worker did not start")
         }
         resolve()
       }
-      timer = setTimeout(() => finish(false, "the usage worker did not start in time"), START_TIMEOUT_MS)
+      this.startAbort = () => finish(false, "the usage service stopped")
+      timer = setTimeout(
+        () => finish(false, "the usage worker did not start in time"),
+        this.config.timeouts?.start ?? START_TIMEOUT_MS,
+      )
 
       worker.onmessage = (event) => {
         const message = event.data as { type?: string; error?: { code?: string; message?: string } } | undefined
         if (message?.type === "ready") {
+          // A stop or a start failure may have settled this start already; a
+          // late `ready` must not attach a live worker to a stopped client.
+          if (settled) {
+            worker.terminate()
+            return
+          }
           this.worker = worker
           this.attach(worker)
           finish(true)
@@ -226,6 +265,13 @@ export class StatsClient {
     pending.reject(new StatsError(code, payload.error?.message ?? "the usage request failed"))
   }
 
+  private timeoutFor(method: StatsMethod): number {
+    if (MAINTENANCE_METHODS.has(method)) {
+      return this.config.timeouts?.maintenance ?? MAINTENANCE_TIMEOUT_MS
+    }
+    return this.config.timeouts?.read ?? READ_TIMEOUT_MS
+  }
+
   private send<T>(method: StatsMethod, input: unknown, signal?: AbortSignal): Promise<T> {
     const worker = this.worker
     if (worker === undefined) throw new StatsError("unavailable", "the usage worker is not running")
@@ -239,7 +285,7 @@ export class StatsClient {
           this.settle(id, pending)
           pending.reject(new StatsError("unavailable", "the usage request timed out"))
           this.hardReset("the usage request timed out")
-        }, REQUEST_TIMEOUT_MS),
+        }, this.timeoutFor(method)),
       }
       if (signal !== undefined) {
         if (signal.aborted) {

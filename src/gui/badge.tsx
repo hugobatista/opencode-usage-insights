@@ -1,9 +1,8 @@
 /** @jsxImportSource solid-js */
 import { Show, createMemo } from "solid-js"
 import { usePlugin, type IconName } from "@opencode/plugin/gui"
-import { formatSpend } from "../core"
 import type { TurnStats } from "../core"
-import { lineTextFor, type GuiLineOptions } from "./line"
+import { badgeLabel, lineTextFor, type GuiLineOptions } from "./line"
 
 /**
  * The usage insights chip in the session header, next to the peak/off-peak
@@ -20,10 +19,7 @@ export function UsageBadge(props: {
 }) {
   const ctx = usePlugin()
   const stats = createMemo(() => props.line())
-  const label = createMemo(() => {
-    const current = stats()
-    return current === undefined ? undefined : formatSpend(current.totals.cost, current.totals.listCost)
-  })
+  const label = createMemo(() => badgeLabel(stats(), props.options))
   const title = createMemo(() => lineTextFor(stats(), props.options))
 
   const content = () => (

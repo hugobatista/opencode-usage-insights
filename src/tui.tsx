@@ -4,6 +4,7 @@ import type { Context } from "@opencode/plugin/tui/context"
 import { StyledText, fg, type ColorInput } from "@opentui/core"
 import { Show, createEffect, createMemo, createRenderEffect, createSignal } from "solid-js"
 import { computeTurn, type LineFields, type LineLabels, type TurnStats, type TurnTotalsView } from "./core"
+import { clampTurnsLimit } from "./limits"
 import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "./line"
 import { DEFAULT_SETTINGS, PANEL_NAME, parseArgs, sanitizeSettings, type PanelSettings, type PanelView, type RangeKey } from "./panel-data"
 import { Panel } from "./panel"
@@ -51,7 +52,7 @@ export type Options = {
   labels?: Partial<LineLabels> | undefined
   /** Show the per-prompt history in the session sidebar (default true). */
   sidebar?: boolean | undefined
-  /** How many turns the sidebar history shows (default 8). */
+  /** How many turns the sidebar history shows (default 8, clamped to 1–50). */
   sidebarTurns?: number | undefined
   /**
    * Show the `/usage` statistics panel and its command (default true).
@@ -129,6 +130,7 @@ export default Plugin.define({
     const [refresh, setRefresh] = createSignal(0)
     const [listCosts, setListCosts] = createSignal<Record<string, number>>({})
     const pendingListCost = new Set<string>()
+    const dirtyListCost = new Set<string>()
     const api = usageApi(ctx.client, ctx.location)
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let lastRefresh = 0
@@ -168,7 +170,14 @@ export default Plugin.define({
      * the RPC answers; a server that cannot answer degrades to charged money.
      */
     async function loadListCost(sessionID: string): Promise<void> {
-      if (!pricing || pendingListCost.has(sessionID)) return
+      if (!pricing) return
+      if (pendingListCost.has(sessionID)) {
+        // A write landed while the previous read was in flight. Do not drop
+        // it: repeat once the current request settles, or the line keeps an
+        // estimate that is missing the newest step.
+        dirtyListCost.add(sessionID)
+        return
+      }
       pendingListCost.add(sessionID)
       try {
         const result = await api.listCost({ sessionID })
@@ -182,6 +191,7 @@ export default Plugin.define({
         // The line degrades to the charged total.
       } finally {
         pendingListCost.delete(sessionID)
+        if (dirtyListCost.delete(sessionID)) void loadListCost(sessionID)
       }
     }
 
@@ -291,7 +301,7 @@ export default Plugin.define({
           <TurnsSidebar
             sessionID={input.sessionID}
             ctx={ctx}
-            deps={{ refresh, limit: Math.max(1, Math.round(options.sidebarTurns ?? 8)) }}
+            deps={{ refresh, limit: clampTurnsLimit(options.sidebarTurns ?? 8) }}
           />
         ),
     })
@@ -388,7 +398,14 @@ export default Plugin.define({
     __test.line = lineFor
     __test.lineText = (sessionID: string) => {
       void loadListCost(sessionID)
-      return lineText(lineParts(lineFor(sessionID), { labels: options.labels, fields: options.fields, estimates: pricing }))
+      return lineText(
+        lineParts(lineFor(sessionID), {
+          labels: options.labels,
+          fields: options.fields,
+          turnTotals: options.turnTotals,
+          estimates: pricing,
+        }),
+      )
     }
     __test.open = open
     __test.state = () => {

@@ -22,6 +22,7 @@ import {
   type PanelTone,
   type PanelView,
 } from "./panel-data"
+import { clampPanelWidth } from "./limits"
 import { usageApi } from "./rpc-client"
 import type { FiltersOutput, PanelInput as UsagePanelInput } from "./rpc"
 import type { DbInfo } from "./stats/maintenance"
@@ -69,7 +70,11 @@ export function Panel(props: {
   let generation = 0
   let scroller: Scroller | undefined
 
-  const width = (): number => Math.max(60, props.input.width - 4)
+  // The RPC schema rejects a width over the server's formatting budget. A
+  // full-screen panel on a very wide terminal can exceed it, so clamp on the
+  // client instead of relying on the service clamp, which runs after the
+  // schema has already rejected the request.
+  const width = (): number => clampPanelWidth(Math.max(60, props.input.width - 4))
   const view = (): PanelView => sanitizeSettings(props.settings).view
   const settings = (): PanelSettings => sanitizeSettings(props.settings)
 

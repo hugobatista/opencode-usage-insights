@@ -263,7 +263,7 @@ export function UsagePanel(props: Props) {
         </div>
         <div data-slot="oui-controls">
           <ctx.ui.Select
-            label={ctx.t("panel.title")}
+            label={ctx.t("panel.view")}
             value={view()}
             options={PANEL_VIEWS.map((name) => ({ value: name, label: ctx.t(`view.${name}`) }))}
             onChange={(value) => setView(value as PanelView)}
@@ -293,7 +293,7 @@ export function UsagePanel(props: Props) {
           </ctx.ui.Button>
           <Show when={view() === "turns"}>
             <ctx.ui.Select
-              label={ctx.t("panel.turns")}
+              label={ctx.t("panel.scope")}
               value={settings().turnsScope}
               options={[
                 { value: "session", label: ctx.t("panel.thisSession") },
@@ -304,7 +304,7 @@ export function UsagePanel(props: Props) {
           </Show>
           <Show when={view() === "periods"}>
             <ctx.ui.Select
-              label={ctx.t("view.periods")}
+              label={ctx.t("panel.granularity")}
               value={settings().granularity}
               options={GRANULARITIES.map((value) => ({ value, label: ctx.t(`granularity.${value}`) }))}
               onChange={(value) => setGranularity(value as Granularity)}

@@ -17,11 +17,12 @@ import {
 import { Schema } from "effect"
 import { Suspense, createMemo, createSignal, lazy, onCleanup } from "solid-js"
 import type { LineFields, LineLabels, TurnStats, TurnTotalsView } from "./core"
+import { clampTurnsLimit } from "./limits"
 import { DEFAULT_SETTINGS, defaultSort, parseArgs, sanitizeSettings, type PanelSettings, type PanelView } from "./panel-data"
 import { costOf, priceTable, type PriceFn, type PriceTable } from "./pricing"
 import { usageApi } from "./rpc-client"
 import type { RuntimeMessage, RuntimeSessionInfo } from "./line"
-import { lineFor, type GuiLineOptions } from "./gui/line"
+import { lineForSession, type GuiLineOptions } from "./gui/line"
 import { UsageBadge } from "./gui/badge"
 import css from "./gui/usage.css?inline"
 import icon from "./gui/icons/usage.svg?raw"
@@ -47,6 +48,7 @@ export type Options = {
   turnTotals?: TurnTotalsView | undefined
   fields?: Partial<LineFields> | undefined
   labels?: Partial<LineLabels> | undefined
+  /** How many turns the Turns insights tab shows (default 8, clamped to 1–50). */
   sidebarTurns?: number | undefined
   panel?: boolean | undefined
 }
@@ -79,7 +81,7 @@ export default Plugin.define({
     const panelEnabled = options.panel !== false
     const pricing = options.pricing !== "off"
     const key = `${ctx.id}:usage`
-    const limit = Math.max(1, Math.round(options.sidebarTurns ?? 8))
+    const limit = clampTurnsLimit(options.sidebarTurns ?? 8)
 
     const settings = createMemo(() => sanitizeSettings(ctx.stores.panel.value as Partial<PanelSettings>))
     const update = (mutation: (draft: PanelSettings) => void): void => {
@@ -120,8 +122,10 @@ export default Plugin.define({
 
     // The server emits `recorded` after a write. Re-read the panel and the
     // session estimate only after that event, not on every transcript delta.
+    // Follow the current session's server: a remote session's RPC events do
+    // not arrive on the desktop sidecar.
     createKeyed(
-      () => ctx.servers.get("sidecar")?.client ?? ctx.client,
+      () => ctx.sessions.current()?.server.client ?? ctx.servers.get("sidecar")?.client ?? ctx.client,
       (client) =>
         onCleanup(
           (() => {
@@ -177,20 +181,20 @@ export default Plugin.define({
     }
 
     createKeyed(
-      () => ctx.servers.get("sidecar")?.data,
+      () => ctx.sessions.current()?.server.data ?? ctx.servers.get("sidecar")?.data,
       (data) => onCleanup(data.on("model.updated", () => {
         priceCache = undefined
       })),
     )
 
-    function lineForSession(session: MountedSession): TurnStats | undefined {
+    function lineForMounted(session: MountedSession): TurnStats | undefined {
       try {
-        return lineFor({
-          messages: session.server.data.session.message.list(session.id) as unknown as RuntimeMessage[],
-          info: session.server.data.session.get(session.id) as unknown as RuntimeSessionInfo | undefined,
-          listCost: listCostFor(session),
+        return lineForSession({
           status: session.server.data.session.status(session.id),
-          price: priceFor(session),
+          messages: () => session.server.data.session.message.list(session.id) as unknown as RuntimeMessage[],
+          info: () => session.server.data.session.get(session.id) as unknown as RuntimeSessionInfo | undefined,
+          listCost: listCostFor(session),
+          price: () => priceFor(session),
         })
       } catch {
         return undefined
@@ -345,7 +349,7 @@ export default Plugin.define({
       order: 90,
       render: (input) => (
         <UsageBadge
-          line={() => lineForSession(input.session)}
+          line={() => lineForMounted(input.session)}
           options={lineOptions()}
           icon={ctx.icons.usage}
           compact={input.compact}

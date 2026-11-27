@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { lineFor, lineTextFor } from "../src/gui/line"
+import { badgeLabel, lineFor, lineForSession, lineTextFor } from "../src/gui/line"
 import type { RuntimeMessage } from "../src/line"
 
 const MODEL = { providerID: "opencode", id: "deepseek-v4.1-flash" }
@@ -37,6 +37,45 @@ describe("the desktop line helpers", () => {
 
   test("hides the badge while the turn is running", () => {
     expect(lineFor({ messages, info: undefined, listCost: 0, status: "running" })).toBeUndefined()
+  })
+
+  test("does not read the transcript while the turn is running", () => {
+    let reads = 0
+    const hidden = lineForSession({
+      status: "running",
+      messages: () => {
+        reads += 1
+        return messages
+      },
+      info: () => undefined,
+      listCost: 0,
+    })
+    expect(hidden).toBeUndefined()
+    expect(reads).toBe(0)
+
+    const idle = lineForSession({
+      status: "idle",
+      messages: () => {
+        reads += 1
+        return messages
+      },
+      info: () => undefined,
+      listCost: 0,
+    })
+    expect(idle).toBeDefined()
+    expect(reads).toBe(1)
+  })
+
+  test("hides the cost label when the cost field is off", () => {
+    const stats = lineFor({
+      messages,
+      info: { cost: 0.04, tokens: { input: 2_000, output: 100, cache: { read: 100_000 } }, time: { created: 0 } },
+      listCost: 0,
+      status: "idle",
+    })!
+    expect(badgeLabel(stats, { estimates: true })).toContain("$")
+    expect(badgeLabel(stats, { estimates: true, fields: { cost: false } })).toBeUndefined()
+    expect(badgeLabel(undefined, { estimates: true })).toBeUndefined()
   })
 
   test("shows the stored list estimate in the session segment", () => {

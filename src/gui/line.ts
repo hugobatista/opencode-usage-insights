@@ -1,4 +1,4 @@
-import { computeTurn, type LineFields, type LineLabels, type TurnStats, type TurnTotalsView } from "../core"
+import { computeTurn, formatSpend, type LineFields, type LineLabels, type TurnStats, type TurnTotalsView } from "../core"
 import { lineParts, lineText, sessionTotals, toTranscriptTail, type LinePart, type RuntimeMessage, type RuntimeSessionInfo } from "../line"
 import type { PriceFn } from "../pricing"
 
@@ -28,6 +28,38 @@ export function lineFor(input: GuiLineInput): TurnStats | undefined {
   if (input.status !== undefined && input.status !== "idle") return undefined
   const session = input.info === undefined ? undefined : sessionTotals(input.info, input.listCost)
   return computeTurn(toTranscriptTail(input.messages, 2, input.price), session)
+}
+
+/**
+ * The header badge's view of a mounted session. Status is checked before the
+ * transcript and catalog are read: the host publishes the message list as a
+ * store, so this runs on every streamed delta, and a running turn has no badge
+ * to update. Reading the transcript first would make every delta scan the
+ * session history for a line that is hidden.
+ */
+export type GuiSessionLineInput = {
+  status: "idle" | "running" | undefined
+  messages: () => readonly RuntimeMessage[]
+  info: () => RuntimeSessionInfo | undefined
+  listCost: number
+  price?: (() => PriceFn | undefined) | undefined
+}
+
+export function lineForSession(input: GuiSessionLineInput): TurnStats | undefined {
+  if (input.status !== undefined && input.status !== "idle") return undefined
+  return lineFor({
+    messages: input.messages(),
+    info: input.info(),
+    listCost: input.listCost,
+    status: input.status,
+    price: input.price?.(),
+  })
+}
+
+/** The badge's cost-only label, or undefined when the cost field is off. */
+export function badgeLabel(stats: TurnStats | undefined, options: GuiLineOptions): string | undefined {
+  if (stats === undefined || options.fields?.cost === false) return undefined
+  return formatSpend(stats.totals.cost, stats.totals.listCost)
 }
 
 export function linePartsFor(stats: TurnStats | undefined, options: GuiLineOptions): LinePart[] {

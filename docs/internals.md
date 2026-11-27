@@ -287,7 +287,10 @@ arguments, no file contents, no environment variables.
   through JSON-Schema-validated methods with closed objects, enums and clamps.
   There is no SQL, path, import or export method. Maintenance is gated by the
   `maintenance` option and an explicit confirmation; the worker runs every query
-  off the server's event loop and the client queue is bounded.
+  off the server's event loop and the client queue is bounded while the worker
+  is in use. Reads have a 10 s watchdog; prune, vacuum and backfill get five
+  minutes because rewriting a large file is legitimately slower. The in-process
+  fallback shares the server's event loop and has no separate queue.
 - **Validated input.** Anything that reaches the database from outside — a
   provider id the host reports, a session title, an imported NDJSON dump — is
   validated as an identifier token or stripped of control characters and capped
@@ -344,7 +347,10 @@ The TUI harness is the same one the tests and the documentation images use. The
 Desktop line helpers have their own pure tests (`test/gui-line.test.ts`),
 `test/gui-bundle.test.ts` evaluates the built CJS bundle with the app's shared
 modules, and `test/server.test.ts` drives the real server RPC through the
-worker. `bun test` runs through `bunfig.toml`, which preloads `test/preload.ts`.
+worker. `test/limits.test.ts` keeps the client clamps and the RPC schema bounds
+in step, and `test/stats-client.test.ts` covers the worker start/shutdown and
+the separate read/maintenance watchdogs. `bun test` runs through
+`bunfig.toml`, which preloads `test/preload.ts`.
 Bun resolves the bare `solid-js` specifier to the package's server build, where
 signals do not track and render effects run once; the host resolves the client
 build (the one `@opentui/solid` uses internally). The preload points the
